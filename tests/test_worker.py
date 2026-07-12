@@ -587,7 +587,7 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
         worker.artifact_cleanup_interval = 60
         worker.artifacts.prune_older_than = AsyncMock(return_value=0)
 
-        with patch("worker.time.monotonic", side_effect=[100.0, 120.0, 161.0]):
+        with patch("worker.time.monotonic", side_effect=[10.0, 20.0, 70.0]):
             await worker._maybe_prune_artifacts()
             await worker._maybe_prune_artifacts()
             await worker._maybe_prune_artifacts()
@@ -611,7 +611,8 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
         worker.artifact_retention_seconds = 123
         worker.artifacts.prune_older_than = AsyncMock(return_value=0)
 
-        await worker._maybe_prune_artifacts()
+        with patch("worker.time.monotonic", return_value=1.0):
+            await worker._maybe_prune_artifacts()
 
         worker.artifacts.prune_older_than.assert_awaited_once_with(
             123,

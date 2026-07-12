@@ -451,7 +451,7 @@ class JobWorker:
             60.0,
             float(os.getenv("ARTIFACT_CLEANUP_INTERVAL_SECONDS", "3600")),
         )
-        self._last_artifact_cleanup = 0.0
+        self._last_artifact_cleanup: Optional[float] = None
         try:
             self.qdrant_lifecycle_interval = max(
                 0.0,
@@ -567,7 +567,10 @@ class JobWorker:
         if self.artifact_retention_seconds <= 0:
             return
         now = time.monotonic()
-        if now - self._last_artifact_cleanup < self.artifact_cleanup_interval:
+        if (
+            self._last_artifact_cleanup is not None
+            and now - self._last_artifact_cleanup < self.artifact_cleanup_interval
+        ):
             return
         self._last_artifact_cleanup = now
         try:
