@@ -8,7 +8,7 @@ ingestion, retrieval, and reranking.
 
 ## Run with Docker Compose
 
-Requirements: Docker Engine with Compose v2.23.1 or newer, a 64-bit Linux host,
+Requirements: Docker Engine with Compose v2.24.4 or newer, a 64-bit Linux host,
 and outbound internet access for search and page retrieval. The configured
 memory ceilings total about 15 GB for the base stack, so a 16 GB VPS is the
 practical default; each optional Crawl4AI or reranker profile adds up to 4 GB.
@@ -71,7 +71,7 @@ never be committed.
 
 On an Ubuntu or Debian VPS, install Git and Docker Engine with the Compose
 plugin from Docker's official repository, then verify `docker compose version`
-reports v2.23.1 or newer. Clone and configure the service:
+reports v2.24.4 or newer. Clone and configure the service:
 
 ```console
 git clone git@github.com:YOUR_ACCOUNT/research-mcp.git
