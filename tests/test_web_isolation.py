@@ -360,6 +360,34 @@ class ComposeIsolationTests(unittest.TestCase):
         self.assertTrue(self.compose["networks"]["search-control"]["internal"])
         self.assertIn("search-control", self.services["research-worker"]["networks"])
 
+    def test_searxng_uses_a_file_backed_config_with_runtime_secret(self):
+        self.assertEqual(
+            self.compose["configs"]["searxng-settings"],
+            {"file": "./searxng-settings.yml"},
+        )
+        searxng = self.services["searxng"]
+        self.assertTrue(searxng["read_only"])
+        self.assertEqual(searxng["user"], "977:977")
+        self.assertIn(
+            {
+                "source": "searxng-settings",
+                "target": "/etc/searxng/settings.yml",
+            },
+            searxng["configs"],
+        )
+        self.assertEqual(
+            searxng["environment"]["SEARXNG_SECRET"],
+            "${SEARXNG_SECRET:-replace-this-private-instance-secret}",
+        )
+        settings = yaml.safe_load(
+            (PROJECT_ROOT / "searxng-settings.yml").read_text("utf-8")
+        )
+        self.assertIn("json", settings["search"]["formats"])
+        self.assertEqual(
+            settings["server"]["secret_key"],
+            "ultrasecretkey",
+        )
+
     def test_worker_uses_socket_and_is_not_on_sandbox_network(self):
         self.assertNotIn("web-sandbox", self.services["research-worker"]["networks"])
         volumes = self.services["research-worker"]["volumes"]

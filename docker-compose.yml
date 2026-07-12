@@ -501,6 +501,7 @@ services:
     environment:
       GRANIAN_BLOCKING_THREADS: ${SEARXNG_THREADS:-4}
       GRANIAN_WORKERS: ${SEARXNG_WORKERS:-2}
+      SEARXNG_SECRET: ${SEARXNG_SECRET:-replace-this-private-instance-secret}
     configs:
       - source: searxng-settings
         target: /etc/searxng/settings.yml
@@ -619,24 +620,7 @@ services:
 
 configs:
   searxng-settings:
-    content: |
-      use_default_settings: true
-      general:
-        instance_name: "Research MCP Search"
-      search:
-        safe_search: 0
-        formats:
-          - html
-          - json
-      server:
-        bind_address: "0.0.0.0"
-        port: 8080
-        secret_key: "${SEARXNG_SECRET:-replace-this-private-instance-secret}"
-        limiter: false
-        image_proxy: false
-      outgoing:
-        request_timeout: 10.0
-        max_request_timeout: 30.0
+    file: ./searxng-settings.yml
 
 networks:
   backend:

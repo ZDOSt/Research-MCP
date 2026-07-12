@@ -160,6 +160,9 @@ browser and PDF parser only through separate Unix sockets. The PDF parser has no
 network interface. Playwright and optional Crawl4AI run only on an internal
 sandbox network and reach public targets through `safe-egress`, which rejects
 private, loopback, link-local, and metadata destinations after DNS resolution.
+SearXNG uses a file-backed settings mount so its root filesystem remains
+read-only across Compose implementations; `SEARXNG_SECRET` overrides the
+checked-in placeholder at runtime.
 The gateway joins a separate edge network for its published port. Named volumes
 retain Redis state, Qdrant vectors and snapshots, embedding models, and research
 artifacts across replacement.

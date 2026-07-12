@@ -1,0 +1,22 @@
+use_default_settings: true
+
+general:
+  instance_name: "Research MCP Search"
+
+search:
+  safe_search: 0
+  formats:
+    - html
+    - json
+
+server:
+  bind_address: "0.0.0.0"
+  port: 8080
+  # The pinned image overrides this value from SEARXNG_SECRET at runtime.
+  secret_key: "ultrasecretkey"
+  limiter: false
+  image_proxy: false
+
+outgoing:
+  request_timeout: 10.0
+  max_request_timeout: 30.0

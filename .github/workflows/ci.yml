@@ -42,6 +42,13 @@ jobs:
           fi
           exit "$status"
       - run: docker compose config --quiet
+      - name: Validate read-only SearXNG config mount
+        env:
+          SEARXNG_IMAGE: alpine:3.21
+          SEARXNG_SECRET: ci-only-searxng-secret
+        run: |
+          docker compose create searxng
+          docker compose rm --force --stop searxng
       - name: Validate zero-port client-network deployment
         env:
           MCP_CLIENT_NETWORK: ci-client-network
