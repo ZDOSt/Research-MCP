@@ -1,0 +1,65 @@
+import pytest
+
+import mcp_server
+
+
+@pytest.mark.asyncio
+async def test_all_public_tools_expose_bounded_client_schemas():
+    tools = {tool.name: tool for tool in await mcp_server.mcp.list_tools()}
+    assert set(tools) == {
+        "get_research_artifact",
+        "github_research",
+        "ingest_text",
+        "investigate_url",
+        "manage_sources",
+        "query_memory",
+        "research_job",
+        "research_web",
+        "start_research",
+    }
+
+    research = tools["research_web"].parameters["properties"]
+    assert research["mode"]["enum"] == [
+        "quick",
+        "balanced",
+        "deep",
+        "technical",
+        "academic",
+        "local_only",
+        "web_only",
+    ]
+    assert research["max_sources"]["anyOf"][0] == {
+        "maximum": 8,
+        "minimum": 0,
+        "type": "integer",
+    }
+
+    investigation = tools["investigate_url"].parameters["properties"]
+    assert investigation["mode"]["enum"] == ["auto", "targeted", "balanced", "exhaustive"]
+    assert investigation["max_chars"]["minimum"] == 10_000
+    assert investigation["max_chars"]["maximum"] == 750_000
+
+    assert tools["query_memory"].parameters["properties"]["top_k"]["maximum"] == 30
+    assert tools["manage_sources"].parameters["properties"]["action"]["enum"] == [
+        "list",
+        "stats",
+        "delete",
+    ]
+    assert tools["research_job"].parameters["properties"]["action"]["enum"] == [
+        "status",
+        "result",
+        "cancel",
+    ]
+    assert tools["github_research"].parameters["properties"]["action"]["enum"] == [
+        "search",
+        "inspect",
+        "read",
+    ]
+    assert tools["github_research"].parameters["properties"]["kind"]["enum"] == [
+        "issues",
+        "code",
+        "repositories",
+    ]
+    artifact_chars = tools["get_research_artifact"].parameters["properties"]["max_chars"]
+    assert artifact_chars["minimum"] == 1_000
+    assert artifact_chars["maximum"] == 250_000

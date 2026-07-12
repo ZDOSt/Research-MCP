@@ -1,0 +1,43 @@
+# Optional override for MCP clients running on an existing Docker network.
+# Set MCP_CLIENT_NETWORK and a strong MCP_AUTH_TOKEN in .env, then include this
+# file with -f after the base docker-compose.yml.
+services:
+  mcp-gateway:
+    environment:
+      CRAWL4AI_URL: http://127.0.0.1:1
+      MCP_ALLOWED_HOSTS: ${MCP_ALLOWED_HOSTS:-127.0.0.1:*,localhost:*,[::1]:*,mcp-gateway:*},${MCP_CLIENT_ALIAS:-research-mcp-gateway}:*
+      MCP_ALLOW_UNAUTHENTICATED_REMOTE: "false"
+      MCP_EXTERNAL_BIND_ADDRESS: 0.0.0.0
+      QDRANT_URL: http://research-mcp-qdrant:6333
+      REDIS_URL: redis://research-mcp-redis:6379/0
+      RERANKER_URL: http://research-mcp-reranker:8000
+      SEARXNG_URL: http://127.0.0.1:1
+    networks:
+      backend:
+      edge:
+      client-network:
+        aliases:
+          - ${MCP_CLIENT_ALIAS:-research-mcp-gateway}
+
+  redis:
+    networks:
+      backend:
+        aliases:
+          - research-mcp-redis
+
+  qdrant:
+    networks:
+      backend:
+        aliases:
+          - research-mcp-qdrant
+
+  reranker:
+    networks:
+      backend:
+        aliases:
+          - research-mcp-reranker
+
+networks:
+  client-network:
+    external: true
+    name: ${MCP_CLIENT_NETWORK:?Set MCP_CLIENT_NETWORK to an existing Docker network}

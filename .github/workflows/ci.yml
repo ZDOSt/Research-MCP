@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unit-and-compose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -r requirements-dev.txt
+      - run: python -m pip check
+      - run: python -m pip_audit -r requirements.txt
+      - run: python -m compileall -q .
+      - run: python -m ruff check . --select E9,F
+      - run: python -m bandit -r . -x ./.venv,./tests -ll -ii
+      - run: python -m pytest -q
+      - run: docker compose config --quiet
+      - run: MCP_CLIENT_NETWORK=ci-client-network MCP_AUTH_TOKEN=ci-only-token docker compose -f docker-compose.yml -f docker-compose.client-network.yml config --quiet
