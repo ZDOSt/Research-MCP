@@ -499,6 +499,15 @@ Important invariants:
 - Keep `RESEARCH_BROWSER_DISABLE_SANDBOX=false` and
   `RESEARCH_BROWSER_IGNORE_HTTPS_ERRORS=false` unless a controlled environment
   has a documented compatibility requirement.
+- `RESEARCH_BROWSER_SANDBOX_MODE=auto` first launches Chromium with its native
+  sandbox. Only a recognized host denial of Chromium's user namespace permits a
+  compatibility retry without that inner sandbox; the dedicated web runner
+  remains non-root, read-only, capability-free, seccomp-filtered,
+  resource-limited, isolated behind `safe-egress`, and subject to Docker's
+  AppArmor profile where AppArmor is available. Set the mode to `required` after
+  loading a host AppArmor policy that grants `userns`. `disabled` and the
+  legacy `RESEARCH_BROWSER_DISABLE_SANDBOX=true` switch are explicit emergency
+  overrides. Do not add `SYS_ADMIN` or change host-wide user-namespace policy.
 - Successful job artifacts are pruned after `ARTIFACT_RETENTION_SECONDS` by
   default. Set it to `0` only when another process owns artifact lifecycle, and
   keep the Redis result TTL at least as long as artifact retention.

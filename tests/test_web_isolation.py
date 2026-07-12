@@ -30,6 +30,19 @@ class FakeStreamingResponse:
             yield chunk
 
 
+class FakePlaywrightManager:
+    def __init__(self, launch):
+        self.playwright = types.SimpleNamespace(
+            chromium=types.SimpleNamespace(launch=launch)
+        )
+
+    async def __aenter__(self):
+        return self.playwright
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        return False
+
+
 class EgressPolicyTests(unittest.IsolatedAsyncioTestCase):
     def test_rejects_every_non_global_address_family(self):
         addresses = [
@@ -159,6 +172,7 @@ class RunnerBoundaryTests(unittest.IsolatedAsyncioTestCase):
                     30.0,
                 )
 
+
     async def test_runner_response_is_stream_bounded(self):
         response = FakeStreamingResponse([b"123", b"456"])
         with patch.object(browser, "WEB_RUNNER_MAX_RESPONSE_BYTES", 5):
@@ -230,6 +244,180 @@ class RunnerBoundaryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("accept_downloads=False", source)
         self.assertIn("permissions=[]", source)
         self.assertIn('service_workers="block"', source)
+
+
+class ChromiumSandboxTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        browser.set_resolved_chromium_sandbox(None)
+
+    def tearDown(self):
+        browser.set_resolved_chromium_sandbox(None)
+
+    @staticmethod
+    def _browser():
+        return types.SimpleNamespace(close=AsyncMock())
+
+    async def test_auto_mode_keeps_native_sandbox_when_available(self):
+        launched_browser = self._browser()
+        launch = AsyncMock(return_value=launched_browser)
+        manager = FakePlaywrightManager(launch)
+
+        with patch.dict(
+            os.environ,
+            {
+                "RESEARCH_BROWSER_SANDBOX_MODE": "auto",
+                "RESEARCH_BROWSER_DISABLE_SANDBOX": "false",
+            },
+            clear=False,
+        ), patch.object(web_runner, "async_playwright", return_value=manager):
+            await web_runner.verify_chromium_runtime()
+
+        launch.assert_awaited_once()
+        self.assertTrue(launch.await_args.kwargs["chromium_sandbox"])
+        self.assertTrue(browser.chromium_launch_options()["chromium_sandbox"])
+
+    async def test_auto_mode_falls_back_only_for_known_host_denial(self):
+        denial = RuntimeError(
+            "FATAL:sandbox/linux/services/credentials.cc:131 "
+            "Check failed: Permission denied (13)"
+        )
+        launched_browser = self._browser()
+        launch = AsyncMock(side_effect=[denial, launched_browser])
+        manager = FakePlaywrightManager(launch)
+
+        with patch.dict(
+            os.environ,
+            {
+                "RESEARCH_BROWSER_SANDBOX_MODE": "auto",
+                "RESEARCH_BROWSER_DISABLE_SANDBOX": "false",
+            },
+            clear=False,
+        ), patch.object(
+            web_runner, "async_playwright", return_value=manager
+        ), patch.object(web_runner.LOGGER, "warning") as warning:
+            await web_runner.verify_chromium_runtime()
+
+        self.assertEqual(launch.await_count, 2)
+        self.assertTrue(launch.await_args_list[0].kwargs["chromium_sandbox"])
+        self.assertFalse(launch.await_args_list[1].kwargs["chromium_sandbox"])
+        self.assertFalse(browser.chromium_launch_options()["chromium_sandbox"])
+        warning.assert_called_once()
+
+    async def test_auto_mode_fails_closed_for_unrelated_launch_error(self):
+        launch = AsyncMock(side_effect=RuntimeError("browser executable missing"))
+        manager = FakePlaywrightManager(launch)
+
+        with patch.dict(
+            os.environ,
+            {
+                "RESEARCH_BROWSER_SANDBOX_MODE": "auto",
+                "RESEARCH_BROWSER_DISABLE_SANDBOX": "false",
+            },
+            clear=False,
+        ), patch.object(web_runner, "async_playwright", return_value=manager):
+            with self.assertRaisesRegex(RuntimeError, "sandbox preflight failed"):
+                await web_runner.verify_chromium_runtime()
+
+        self.assertEqual(launch.await_count, 1)
+
+    def test_host_denial_match_requires_both_specific_markers(self):
+        self.assertFalse(
+            web_runner.chromium_sandbox_denied_by_host(
+                RuntimeError("sandbox/linux/services/credentials.cc:131 failed")
+            )
+        )
+        self.assertFalse(
+            web_runner.chromium_sandbox_denied_by_host(
+                RuntimeError("unrelated operation: Permission denied (13)")
+            )
+        )
+
+    async def test_auto_mode_fails_if_compatibility_launch_fails(self):
+        denial = RuntimeError(
+            "FATAL:sandbox/linux/services/credentials.cc:131 "
+            "Check failed: Permission denied (13)"
+        )
+        launch = AsyncMock(
+            side_effect=[denial, RuntimeError("compatibility launch failed")]
+        )
+        manager = FakePlaywrightManager(launch)
+
+        with patch.dict(
+            os.environ,
+            {
+                "RESEARCH_BROWSER_SANDBOX_MODE": "auto",
+                "RESEARCH_BROWSER_DISABLE_SANDBOX": "false",
+            },
+            clear=False,
+        ), patch.object(web_runner, "async_playwright", return_value=manager):
+            with self.assertRaisesRegex(RuntimeError, "compatibility preflight failed"):
+                await web_runner.verify_chromium_runtime()
+
+        self.assertEqual(launch.await_count, 2)
+        self.assertIsNone(browser._resolved_chromium_sandbox)
+
+    async def test_required_mode_never_falls_back(self):
+        denial = RuntimeError(
+            "FATAL:sandbox/linux/services/credentials.cc:131 "
+            "Check failed: Permission denied (13)"
+        )
+        launch = AsyncMock(side_effect=denial)
+        manager = FakePlaywrightManager(launch)
+
+        with patch.dict(
+            os.environ,
+            {
+                "RESEARCH_BROWSER_SANDBOX_MODE": "required",
+                "RESEARCH_BROWSER_DISABLE_SANDBOX": "false",
+            },
+            clear=False,
+        ), patch.object(web_runner, "async_playwright", return_value=manager):
+            with self.assertRaisesRegex(RuntimeError, "sandbox preflight failed"):
+                await web_runner.verify_chromium_runtime()
+
+        self.assertEqual(launch.await_count, 1)
+        self.assertTrue(launch.await_args.kwargs["chromium_sandbox"])
+
+    async def test_disabled_mode_never_attempts_native_sandbox(self):
+        launched_browser = self._browser()
+        launch = AsyncMock(return_value=launched_browser)
+        manager = FakePlaywrightManager(launch)
+
+        with patch.dict(
+            os.environ,
+            {
+                "RESEARCH_BROWSER_SANDBOX_MODE": "disabled",
+                "RESEARCH_BROWSER_DISABLE_SANDBOX": "false",
+            },
+            clear=False,
+        ), patch.object(web_runner, "async_playwright", return_value=manager):
+            await web_runner.verify_chromium_runtime()
+
+        launch.assert_awaited_once()
+        self.assertFalse(launch.await_args.kwargs["chromium_sandbox"])
+
+    def test_legacy_disable_switch_overrides_required_mode(self):
+        with patch.dict(
+            os.environ,
+            {
+                "RESEARCH_BROWSER_SANDBOX_MODE": "required",
+                "RESEARCH_BROWSER_DISABLE_SANDBOX": "true",
+            },
+            clear=False,
+        ):
+            self.assertEqual(browser.chromium_sandbox_mode(), "disabled")
+
+    def test_invalid_mode_is_rejected(self):
+        with patch.dict(
+            os.environ,
+            {
+                "RESEARCH_BROWSER_SANDBOX_MODE": "sometimes",
+                "RESEARCH_BROWSER_DISABLE_SANDBOX": "false",
+            },
+            clear=False,
+        ):
+            with self.assertRaisesRegex(ValueError, "must be auto, required, or disabled"):
+                browser.chromium_sandbox_mode()
 
 
 class PdfSandboxTests(unittest.IsolatedAsyncioTestCase):
@@ -423,6 +611,14 @@ class ComposeIsolationTests(unittest.TestCase):
         self.assertEqual(
             self.services["crawl4ai"]["environment"]["GUNICORN_BIND"],
             "0.0.0.0:11235",
+        )
+
+    def test_runner_defaults_to_automatic_sandbox_compatibility(self):
+        self.assertEqual(
+            self.services["web-runner"]["environment"][
+                "RESEARCH_BROWSER_SANDBOX_MODE"
+            ],
+            "${RESEARCH_BROWSER_SANDBOX_MODE:-auto}",
         )
 
     def test_crawl4ai_is_derived_and_chained_through_healthy_broker(self):

@@ -82,17 +82,42 @@ NETWORK_RELEVANCE_STOP_WORDS = {
 }
 
 _browser_semaphore = asyncio.Semaphore(1)
+_resolved_chromium_sandbox: Optional[bool] = None
 
 
 def env_flag(name: str) -> bool:
     return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
-def chromium_launch_options() -> dict[str, Any]:
+def chromium_sandbox_mode() -> str:
+    if env_flag("RESEARCH_BROWSER_DISABLE_SANDBOX"):
+        return "disabled"
+    mode = os.getenv("RESEARCH_BROWSER_SANDBOX_MODE", "required").strip().lower()
+    if mode not in {"auto", "required", "disabled"}:
+        raise ValueError(
+            "RESEARCH_BROWSER_SANDBOX_MODE must be auto, required, or disabled"
+        )
+    return mode
+
+
+def set_resolved_chromium_sandbox(enabled: Optional[bool]) -> None:
+    global _resolved_chromium_sandbox
+    _resolved_chromium_sandbox = enabled
+
+
+def chromium_sandbox_enabled() -> bool:
+    if _resolved_chromium_sandbox is not None:
+        return _resolved_chromium_sandbox
+    return chromium_sandbox_mode() != "disabled"
+
+
+def chromium_launch_options(*, sandbox_enabled: Optional[bool] = None) -> dict[str, Any]:
     proxy_url = os.getenv("RESEARCH_BROWSER_PROXY", "").strip()
+    if sandbox_enabled is None:
+        sandbox_enabled = chromium_sandbox_enabled()
     options: dict[str, Any] = {
         "headless": True,
-        "chromium_sandbox": not env_flag("RESEARCH_BROWSER_DISABLE_SANDBOX"),
+        "chromium_sandbox": sandbox_enabled,
         "args": ["--disable-dev-shm-usage", "--disable-gpu"],
     }
     if proxy_url:

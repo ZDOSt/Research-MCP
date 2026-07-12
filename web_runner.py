@@ -20,7 +20,9 @@ from browser import (
     ABSOLUTE_MAX_CHARS,
     DEFAULT_MAX_CHARS,
     chromium_launch_options,
+    chromium_sandbox_mode,
     playwright_explore_page_local,
+    set_resolved_chromium_sandbox,
 )
 from crawler import (
     CRAWL4AI_MAX_RESPONSE_BYTES,
@@ -59,15 +61,42 @@ def require_isolated_runtime() -> None:
         raise RuntimeError("web-runner requires a SOCKS5 RESEARCH_BROWSER_PROXY")
 
 
+def chromium_sandbox_denied_by_host(exc: Exception) -> bool:
+    detail = str(exc).lower()
+    return (
+        "sandbox/linux/services/credentials.cc" in detail
+        and "permission denied (13)" in detail
+    )
+
+
+async def _verify_chromium_launch(sandbox_enabled: bool) -> None:
+    async with asyncio.timeout(45.0):
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(
+                **chromium_launch_options(sandbox_enabled=sandbox_enabled)
+            )
+            await browser.close()
+
+
 async def verify_chromium_runtime() -> None:
-    """Fail startup unless Chromium can launch with the configured sandbox."""
+    """Resolve and verify the Chromium sandbox mode before serving requests."""
+    mode = chromium_sandbox_mode()
+    sandbox_enabled = mode != "disabled"
     try:
-        async with asyncio.timeout(45.0):
-            async with async_playwright() as playwright:
-                browser = await playwright.chromium.launch(**chromium_launch_options())
-                await browser.close()
+        await _verify_chromium_launch(sandbox_enabled)
     except Exception as exc:
-        raise RuntimeError("Chromium sandbox preflight failed") from exc
+        if mode != "auto" or not chromium_sandbox_denied_by_host(exc):
+            raise RuntimeError("Chromium sandbox preflight failed") from exc
+        LOGGER.warning(
+            "Chromium native sandbox was denied by host policy; using the "
+            "hardened web-runner container as the compatibility sandbox"
+        )
+        try:
+            await _verify_chromium_launch(False)
+        except Exception as fallback_exc:
+            raise RuntimeError("Chromium compatibility preflight failed") from fallback_exc
+        sandbox_enabled = False
+    set_resolved_chromium_sandbox(sandbox_enabled)
 
 
 @asynccontextmanager
