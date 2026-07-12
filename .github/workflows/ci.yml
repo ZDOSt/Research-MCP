@@ -24,7 +24,23 @@ jobs:
       - run: python -m compileall -q .
       - run: python -m ruff check . --select E9,F
       - run: python -m bandit -r . -x ./.venv,./tests -ll -ii
-      - run: python -m pytest -q
+      - name: Run tests
+        shell: bash
+        run: |
+          set +e
+          python -m pytest -q --tb=short 2>&1 | tee pytest-output.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            {
+              echo "## Pytest failure"
+              echo '```text'
+              tail -n 200 pytest-output.log
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            message="$(tail -n 200 pytest-output.log | python -c 'import sys; print(sys.stdin.read().replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A"))')"
+            echo "::error title=Pytest failure::$message"
+          fi
+          exit "$status"
       - run: docker compose config --quiet
       - name: Validate zero-port client-network deployment
         env:
