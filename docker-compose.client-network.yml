@@ -5,7 +5,7 @@ services:
   mcp-gateway:
     environment:
       CRAWL4AI_URL: http://127.0.0.1:1
-      MCP_ALLOWED_HOSTS: ${MCP_ALLOWED_HOSTS:-127.0.0.1:*,localhost:*,[::1]:*,mcp-gateway:*},${MCP_CLIENT_ALIAS:-research-mcp-gateway}:*
+      MCP_ALLOWED_HOSTS: ${MCP_ALLOWED_HOSTS:-127.0.0.1:*,localhost:*,[::1]:*,mcp-gateway:*},${MCP_CLIENT_ALIAS:-research-mcp}:*
       MCP_ALLOW_UNAUTHENTICATED_REMOTE: "false"
       MCP_EXTERNAL_BIND_ADDRESS: 0.0.0.0
       QDRANT_URL: http://research-mcp-qdrant:6333
@@ -17,7 +17,8 @@ services:
       edge:
       client-network:
         aliases:
-          - ${MCP_CLIENT_ALIAS:-research-mcp-gateway}
+          - ${MCP_CLIENT_ALIAS:-research-mcp}
+    ports: !reset []
 
   redis:
     networks:

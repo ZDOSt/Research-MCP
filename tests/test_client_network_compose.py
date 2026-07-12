@@ -7,11 +7,27 @@ import yaml
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
+class ComposeReset(list):
+    pass
+
+
+class ComposeLoader(yaml.SafeLoader):
+    pass
+
+
+def _construct_compose_reset(loader, node):
+    return ComposeReset(loader.construct_sequence(node))
+
+
+ComposeLoader.add_constructor("!reset", _construct_compose_reset)
+
+
 class ClientNetworkComposeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.override = yaml.safe_load(
-            (PROJECT_ROOT / "docker-compose.client-network.yml").read_text("utf-8")
+        cls.override = yaml.load(
+            (PROJECT_ROOT / "docker-compose.client-network.yml").read_text("utf-8"),
+            Loader=ComposeLoader,
         )
         cls.services = cls.override["services"]
 
@@ -31,15 +47,20 @@ class ClientNetworkComposeTests(unittest.TestCase):
         )
         self.assertEqual(
             gateway["networks"]["client-network"]["aliases"],
-            ["${MCP_CLIENT_ALIAS:-research-mcp-gateway}"],
+            ["${MCP_CLIENT_ALIAS:-research-mcp}"],
         )
         self.assertIn(
-            "${MCP_CLIENT_ALIAS:-research-mcp-gateway}:*",
+            "${MCP_CLIENT_ALIAS:-research-mcp}:*",
             gateway["environment"]["MCP_ALLOWED_HOSTS"],
         )
         self.assertEqual(
             gateway["environment"]["MCP_ALLOW_UNAUTHENTICATED_REMOTE"], "false"
         )
+
+    def test_gateway_has_no_published_host_ports(self):
+        ports = self.services["mcp-gateway"]["ports"]
+        self.assertIsInstance(ports, ComposeReset)
+        self.assertEqual(ports, [])
 
     def test_gateway_cannot_resolve_web_backends_on_client_network(self):
         gateway_environment = self.services["mcp-gateway"]["environment"]

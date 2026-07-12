@@ -363,17 +363,18 @@ Set these values in `.env`:
 COMPOSE_FILE=docker-compose.yml:docker-compose.client-network.yml
 COMPOSE_PATH_SEPARATOR=:
 MCP_CLIENT_NETWORK=the-existing-client-network
-MCP_CLIENT_ALIAS=research-mcp-gateway
+MCP_CLIENT_ALIAS=research-mcp
 MCP_AUTH_TOKEN=a-long-random-secret
 ```
 
 The named network must already exist and the MCP client must also join it. The
-alias must be unique on that network. Keep `MCP_BIND_ADDRESS=127.0.0.1`; Docker
-peers reach the gateway through its network alias, independently of the
-loopback-only published host port. `COMPOSE_FILE` makes every subsequent
-`docker compose` command retain both files, including profile and scaling
-commands. `COMPOSE_PATH_SEPARATOR` keeps that setting portable across host
-operating systems. Start the stack with:
+alias must be unique on that network. Keep `MCP_BIND_ADDRESS=127.0.0.1` so the
+base deployment remains safe if the override is later removed. The override
+removes the host port publication and exposes the gateway only through its
+Docker network alias. `COMPOSE_FILE` makes every subsequent `docker compose`
+command retain both files, including profile and scaling commands.
+`COMPOSE_PATH_SEPARATOR` keeps that setting portable across host operating
+systems. Start the stack with:
 
 ```console
 docker compose config --quiet
@@ -383,10 +384,12 @@ docker compose up -d --build --wait
 The override makes authentication mandatory and assigns unique backend aliases
 for gateway database connections. This prevents an unrelated `redis`, `qdrant`,
 or `reranker` on the shared client network from being selected by Docker DNS.
-Do not attach any other Research MCP service to that external network.
+It also removes every host port publication; only containers on the external
+client network can reach the gateway. Do not attach any other Research MCP
+service to that external network.
 
 Configure the client for Streamable HTTP at
-`http://research-mcp-gateway:8001/mcp`, or replace the hostname with the value of
+`http://research-mcp:8001/mcp`, or replace the hostname with the value of
 `MCP_CLIENT_ALIAS`. Plain HTTP is appropriate only for a trusted, same-host
 Docker network; use a TLS reverse proxy across hosts or untrusted networks.
 Client tool-call timeouts should exceed
@@ -399,7 +402,7 @@ private socket rather than disabling SSRF protection:
 ```yaml
 mcpSettings:
   allowedAddresses:
-    - "research-mcp-gateway:8001"
+    - "research-mcp:8001"
 ```
 
 LibreChat ignores `allowedAddresses` when `mcpSettings.allowedDomains` is also

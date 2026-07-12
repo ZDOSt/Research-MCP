@@ -26,4 +26,11 @@ jobs:
       - run: python -m bandit -r . -x ./.venv,./tests -ll -ii
       - run: python -m pytest -q
       - run: docker compose config --quiet
-      - run: MCP_CLIENT_NETWORK=ci-client-network MCP_AUTH_TOKEN=ci-only-token docker compose -f docker-compose.yml -f docker-compose.client-network.yml config --quiet
+      - name: Validate zero-port client-network deployment
+        env:
+          MCP_CLIENT_NETWORK: ci-client-network
+          MCP_AUTH_TOKEN: ci-only-token
+        run: |
+          docker compose -f docker-compose.yml -f docker-compose.client-network.yml config --quiet
+          docker compose -f docker-compose.yml -f docker-compose.client-network.yml config --format json |
+            python -c 'import json, sys; gateway = json.load(sys.stdin)["services"]["mcp-gateway"]; assert not gateway.get("ports"), gateway.get("ports"); assert "research-mcp" in gateway["networks"]["client-network"]["aliases"]'
