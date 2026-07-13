@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import os
 import tempfile
 import unittest
@@ -11,6 +12,7 @@ from worker import (
     _INTERNAL_ATTEMPT_ID,
     _INTERNAL_ATTEMPT_ORDER_NS,
     _INTERNAL_JOB_ID,
+    _INTERNAL_SEARCH_CACHE_SCOPE,
     _claimed_attempt_context,
     dispatch_job,
     JobWorker,
@@ -194,6 +196,46 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(store.successful_ingestion_attempt_id)
         self.assertEqual(store.registered_invalidations, {})
         self.assertIsNone(store.failed)
+
+    async def test_authenticated_worker_scopes_search_cache_without_exposing_owner(self):
+        job_id = uuid.uuid4().hex
+        owner_id = "librechat-client"
+        store = FakeWorkerStore(
+            {
+                "job_id": job_id,
+                "kind": "research_web",
+                "owner_id": owner_id,
+                "payload": {
+                    "query": "q",
+                    _INTERNAL_SEARCH_CACHE_SCOPE: "spoofed",
+                },
+            }
+        )
+        dispatched_payload = None
+
+        async def dispatch(_kind, payload):
+            nonlocal dispatched_payload
+            dispatched_payload = payload
+            return {"query": payload["query"], "results": []}
+
+        worker = JobWorker(
+            store=store,
+            artifacts=self.artifacts,
+            dispatcher=dispatch,
+            worker_id="test-worker",
+            poll_interval=0.01,
+        )
+
+        self.assertTrue(await worker.run_once(timeout=0.01))
+
+        expected_scope = hashlib.sha256(
+            f"owner\x00{owner_id}".encode("utf-8")
+        ).hexdigest()
+        self.assertEqual(
+            dispatched_payload[_INTERNAL_SEARCH_CACHE_SCOPE],
+            expected_scope,
+        )
+        self.assertNotIn(owner_id, str(dispatched_payload))
 
     async def test_default_research_acquisition_skips_ingestion_compensation(self):
         job_id = uuid.uuid4().hex

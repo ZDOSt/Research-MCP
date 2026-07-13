@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import ipaddress
 import os
 import secrets
@@ -24,6 +25,7 @@ from github_connector import (
 from artifact_store import ArtifactStoreError, OWNER_BINDING_NAME, get_artifact_store
 from job_store import (
     JobQueueFullError,
+    ResearchAdmissionLimitedError,
     enqueue_job,
     get_job_result,
     get_job_status,
@@ -400,6 +402,12 @@ def _current_principal_id() -> Optional[str]:
     return str(getattr(token, "client_id", "") or "").strip() or None
 
 
+def _current_search_cache_scope() -> str:
+    principal_id = _current_principal_id()
+    identity = f"owner\x00{principal_id}" if principal_id else "anonymous"
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
 def _job_owner_failure(job: Optional[dict]) -> Optional[dict]:
     if not _token_authorization_enabled():
         return None
@@ -527,6 +535,40 @@ def _running_job_response(
     return response
 
 
+def _research_admission_limited_response(
+    exc: ResearchAdmissionLimitedError,
+    *,
+    tool_name: str,
+) -> dict:
+    retryable = exc.reason != "anonymous_disabled"
+    response = {
+        "error": "research_admission_limited",
+        "tool": tool_name,
+        "reason": exc.reason,
+        "detail": _safe_error_detail(exc),
+        "retryable": retryable,
+        "retry_after_seconds": exc.retry_after_seconds,
+        "limits": {
+            "active_jobs": exc.active_jobs,
+            "max_active": exc.max_active,
+            "recent_jobs": exc.recent_jobs,
+            "max_new_jobs": exc.max_new_jobs,
+            "window_seconds": exc.window_seconds,
+        },
+        "retrieval_context": runtime_retrieval_context(),
+        "answering_instructions": [
+            "Do not immediately submit another distinct research request.",
+            "An identical queued or running request is coalesced automatically and does not consume another admission.",
+        ],
+    }
+    if exc.reason == "anonymous_disabled":
+        response["answering_instructions"] = [
+            "This server requires authenticated ownership for durable web research.",
+            "Configure an MCP access token instead of retrying anonymously.",
+        ]
+    return response
+
+
 async def _wait_for_terminal_job(job_id: str, wait_seconds: float) -> Optional[dict]:
     deadline = time.monotonic() + max(0.0, min(60.0, wait_seconds))
     status = await get_job_status(job_id)
@@ -551,6 +593,8 @@ async def _enqueue_and_wait(kind: str, payload: dict, tool_name: str) -> dict:
             if owner_id
             else await enqueue_job(kind, payload)
         )
+    except ResearchAdmissionLimitedError as exc:
+        return _research_admission_limited_response(exc, tool_name=tool_name)
     except JobQueueFullError as exc:
         return {
             "error": "job_queue_full",
@@ -675,6 +719,7 @@ async def research_web(
             namespace=namespace,
             include_memory=include_memory,
             synthesize=synthesize,
+            search_cache_scope=_current_search_cache_scope(),
             # Authenticated inline calls have no Redis job owner record against
             # which artifact reads can be authorized. Durable jobs retain source
             # artifacts because their job IDs are owner-scoped in Redis.
@@ -982,6 +1027,8 @@ async def start_research(
             if owner_id
             else await enqueue_job("research_web", payload)
         )
+    except ResearchAdmissionLimitedError as exc:
+        return _research_admission_limited_response(exc, tool_name="start_research")
     except JobQueueFullError as exc:
         return {
             "error": "job_queue_full",

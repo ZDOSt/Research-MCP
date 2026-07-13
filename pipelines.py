@@ -76,6 +76,21 @@ SEARCH_RERANKER_MAX_CANDIDATES = max(
 )
 
 
+def _validated_search_query_concurrency(value: Optional[str] = None) -> int:
+    raw_value = (
+        os.getenv("SEARCH_QUERY_CONCURRENCY", "2") if value is None else value
+    )
+    try:
+        concurrency = int(raw_value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "SEARCH_QUERY_CONCURRENCY must be an integer from 1 to 4"
+        ) from exc
+    if not 1 <= concurrency <= 4:
+        raise ValueError("SEARCH_QUERY_CONCURRENCY must be an integer from 1 to 4")
+    return concurrency
+
+
 def _validated_source_concurrency(value: Optional[str] = None) -> int:
     raw_value = (
         os.getenv("RESEARCH_SOURCE_CONCURRENCY", "3") if value is None else value
@@ -91,6 +106,7 @@ def _validated_source_concurrency(value: Optional[str] = None) -> int:
     return concurrency
 
 
+SEARCH_QUERY_CONCURRENCY = _validated_search_query_concurrency()
 RESEARCH_SOURCE_CONCURRENCY = _validated_source_concurrency()
 CORROBORATION_STOP_WORDS = {
     "about", "after", "also", "and", "are", "because", "been", "before", "being",
@@ -180,10 +196,117 @@ def _compact_search_diagnostics(
             if not engine:
                 continue
             entry = {"engine": engine[:100]}
-            if item.get("reason"):
-                entry["reason"] = _safe_error_detail(item["reason"], 300)
+            reason_code = str(item.get("reason_code") or "").strip()
+            if reason_code in {
+                "rate_limited",
+                "access_blocked",
+                "timeout",
+                "service_error",
+                "service_unavailable",
+                "upstream_unresponsive",
+            }:
+                entry["reason_code"] = reason_code
+            retry_after = item.get("retry_after_seconds")
+            if isinstance(retry_after, (int, float)) and not isinstance(
+                retry_after, bool
+            ):
+                entry["retry_after_seconds"] = round(
+                    max(0.0, min(float(retry_after), 86400.0)),
+                    3,
+                )
             compact_engines.append(entry)
         output["unresponsive_engines"] = compact_engines
+
+    acquisition_status = str(raw.get("acquisition_status") or "").strip()
+    if acquisition_status in {"succeeded", "partial", "failed"}:
+        output["acquisition_status"] = acquisition_status
+    failure_class = str(raw.get("failure_class") or "").strip()
+    if failure_class in {"transient", "configuration"}:
+        output["failure_class"] = failure_class
+    engine_policy = str(raw.get("engine_policy") or "").strip()
+    if engine_policy in {"general", "news", "technical", "academic"}:
+        output["engine_policy"] = engine_policy
+
+    acquisition_error = raw.get("acquisition_error")
+    if isinstance(acquisition_error, dict):
+        code = str(acquisition_error.get("code") or "").strip()
+        if code:
+            compact_error = {"code": code[:100]}
+            for key in ("successful_responses", "responsive_engines"):
+                value = acquisition_error.get(key)
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    compact_error[key] = max(0, min(int(value), 1000))
+            output["acquisition_error"] = compact_error
+
+    cache = raw.get("cache")
+    if isinstance(cache, dict):
+        status = str(cache.get("status") or "").strip()
+        if status:
+            compact_cache = {"status": status[:60]}
+            age_seconds = cache.get("age_seconds")
+            if isinstance(age_seconds, (int, float)) and not isinstance(
+                age_seconds, bool
+            ):
+                compact_cache["age_seconds"] = round(
+                    max(0.0, min(float(age_seconds), 86400.0)),
+                    3,
+                )
+            if isinstance(cache.get("freshness_unverified"), bool):
+                compact_cache["freshness_unverified"] = cache[
+                    "freshness_unverified"
+                ]
+            if cache.get("warning"):
+                compact_cache["warning"] = _safe_error_detail(
+                    cache["warning"],
+                    300,
+                )
+            output["cache"] = compact_cache
+
+    raw_stages = raw.get("search_stages")
+    if isinstance(raw_stages, list):
+        compact_stages = []
+        for stage in raw_stages[:5]:
+            if not isinstance(stage, dict):
+                continue
+            compact_stage = {
+                "stage": max(0, min(int(stage.get("stage") or 0), 20)),
+                "status": str(stage.get("status") or "")[:60],
+                "engines": [
+                    str(engine)[:100]
+                    for engine in (stage.get("engines") or [])[:10]
+                ],
+            }
+            for key in (
+                "raw_results",
+                "http_status",
+                "retry_after_seconds",
+                "duration_seconds",
+            ):
+                value = stage.get(key)
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    compact_stage[key] = max(0, value)
+            skipped = stage.get("skipped_cooldowns")
+            if isinstance(skipped, list):
+                compact_stage["skipped_cooldowns"] = [
+                    {
+                        "engine": str(item.get("engine") or "")[:100],
+                        "reason": _safe_error_detail(
+                            item.get("reason") or "circuit_open",
+                            100,
+                        ),
+                        "retry_after_seconds": max(
+                            0.0,
+                            min(
+                                float(item.get("retry_after_seconds") or 0.0),
+                                86400.0,
+                            ),
+                        ),
+                    }
+                    for item in skipped[:10]
+                    if isinstance(item, dict) and item.get("engine")
+                ]
+            compact_stages.append(compact_stage)
+        output["search_stages"] = compact_stages
 
     return output
 
@@ -451,6 +574,7 @@ async def _run_search_batch_bounded(
     max_results: int,
     mode: str,
     timeout_seconds: float,
+    cache_scope: Optional[str] = None,
 ) -> list[object]:
     """Run planned searches concurrently without letting stragglers own the request."""
     if not queries:
@@ -458,13 +582,27 @@ async def _run_search_batch_bounded(
     if timeout_seconds <= 0:
         return [TimeoutError("research search budget exhausted") for _ in queries]
 
+    semaphore = asyncio.Semaphore(SEARCH_QUERY_CONCURRENCY)
+
+    async def run_search(query: str, policy: object) -> object:
+        async with semaphore:
+            search_kwargs = {
+                "query": query,
+                "max_results": max_results,
+                "mode": mode,
+                "policy": policy,
+            }
+            if cache_scope:
+                search_kwargs["cache_scope"] = cache_scope
+            return await searxng_search(
+                **search_kwargs,
+            )
+
     tasks = [
         asyncio.create_task(
-            searxng_search(
-                query=query,
-                max_results=max_results,
-                mode=mode,
-                policy=policy,
+            run_search(
+                query,
+                policy,
             )
         )
         for query, policy in zip(queries, policies)
@@ -485,6 +623,90 @@ async def _run_search_batch_bounded(
     if pending:
         await _cancel_tasks_bounded(list(pending), timeout_seconds=0.1)
     return outcomes
+
+
+def _partition_search_query_waves(
+    queries: list[str],
+    policies: list[object],
+    intent_ids: list[str],
+    *,
+    max_reserve_per_intent: int = 1,
+) -> tuple[list[tuple[str, object, str]], list[list[tuple[str, object, str]]]]:
+    """Build one primary wave followed by ordered per-intent reserve waves."""
+    primary: list[tuple[str, object, str]] = []
+    reserve_by_intent: dict[str, list[tuple[str, object, str]]] = {}
+    primary_intents: set[str] = set()
+    primary_intent_order: list[str] = []
+    for query, policy, intent_id in zip(queries, policies, intent_ids):
+        entry = (query, policy, intent_id)
+        if intent_id not in primary_intents:
+            primary.append(entry)
+            primary_intents.add(intent_id)
+            primary_intent_order.append(intent_id)
+        else:
+            reserves = reserve_by_intent.setdefault(intent_id, [])
+            if len(reserves) < max(0, max_reserve_per_intent):
+                reserves.append(entry)
+    reserve_waves = [
+        [
+            reserve_by_intent[intent_id][index]
+            for intent_id in primary_intent_order
+            if index < len(reserve_by_intent.get(intent_id, []))
+        ]
+        for index in range(
+            max((len(items) for items in reserve_by_intent.values()), default=0)
+        )
+    ]
+    return primary, reserve_waves
+
+
+def _search_outcome_has_source_coverage(
+    outcome: object,
+    *,
+    min_results: int = 2,
+    min_owners: int = 2,
+) -> bool:
+    if isinstance(outcome, Exception) or not isinstance(outcome, (list, tuple)):
+        return False
+    owners = set()
+    result_urls = set()
+    for item in outcome:
+        if not isinstance(item, dict):
+            continue
+        url = normalize_search_url(str(item.get("url") or ""))
+        if url:
+            result_urls.add(url)
+        domain = normalize_domain(
+            str(item.get("domain") or get_domain(url))
+        )
+        owner = estimate_source_owner_domain(domain)
+        if owner:
+            owners.add(owner)
+    return len(result_urls) >= min_results and len(owners) >= min_owners
+
+
+def _resolved_search_intents(
+    intent_ids: list[str],
+    outcomes: list[object],
+    *,
+    mode: str,
+) -> set[str]:
+    grouped: dict[str, list[dict]] = {}
+    for intent_id, outcome in zip(intent_ids, outcomes):
+        if isinstance(outcome, (list, tuple)):
+            grouped.setdefault(intent_id, []).extend(
+                item for item in outcome if isinstance(item, dict)
+            )
+    min_results, min_owners = (6, 3) if mode == "deep" else (2, 2)
+    return {
+        intent_id
+        for intent_id, candidates in grouped.items()
+        if _search_outcome_has_source_coverage(
+            candidates,
+            min_results=min_results,
+            min_owners=min_owners,
+        )
+    }
 
 
 async def _invalidate_ingestion_attempt_bounded(
@@ -687,6 +909,35 @@ def _stamp_retrieval_context(items: List[dict], context: dict) -> List[dict]:
         stamped.append(copy)
 
     return stamped
+
+
+def _search_discovery_provenance(item: dict) -> dict:
+    """Keep search discovery provenance separate from later page extraction."""
+    cached_at = item.get("search_cached_at_utc")
+    return {
+        "search_cache_status": item.get("search_cache_status"),
+        "search_cached_at_utc": cached_at,
+        "discovery_retrieved_at_utc": cached_at
+        or item.get("retrieved_at_utc"),
+        "discovery_freshness": item.get("freshness"),
+        "discovery_freshness_status": item.get("freshness_status"),
+        "discovery_freshness_unverified": bool(
+            item.get("freshness_unverified")
+        ),
+    }
+
+
+def _failed_crawl_retrieval_context(result: dict, context: dict) -> dict:
+    if not result.get("freshness_unverified"):
+        return context
+    output = dict(context)
+    output["retrieved_at_utc"] = (
+        result.get("retrieved_at_utc")
+        or result.get("search_cached_at_utc")
+        or context.get("retrieved_at_utc")
+    )
+    output["freshness"] = result.get("freshness") or "stale_cache_unverified"
+    return output
 
 
 def _compact_found_sections(sections: dict) -> dict:
@@ -1090,6 +1341,7 @@ async def crawl_source(
     requested_url = result["url"]
     final_url = requested_url
     retrieval_context = result.get("retrieval_context") or runtime_retrieval_context()
+    discovery_provenance = _search_discovery_provenance(result)
 
     content = ""
     title = result.get("title")
@@ -1169,17 +1421,25 @@ async def crawl_source(
                 content = ""
 
     if not content:
+        failure_retrieval_context = _failed_crawl_retrieval_context(
+            result,
+            retrieval_context,
+        )
         return {
             "ok": False,
             "url": requested_url,
             "title": result.get("title"),
             "domain": result.get("domain"),
-            "retrieval_context": retrieval_context,
-            "retrieved_at_utc": retrieval_context.get("retrieved_at_utc"),
-            "retrieval_current_date_utc": retrieval_context.get("current_date_utc"),
-            "freshness": retrieval_context.get("freshness"),
+            "retrieval_context": failure_retrieval_context,
+            "retrieved_at_utc": failure_retrieval_context.get("retrieved_at_utc"),
+            "retrieval_current_date_utc": failure_retrieval_context.get(
+                "current_date_utc"
+            ),
+            "freshness": failure_retrieval_context.get("freshness"),
             "published_at": result.get("published_at"),
             "freshness_status": result.get("freshness_status"),
+            "freshness_unverified": bool(result.get("freshness_unverified")),
+            **discovery_provenance,
             "search_engine": result.get("engine"),
             "search_rank": result.get("search_rank"),
             "reason": "; ".join(errors) or "No crawlable content returned",
@@ -1201,6 +1461,10 @@ async def crawl_source(
         "source_reason": result.get("score_reasons", []),
         "published_at": result.get("published_at"),
         "freshness_status": result.get("freshness_status"),
+        # The page content was fetched now; stale discovery metadata remains
+        # separately labeled and must not downgrade current extraction time.
+        "freshness_unverified": False,
+        **discovery_provenance,
         "search_engine": result.get("engine"),
         "search_rank": result.get("search_rank"),
         "extraction_method": method,
@@ -1251,6 +1515,20 @@ async def _write_crawled_source_artifact(
             "retrieved_at_utc": retrieval_context.get("retrieved_at_utc"),
             "published_at": output.get("published_at"),
             "freshness_status": output.get("freshness_status"),
+            "freshness": output.get("freshness"),
+            "freshness_unverified": bool(output.get("freshness_unverified")),
+            "search_cache_status": output.get("search_cache_status"),
+            "search_cached_at_utc": output.get("search_cached_at_utc"),
+            "discovery_retrieved_at_utc": output.get(
+                "discovery_retrieved_at_utc"
+            ),
+            "discovery_freshness": output.get("discovery_freshness"),
+            "discovery_freshness_status": output.get(
+                "discovery_freshness_status"
+            ),
+            "discovery_freshness_unverified": bool(
+                output.get("discovery_freshness_unverified")
+            ),
             "search_engine": output.get("search_engine"),
             "search_rank": output.get("search_rank"),
         },
@@ -1419,6 +1697,24 @@ async def persist_crawled_source(
                     "content_type": "webpage",
                     "published_at": output.get("published_at"),
                     "freshness_status": output.get("freshness_status"),
+                    "freshness": output.get("freshness"),
+                    "freshness_unverified": bool(
+                        output.get("freshness_unverified")
+                    ),
+                    "search_cache_status": output.get("search_cache_status"),
+                    "search_cached_at_utc": output.get(
+                        "search_cached_at_utc"
+                    ),
+                    "discovery_retrieved_at_utc": output.get(
+                        "discovery_retrieved_at_utc"
+                    ),
+                    "discovery_freshness": output.get("discovery_freshness"),
+                    "discovery_freshness_status": output.get(
+                        "discovery_freshness_status"
+                    ),
+                    "discovery_freshness_unverified": bool(
+                        output.get("discovery_freshness_unverified")
+                    ),
                     "search_engine": output.get("search_engine"),
                     "search_rank": output.get("search_rank"),
                     "retrieved_at_utc": retrieval_context.get("retrieved_at_utc"),
@@ -1592,6 +1888,20 @@ def build_evidence_pack(results: List[dict]) -> List[dict]:
                 "retrieved_at_utc": item.get("retrieved_at_utc") or item.get("ingested_at"),
                 "published_at": item.get("published_at"),
                 "freshness_status": item.get("freshness_status"),
+                "freshness": item.get("freshness"),
+                "freshness_unverified": bool(item.get("freshness_unverified")),
+                "search_cache_status": item.get("search_cache_status"),
+                "search_cached_at_utc": item.get("search_cached_at_utc"),
+                "discovery_retrieved_at_utc": item.get(
+                    "discovery_retrieved_at_utc"
+                ),
+                "discovery_freshness": item.get("discovery_freshness"),
+                "discovery_freshness_status": item.get(
+                    "discovery_freshness_status"
+                ),
+                "discovery_freshness_unverified": bool(
+                    item.get("discovery_freshness_unverified")
+                ),
                 "search_engine": item.get("search_engine"),
                 "search_rank": item.get("search_rank"),
                 "research_run_id": item.get("research_run_id"),
@@ -1685,6 +1995,15 @@ def build_search_snippet_evidence(
             or freshness_status in {"outside_window", "outside_requested_window", "stale"}
         ):
             continue
+        stale_cache = candidate.get("search_cache_status") == "stale_fallback"
+        limitations = (
+            "Discovery snippet only; the linked page was not available as extracted evidence."
+        )
+        if stale_cache:
+            limitations += (
+                " Discovery came from an explicitly stale cache fallback after a transient "
+                "search failure; current publication freshness is unverified."
+            )
         output.append(
             {
                 "evidence_id": 0,
@@ -1697,15 +2016,19 @@ def build_search_snippet_evidence(
                 "published_at": candidate.get("published_at"),
                 "retrieved_at_utc": candidate.get("retrieved_at_utc"),
                 "freshness_status": candidate.get("freshness_status"),
+                "freshness": candidate.get("freshness"),
+                "freshness_unverified": bool(
+                    candidate.get("freshness_unverified")
+                ),
+                "search_cache_status": candidate.get("search_cache_status"),
+                "search_cached_at_utc": candidate.get("search_cached_at_utc"),
                 "search_engine": candidate.get("engine"),
                 "search_rank": candidate.get("search_rank"),
                 "source_score": candidate.get("score"),
                 "content_trust": "untrusted_external_content",
                 "evidence_type": "search_result_snippet",
                 "confidence": "low",
-                "limitations": (
-                    "Discovery snippet only; the linked page was not available as extracted evidence."
-                ),
+                "limitations": limitations,
             }
         )
         existing_urls.add(url)
@@ -1727,6 +2050,7 @@ async def _research_pipeline_impl(
     defer_persistence: bool = False,
     ingestion_attempt_id: Optional[str] = None,
     ingestion_order_ns: Optional[int] = None,
+    search_cache_scope: Optional[str] = None,
 ) -> dict:
     start = time.monotonic()
     retrieval_context = runtime_retrieval_context()
@@ -1816,37 +2140,87 @@ async def _research_pipeline_impl(
             "duration_seconds": round(time.monotonic() - start, 2),
         }
 
-    search_queries = list(plan.get("queries") or [query])
+    planned_search_queries = list(plan.get("queries") or [query])
     raw_intent_ids = plan.get("query_intent_ids")
     if not isinstance(raw_intent_ids, list) or len(raw_intent_ids) != len(
-        search_queries
+        planned_search_queries
     ):
-        search_intent_ids = [f"query-{index}" for index in range(len(search_queries))]
+        # Malformed or legacy planner output must not turn every query variant
+        # into an independent primary wave. Treat it as one intent and retain
+        # only the mode's bounded reserve-query allowance.
+        planned_search_intent_ids = ["intent-1"] * len(planned_search_queries)
     else:
-        search_intent_ids = [
+        planned_search_intent_ids = [
             str(value or f"query-{index}")[:100]
             for index, value in enumerate(raw_intent_ids)
         ]
-    search_policies = [
+    planned_search_policies = [
         infer_search_policy(
             item,
             mode,
             current_date=retrieval_context.get("current_date_local"),
             timezone_name=retrieval_context.get("timezone"),
         )
-        for item in search_queries
+        for item in planned_search_queries
     ]
+    primary_queries, reserve_waves = _partition_search_query_waves(
+        planned_search_queries,
+        planned_search_policies,
+        planned_search_intent_ids,
+        max_reserve_per_intent=(4 if mode == "deep" else 1),
+    )
+    search_queries = [item[0] for item in primary_queries]
+    search_policies = [item[1] for item in primary_queries]
+    search_intent_ids = [item[2] for item in primary_queries]
     search_budget_seconds = min(
         float(config.get("search_budget", 30.0)),
         max(0.0, research_deadline - time.monotonic()),
     )
+    search_started = time.monotonic()
     search_outcomes = await _run_search_batch_bounded(
         search_queries,
         search_policies,
         max_results=search_results_value,
         mode=mode,
         timeout_seconds=search_budget_seconds,
+        cache_scope=search_cache_scope,
     )
+    resolved_intents = _resolved_search_intents(
+        search_intent_ids,
+        search_outcomes,
+        mode=mode,
+    )
+    fallback_variant_executed = False
+    for reserve_wave in reserve_waves:
+        fallback_queries = [
+            item for item in reserve_wave if item[2] not in resolved_intents
+        ]
+        if not fallback_queries:
+            continue
+        fallback_budget_seconds = min(
+            max(0.0, search_budget_seconds - (time.monotonic() - search_started)),
+            max(0.0, research_deadline - time.monotonic()),
+        )
+        if fallback_budget_seconds <= 0:
+            break
+        fallback_outcomes = await _run_search_batch_bounded(
+            [item[0] for item in fallback_queries],
+            [item[1] for item in fallback_queries],
+            max_results=search_results_value,
+            mode=mode,
+            timeout_seconds=fallback_budget_seconds,
+            cache_scope=search_cache_scope,
+        )
+        search_queries.extend(item[0] for item in fallback_queries)
+        search_policies.extend(item[1] for item in fallback_queries)
+        search_intent_ids.extend(item[2] for item in fallback_queries)
+        search_outcomes.extend(fallback_outcomes)
+        fallback_variant_executed = True
+        resolved_intents = _resolved_search_intents(
+            search_intent_ids,
+            search_outcomes,
+            mode=mode,
+        )
 
     merged_candidates: Dict[str, dict] = {}
     search_errors = []
@@ -1870,6 +2244,19 @@ async def _research_pipeline_impl(
         diagnostics = _compact_search_diagnostics(search_query, outcome, phase)
         if diagnostics:
             search_diagnostics.append(diagnostics)
+            if diagnostics.get("acquisition_status") == "failed":
+                acquisition_error = diagnostics.get("acquisition_error") or {}
+                error_code = str(
+                    acquisition_error.get("code")
+                    or "search_backend_unavailable"
+                )[:100]
+                search_errors.append(
+                    {
+                        "query": search_query,
+                        "phase": phase,
+                        "error": error_code,
+                    }
+                )
 
         for candidate in _stamp_retrieval_context(outcome, retrieval_context):
             candidate = dict(candidate)
@@ -1922,7 +2309,10 @@ async def _research_pipeline_impl(
 
     fallback_metadata = None
     successful_search = any(
-        not isinstance(outcome, Exception) for outcome in search_outcomes
+        not isinstance(outcome, Exception)
+        and getattr(outcome, "diagnostics", {}).get("acquisition_status")
+        != "failed"
+        for outcome in search_outcomes
     )
     any_accepted_results = any(
         bool(outcome)
@@ -1979,6 +2369,7 @@ async def _research_pipeline_impl(
         not merged_candidates
         and successful_search
         and not any_accepted_results
+        and not fallback_variant_executed
         and recovery_query
         and (can_relax_engine_time_range or recovery_query_is_new)
     )
@@ -2022,12 +2413,15 @@ async def _research_pipeline_impl(
             if fallback_timeout <= 0:
                 raise TimeoutError
             async with asyncio.timeout(fallback_timeout):
-                fallback_outcome = await searxng_search(
-                    query=recovery_query,
-                    max_results=search_results_value,
-                    mode=mode,
-                    policy=recovery_policy,
-                )
+                fallback_kwargs = {
+                    "query": recovery_query,
+                    "max_results": search_results_value,
+                    "mode": mode,
+                    "policy": recovery_policy,
+                }
+                if search_cache_scope:
+                    fallback_kwargs["cache_scope"] = search_cache_scope
+                fallback_outcome = await searxng_search(**fallback_kwargs)
         except Exception as exc:
             fallback_outcome = exc
         search_queries.append(recovery_query)
@@ -2105,6 +2499,10 @@ async def _research_pipeline_impl(
                     or retrieval_context.get("freshness"),
                     "published_at": original.get("published_at"),
                     "freshness_status": original.get("freshness_status"),
+                    "freshness_unverified": bool(
+                        original.get("freshness_unverified")
+                    ),
+                    **_search_discovery_provenance(original),
                     "search_engine": original.get("engine"),
                     "search_rank": original.get("search_rank"),
                     "reason": _safe_error_detail(reason),
@@ -2659,6 +3057,11 @@ async def _research_pipeline_impl(
                 "publication metadata matching that date; do not present undated evidence as "
                 "date-verified, and do not imply the page itself independently confirmed the date."
             ),
+            (
+                "Evidence marked freshness_unverified or stale_fallback came from an explicitly "
+                "stale discovery cache after a transient search failure; do not present its "
+                "publication freshness as currently verified."
+            ),
             "Cite URLs inline.",
             "Mention uncertainty if sources conflict or evidence is incomplete.",
             "Prefer official, primary, technical, or authoritative sources.",
@@ -2723,6 +3126,7 @@ async def research_pipeline(
     defer_persistence: bool = False,
     ingestion_attempt_id: Optional[str] = None,
     ingestion_order_ns: Optional[int] = None,
+    search_cache_scope: Optional[str] = None,
 ) -> dict:
     """Run research under one ingestion attempt that can be revoked on cancellation."""
     effective_attempt_id = ingestion_attempt_id or uuid.uuid4().hex
@@ -2741,6 +3145,7 @@ async def research_pipeline(
             defer_persistence=defer_persistence,
             ingestion_attempt_id=effective_attempt_id,
             ingestion_order_ns=ingestion_order_ns,
+            search_cache_scope=search_cache_scope,
         )
     except asyncio.CancelledError as cancellation:
         if not defer_persistence and mode != "local_only" and max_sources != 0:

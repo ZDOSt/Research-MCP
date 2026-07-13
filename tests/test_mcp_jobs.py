@@ -1,4 +1,5 @@
 import importlib.util
+import hashlib
 import os
 import sys
 import tempfile
@@ -546,6 +547,88 @@ class MCPJobIntegrationTests(unittest.IsolatedAsyncioTestCase):
             result = await server.start_research("q")
         self.assertEqual(result["error"], "job_queue_full")
         self.assertTrue(result["retryable"])
+
+    async def test_research_admission_limit_is_a_structured_tool_response(self):
+        server = load_mcp_server()
+        limited = server.ResearchAdmissionLimitedError(
+            "rolling_window",
+            retry_after_seconds=37,
+            active_jobs=0,
+            max_active=1,
+            recent_jobs=2,
+            max_new_jobs=2,
+            window_seconds=60,
+        )
+        with patch.object(server, "enqueue_job", AsyncMock(side_effect=limited)):
+            sync_result = await server._enqueue_and_wait(
+                "research_web",
+                {"query": "third request"},
+                "research_web",
+            )
+            durable_result = await server.start_research("third request")
+
+        for result, tool_name in (
+            (sync_result, "research_web"),
+            (durable_result, "start_research"),
+        ):
+            self.assertEqual(result["error"], "research_admission_limited")
+            self.assertEqual(result["tool"], tool_name)
+            self.assertEqual(result["reason"], "rolling_window")
+            self.assertTrue(result["retryable"])
+            self.assertEqual(result["retry_after_seconds"], 37)
+            self.assertEqual(result["limits"]["recent_jobs"], 2)
+            self.assertEqual(result["limits"]["max_new_jobs"], 2)
+            self.assertIn("retrieval_context", result)
+
+    async def test_anonymous_admission_denial_is_not_marked_retryable(self):
+        server = load_mcp_server()
+        limited = server.ResearchAdmissionLimitedError(
+            "anonymous_disabled",
+            retry_after_seconds=60,
+            active_jobs=0,
+            max_active=1,
+            recent_jobs=0,
+            max_new_jobs=2,
+            window_seconds=60,
+        )
+        with patch.object(server, "enqueue_job", AsyncMock(side_effect=limited)):
+            result = await server.start_research("question")
+
+        self.assertEqual(result["error"], "research_admission_limited")
+        self.assertFalse(result["retryable"])
+        self.assertIn("authenticated", " ".join(result["answering_instructions"]))
+
+    async def test_inline_backend_does_not_use_redis_admission(self):
+        server = load_mcp_server(backend="inline")
+        pipeline = AsyncMock(return_value={"query": "local", "evidence": []})
+        with patch.object(server, "enqueue_job", AsyncMock()) as enqueue, patch.object(
+            server,
+            "research_pipeline",
+            pipeline,
+        ):
+            result = await server.research_web("local")
+
+        enqueue.assert_not_awaited()
+        pipeline.assert_awaited_once()
+        self.assertEqual(result["query"], "local")
+
+    async def test_inline_research_scopes_cache_to_current_principal(self):
+        server = load_mcp_server(backend="inline")
+        pipeline = AsyncMock(return_value={"query": "local", "evidence": []})
+
+        with patch.object(
+            server,
+            "_current_principal_id",
+            return_value="client-a",
+        ), patch.object(server, "research_pipeline", pipeline):
+            await server.research_web("local")
+
+        expected_scope = hashlib.sha256(b"owner\x00client-a").hexdigest()
+        self.assertEqual(
+            pipeline.await_args.kwargs["search_cache_scope"],
+            expected_scope,
+        )
+        self.assertNotIn("client-a", str(pipeline.await_args.kwargs))
 
     def test_auth_provider_is_optional_and_configures_required_scope(self):
         open_server = load_mcp_server(auth_token="")

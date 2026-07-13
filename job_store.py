@@ -74,6 +74,33 @@ class JobQueueFullError(JobStoreError):
     """Raised when queue admission would exceed the configured pending limit."""
 
 
+class ResearchAdmissionLimitedError(JobStoreError):
+    """Raised when an owner's research admission budget is exhausted."""
+
+    def __init__(
+        self,
+        reason: str,
+        *,
+        retry_after_seconds: int,
+        active_jobs: int,
+        max_active: int,
+        recent_jobs: int,
+        max_new_jobs: int,
+        window_seconds: int,
+    ) -> None:
+        self.reason = str(reason)
+        self.retry_after_seconds = max(1, int(retry_after_seconds))
+        self.active_jobs = max(0, int(active_jobs))
+        self.max_active = max(0, int(max_active))
+        self.recent_jobs = max(0, int(recent_jobs))
+        self.max_new_jobs = max(0, int(max_new_jobs))
+        self.window_seconds = max(0, int(window_seconds))
+        super().__init__(
+            "research admission budget exhausted; "
+            f"retry after {self.retry_after_seconds} seconds"
+        )
+
+
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -195,6 +222,11 @@ def _env_int(name: str, default: int, minimum: int = 0) -> int:
         return default
 
 
+def _env_choice(name: str, default: str, choices: set[str]) -> str:
+    value = os.getenv(name, default).strip().lower()
+    return value if value in choices else default
+
+
 class RedisJobStore:
     """Queue and job state backed by Redis hashes and reliable lists."""
 
@@ -204,6 +236,10 @@ class RedisJobStore:
         queue_name: Optional[str] = None,
         result_ttl_seconds: Optional[int] = None,
         ingestion_waitaof_timeout_ms: Optional[int] = None,
+        research_admission_max_active: Optional[int] = None,
+        research_admission_max_new_jobs: Optional[int] = None,
+        research_admission_window_seconds: Optional[int] = None,
+        research_admission_anonymous: Optional[str] = None,
         redis_client: Any = None,
     ) -> None:
         self.redis_url = redis_url or os.getenv("REDIS_URL", "redis://redis:6379/0")
@@ -243,6 +279,35 @@ class RedisJobStore:
             if ingestion_waitaof_timeout_ms is None
             else max(0, int(ingestion_waitaof_timeout_ms))
         )
+        self.research_admission_max_active = (
+            _env_int("RESEARCH_ADMISSION_MAX_ACTIVE", 1)
+            if research_admission_max_active is None
+            else max(0, int(research_admission_max_active))
+        )
+        self.research_admission_max_new_jobs = (
+            _env_int("RESEARCH_ADMISSION_MAX_NEW_JOBS", 2)
+            if research_admission_max_new_jobs is None
+            else max(0, int(research_admission_max_new_jobs))
+        )
+        self.research_admission_window_seconds = (
+            _env_int("RESEARCH_ADMISSION_WINDOW_SECONDS", 60)
+            if research_admission_window_seconds is None
+            else max(0, int(research_admission_window_seconds))
+        )
+        anonymous_mode = (
+            _env_choice(
+                "RESEARCH_ADMISSION_ANONYMOUS",
+                "shared",
+                {"shared", "off", "deny"},
+            )
+            if research_admission_anonymous is None
+            else str(research_admission_anonymous).strip().lower()
+        )
+        if anonymous_mode not in {"shared", "off", "deny"}:
+            raise ValueError(
+                "RESEARCH_ADMISSION_ANONYMOUS must be shared, off, or deny"
+            )
+        self.research_admission_anonymous = anonymous_mode
 
         if redis_client is not None:
             self.redis = redis_client
@@ -261,6 +326,53 @@ class RedisJobStore:
         if not _COALESCE_FINGERPRINT_RE.fullmatch(value):
             raise InvalidJobError("coalescing fingerprint is invalid")
         return f"{self.active_job_key_prefix}{value}"
+
+    def _research_admission_keys(
+        self,
+        owner_id: Optional[str],
+    ) -> Optional[tuple[str, str]]:
+        if owner_id is None:
+            if self.research_admission_anonymous == "off":
+                return None
+            identity = b"anonymous"
+        else:
+            identity = b"owner\x00" + owner_id.encode("utf-8")
+        digest = hashlib.sha256(identity).hexdigest()
+        prefix = f"{self.queue_key}:research-admission:{digest}"
+        return f"{prefix}:active", f"{prefix}:history"
+
+    async def _active_research_admissions(
+        self,
+        pipe: Any,
+        active_key: str,
+        owner_id: Optional[str],
+    ) -> tuple[list[str], list[str]]:
+        """Return active and stale admission members while watching their jobs."""
+        raw_job_ids = await pipe.zrange(active_key, 0, -1)
+        active: list[str] = []
+        stale: list[str] = []
+        for raw_job_id in raw_job_ids:
+            member = _decode(raw_job_id)
+            try:
+                job_id = validate_job_id(member)
+            except InvalidJobError:
+                stale.append(member)
+                continue
+            job_key = self._job_key(job_id)
+            await pipe.watch(job_key)
+            raw_record = await pipe.hgetall(job_key)
+            if not raw_record:
+                stale.append(member)
+                continue
+            record = _decode_mapping(raw_record)
+            record_owner = record.get("owner_id") or None
+            reusable = (
+                record.get("kind") == "research_web"
+                and record_owner == owner_id
+                and record.get("status") in {QUEUED, RUNNING}
+            )
+            (active if reusable else stale).append(job_id)
+        return active, stale
 
     async def _matching_active_job_key(
         self,
@@ -336,6 +448,28 @@ class RedisJobStore:
             if coalesce_fingerprint is not None
             else None
         )
+        admission_active_enabled = self.research_admission_max_active > 0
+        admission_window_enabled = (
+            self.research_admission_max_new_jobs > 0
+            and self.research_admission_window_seconds > 0
+        )
+        admission_anonymous_denied = (
+            kind_value == "research_web"
+            and owner_id_value is None
+            and self.research_admission_anonymous == "deny"
+        )
+        admission_keys = (
+            self._research_admission_keys(owner_id_value)
+            if kind_value == "research_web"
+            and (
+                admission_active_enabled
+                or admission_window_enabled
+                or admission_anonymous_denied
+            )
+            else None
+        )
+        admission_active_key = admission_keys[0] if admission_keys else None
+        admission_history_key = admission_keys[1] if admission_keys else None
         now = utc_now_iso()
         record = {
             "job_id": job_id_value,
@@ -359,10 +493,26 @@ class RedisJobStore:
                     watched_keys = [key, self.queue_key]
                     if active_key is not None:
                         watched_keys.append(active_key)
+                    if admission_active_key is not None:
+                        watched_keys.append(admission_active_key)
+                    if admission_history_key is not None:
+                        watched_keys.append(admission_history_key)
                     await pipe.watch(*watched_keys)
                     if await pipe.exists(key):
                         await pipe.unwatch()
                         raise InvalidJobError(f"job_id already exists: {job_id_value}")
+
+                    if admission_anonymous_denied:
+                        await pipe.unwatch()
+                        raise ResearchAdmissionLimitedError(
+                            "anonymous_disabled",
+                            retry_after_seconds=60,
+                            active_jobs=0,
+                            max_active=self.research_admission_max_active,
+                            recent_jobs=0,
+                            max_new_jobs=self.research_admission_max_new_jobs,
+                            window_seconds=self.research_admission_window_seconds,
+                        )
 
                     if active_key is not None:
                         raw_existing_job_id = await pipe.get(active_key)
@@ -405,6 +555,108 @@ class RedisJobStore:
                                         )
                                         result["coalesced"] = True
                                         return result
+
+                    admission_now = 0.0
+                    admission_cutoff = 0.0
+                    if admission_keys is not None:
+                        redis_seconds, redis_microseconds = await pipe.time()
+                        admission_now = float(redis_seconds) + (
+                            float(redis_microseconds) / 1_000_000
+                        )
+                        admission_cutoff = (
+                            admission_now
+                            - self.research_admission_window_seconds
+                        )
+                    active_admissions: list[str] = []
+                    stale_admissions: list[str] = []
+                    if admission_active_key is not None and admission_active_enabled:
+                        (
+                            active_admissions,
+                            stale_admissions,
+                        ) = await self._active_research_admissions(
+                            pipe,
+                            admission_active_key,
+                            owner_id_value,
+                        )
+
+                    recent_scores: list[float] = []
+                    if admission_history_key is not None and admission_window_enabled:
+                        raw_history = await pipe.zrange(
+                            admission_history_key,
+                            0,
+                            -1,
+                            withscores=True,
+                        )
+                        recent_scores = [
+                            float(score)
+                            for _, score in raw_history
+                            if float(score) > admission_cutoff
+                        ]
+
+                    admission_reason: Optional[str] = None
+                    retry_after_seconds = 5
+                    active_limited = (
+                        admission_active_enabled
+                        and len(active_admissions)
+                        >= self.research_admission_max_active
+                    )
+                    window_limited = (
+                        admission_window_enabled
+                        and len(recent_scores)
+                        >= self.research_admission_max_new_jobs
+                    )
+                    window_retry_after = (
+                        max(
+                            1,
+                            math.ceil(
+                                min(recent_scores)
+                                + self.research_admission_window_seconds
+                                - admission_now
+                            ),
+                        )
+                        if window_limited
+                        else 0
+                    )
+                    if active_limited:
+                        admission_reason = "active_limit"
+                        retry_after_seconds = max(
+                            retry_after_seconds,
+                            window_retry_after,
+                        )
+                    elif window_limited:
+                        admission_reason = "rolling_window"
+                        retry_after_seconds = window_retry_after
+
+                    if admission_reason is not None:
+                        pipe.multi()
+                        if admission_history_key is not None:
+                            pipe.zremrangebyscore(
+                                admission_history_key,
+                                "-inf",
+                                admission_cutoff,
+                            )
+                            pipe.expire(
+                                admission_history_key,
+                                max(1, self.research_admission_window_seconds + 1),
+                            )
+                        if admission_active_key is not None:
+                            if stale_admissions:
+                                pipe.zrem(admission_active_key, *stale_admissions)
+                            pipe.expire(
+                                admission_active_key,
+                                self.active_job_index_ttl_seconds,
+                            )
+                        await pipe.execute()
+                        raise ResearchAdmissionLimitedError(
+                            admission_reason,
+                            retry_after_seconds=retry_after_seconds,
+                            active_jobs=len(active_admissions),
+                            max_active=self.research_admission_max_active,
+                            recent_jobs=len(recent_scores),
+                            max_new_jobs=self.research_admission_max_new_jobs,
+                            window_seconds=self.research_admission_window_seconds,
+                        )
+
                     queued_count = int(await pipe.llen(self.queue_key))
                     if self.max_queued_jobs > 0 and queued_count >= self.max_queued_jobs:
                         await pipe.unwatch()
@@ -419,6 +671,31 @@ class RedisJobStore:
                             active_key,
                             job_id_value,
                             ex=self.active_job_index_ttl_seconds,
+                        )
+                    if admission_active_key is not None and admission_active_enabled:
+                        if stale_admissions:
+                            pipe.zrem(admission_active_key, *stale_admissions)
+                        pipe.zadd(
+                            admission_active_key,
+                            {job_id_value: admission_now},
+                        )
+                        pipe.expire(
+                            admission_active_key,
+                            self.active_job_index_ttl_seconds,
+                        )
+                    if admission_history_key is not None and admission_window_enabled:
+                        pipe.zremrangebyscore(
+                            admission_history_key,
+                            "-inf",
+                            admission_cutoff,
+                        )
+                        pipe.zadd(
+                            admission_history_key,
+                            {job_id_value: admission_now},
+                        )
+                        pipe.expire(
+                            admission_history_key,
+                            max(1, self.research_admission_window_seconds + 1),
                         )
                     await pipe.execute()
                     result = self._public_job(record, include_payload=False)

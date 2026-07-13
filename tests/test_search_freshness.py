@@ -685,7 +685,7 @@ def test_news_ranking_preserves_searx_rank_and_does_not_globally_boost_docs():
 
 @pytest.mark.asyncio
 async def test_searx_request_applies_policy_and_surfaces_engine_diagnostics(monkeypatch):
-    captured = {}
+    captured = []
     payload = {
         "results": [
             {
@@ -727,7 +727,7 @@ async def test_searx_request_applies_policy_and_surfaces_engine_diagnostics(monk
             return None
 
         def stream(self, method, url, **kwargs):
-            captured.update({"method": method, "url": url, **kwargs})
+            captured.append({"method": method, "url": url, **kwargs})
             return Response()
 
     monkeypatch.setattr(searching, "SEARXNG_URL", "http://searxng:8080")
@@ -738,16 +738,17 @@ async def test_searx_request_applies_policy_and_surfaces_engine_diagnostics(monk
         current_date="2026-07-13",
     )
 
-    assert captured["params"] == {
+    assert captured[0]["params"] == {
         "q": "today's AI news 2026-07-13",
         "format": "json",
-        "categories": "news,general",
         "language": "auto",
+        "engines": "reuters,bing news",
         "time_range": "day",
     }
+    assert all("categories" not in request["params"] for request in captured)
     assert results.diagnostics["search_policy"]["target_date"] == "2026-07-13"
     assert results.diagnostics["counts"]["exact_match_results"] == 1
     assert results.diagnostics["unresponsive_engines"] == [
-        {"engine": "bing news", "reason": "timeout"},
-        {"engine": "example engine", "reason": "rate limited"},
+        {"engine": "bing news", "reason_code": "timeout"},
+        {"engine": "example engine", "reason_code": "rate_limited"},
     ]

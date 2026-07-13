@@ -654,12 +654,32 @@ class ComposeIsolationTests(unittest.TestCase):
             "${RESEARCH_SOURCE_CONCURRENCY:-3}",
         )
         self.assertEqual(
+            worker_environment["SEARCH_QUERY_CONCURRENCY"],
+            "${SEARCH_QUERY_CONCURRENCY:-2}",
+        )
+        self.assertEqual(
+            worker_environment["SEARCH_CACHE_TTL_SECONDS"],
+            "${SEARCH_CACHE_TTL_SECONDS:-600}",
+        )
+        self.assertEqual(
+            worker_environment["SEARCH_ENGINE_RATE_LIMIT_COOLDOWN_SECONDS"],
+            "${SEARCH_ENGINE_RATE_LIMIT_COOLDOWN_SECONDS:-900}",
+        )
+        self.assertEqual(
             gateway_environment["MCP_JOB_LONG_POLL_SECONDS"],
             "${MCP_JOB_LONG_POLL_SECONDS:-15}",
         )
         self.assertEqual(
             gateway_environment["MCP_SYNC_JOB_WAIT_SECONDS"],
             "${MCP_SYNC_JOB_WAIT_SECONDS:-60}",
+        )
+        self.assertEqual(
+            gateway_environment["RESEARCH_ADMISSION_MAX_ACTIVE"],
+            "${RESEARCH_ADMISSION_MAX_ACTIVE:-1}",
+        )
+        self.assertEqual(
+            gateway_environment["RESEARCH_ADMISSION_MAX_NEW_JOBS"],
+            "${RESEARCH_ADMISSION_MAX_NEW_JOBS:-2}",
         )
 
     def test_persistence_worker_uses_its_own_queue_and_can_bootstrap_model(self):

@@ -10,6 +10,190 @@ from searching import SearchResults
 
 
 @pytest.mark.asyncio
+async def test_search_batch_caps_upstream_query_concurrency(monkeypatch):
+    active = 0
+    peak_active = 0
+
+    async def search(*, query, **_kwargs):
+        nonlocal active, peak_active
+        active += 1
+        peak_active = max(peak_active, active)
+        try:
+            await asyncio.sleep(0.02)
+            return [query]
+        finally:
+            active -= 1
+
+    monkeypatch.setattr(pipelines, "SEARCH_QUERY_CONCURRENCY", 2)
+    monkeypatch.setattr(pipelines, "searxng_search", search)
+
+    outcomes = await pipelines._run_search_batch_bounded(
+        ["one", "two", "three", "four"],
+        [None, None, None, None],
+        max_results=4,
+        mode="balanced",
+        timeout_seconds=1,
+    )
+
+    assert outcomes == [["one"], ["two"], ["three"], ["four"]]
+    assert peak_active == 2
+
+
+def test_search_query_waves_keep_one_primary_and_one_reserve_per_intent():
+    primary, reserve_waves = pipelines._partition_search_query_waves(
+        ["news", "news primary", "install", "news overview", "install docs"],
+        [1, 2, 3, 4, 5],
+        ["news", "news", "install", "news", "install"],
+    )
+
+    assert primary == [("news", 1, "news"), ("install", 3, "install")]
+    assert reserve_waves == [
+        [
+            ("news primary", 2, "news"),
+            ("install docs", 5, "install"),
+        ]
+    ]
+
+
+def test_deep_search_retains_ordered_reserve_waves():
+    primary, reserve_waves = pipelines._partition_search_query_waves(
+        ["topic", "topic docs", "topic primary", "topic independent", "topic overview"],
+        [1, 2, 3, 4, 5],
+        ["topic"] * 5,
+        max_reserve_per_intent=4,
+    )
+
+    assert primary == [("topic", 1, "topic")]
+    assert reserve_waves == [
+        [("topic docs", 2, "topic")],
+        [("topic primary", 3, "topic")],
+        [("topic independent", 4, "topic")],
+        [("topic overview", 5, "topic")],
+    ]
+
+
+def test_search_outcome_coverage_requires_distinct_source_owners():
+    same_owner = [
+        {"url": "https://docs.example.com/one", "domain": "docs.example.com"},
+        {"url": "https://www.example.com/two", "domain": "www.example.com"},
+    ]
+    distinct_owners = same_owner + [
+        {"url": "https://other.example.net/three", "domain": "other.example.net"}
+    ]
+
+    assert pipelines._search_outcome_has_source_coverage(same_owner) is False
+    assert pipelines._search_outcome_has_source_coverage(distinct_owners) is True
+
+
+@pytest.mark.asyncio
+async def test_missing_intent_ids_cannot_execute_every_planner_variant(monkeypatch):
+    calls = []
+
+    async def plan(_query, mode):
+        return {
+            "query": "question",
+            "mode": mode,
+            "queries": ["question", "question docs", "question overview"],
+        }
+
+    async def search(*, query, **_kwargs):
+        calls.append(query)
+        return []
+
+    monkeypatch.setattr(pipelines, "build_research_plan", plan)
+    monkeypatch.setattr(pipelines, "searxng_search", search)
+    monkeypatch.setattr(
+        pipelines,
+        "rag_query_impl",
+        AsyncMock(return_value={"results": []}),
+    )
+
+    await pipelines.research_pipeline(
+        "question",
+        max_sources=0,
+        verify=False,
+        persist_source_artifacts=False,
+    )
+
+    assert calls == ["question", "question docs"]
+
+
+@pytest.mark.asyncio
+async def test_backend_failure_is_not_reported_as_an_ordinary_empty_search(monkeypatch):
+    async def plan(_query, mode):
+        return {"query": "question", "mode": mode, "queries": ["question"]}
+
+    async def search(**_kwargs):
+        return SearchResults(
+            [],
+            diagnostics={
+                "acquisition_status": "failed",
+                "failure_class": "transient",
+                "acquisition_error": {
+                    "code": "search_backend_unavailable",
+                    "successful_responses": 0,
+                    "responsive_engines": 0,
+                },
+                "engine_policy": "general",
+                "unresponsive_engines": [
+                    {
+                        "engine": "bing",
+                        "reason_code": "rate_limited",
+                        "retry_after_seconds": 900,
+                        "reason": "raw upstream details must not escape",
+                    }
+                ],
+                "cache": {"status": "miss"},
+                "search_stages": [
+                    {
+                        "stage": 1,
+                        "status": "service_circuit_open",
+                        "engines": [],
+                        "retry_after_seconds": 42,
+                        "skipped_cooldowns": [],
+                    }
+                ],
+            },
+        )
+
+    monkeypatch.setattr(pipelines, "build_research_plan", plan)
+    monkeypatch.setattr(pipelines, "searxng_search", search)
+    monkeypatch.setattr(
+        pipelines,
+        "rag_query_impl",
+        AsyncMock(return_value={"results": []}),
+    )
+
+    result = await pipelines.research_pipeline(
+        "question",
+        max_sources=0,
+        verify=False,
+        persist_source_artifacts=False,
+    )
+
+    assert result["completion"]["status"] == "insufficient"
+    assert "search_failures" in result["completion"]["reasons"]
+    assert result["search_errors"] == [
+        {
+            "query": "question",
+            "phase": "initial",
+            "error": "search_backend_unavailable",
+        }
+    ]
+    diagnostics = result["search_diagnostics"][0]
+    assert diagnostics["acquisition_status"] == "failed"
+    assert diagnostics["failure_class"] == "transient"
+    assert diagnostics["unresponsive_engines"] == [
+        {
+            "engine": "bing",
+            "reason_code": "rate_limited",
+            "retry_after_seconds": 900.0,
+        }
+    ]
+    assert diagnostics["search_stages"][0]["retry_after_seconds"] == 42
+
+
+@pytest.mark.asyncio
 async def test_crawl_and_ingest_preserves_search_provenance(monkeypatch):
     captured = []
 
@@ -241,6 +425,17 @@ def test_search_snippet_evidence_is_bounded_deduplicated_and_excludes_stale():
             "engine": "news",
             "search_rank": 1,
         },
+        {
+            "title": "Cached fallback result",
+            "url": "https://cached.example/story",
+            "domain": "cached.example",
+            "snippet": "Previously retrieved discovery metadata",
+            "retrieved_at_utc": "2026-07-13T08:00:00+00:00",
+            "search_cached_at_utc": "2026-07-13T08:00:00+00:00",
+            "search_cache_status": "stale_fallback",
+            "freshness": "stale_cache_unverified",
+            "freshness_unverified": True,
+        },
     ]
 
     evidence = pipelines.build_search_snippet_evidence(
@@ -249,11 +444,14 @@ def test_search_snippet_evidence_is_bounded_deduplicated_and_excludes_stale():
         limit=2,
     )
 
-    assert len(evidence) == 1
+    assert len(evidence) == 2
     assert evidence[0]["url"] == "https://current.example/story"
     assert len(evidence[0]["quote"]) == 1600
     assert evidence[0]["published_at"] == "2026-07-13T09:00:00+00:00"
     assert evidence[0]["evidence_type"] == "search_result_snippet"
+    assert evidence[1]["search_cache_status"] == "stale_fallback"
+    assert evidence[1]["freshness_unverified"] is True
+    assert "stale cache fallback" in evidence[1]["limitations"]
 
 
 def test_page_evidence_preserves_publication_and_search_metadata():
@@ -264,6 +462,9 @@ def test_page_evidence_preserves_publication_and_search_metadata():
                 "url": "https://news.example/story",
                 "published_at": "2026-07-13T08:30:00+00:00",
                 "freshness_status": "exact_match",
+                "freshness_unverified": True,
+                "search_cache_status": "stale_fallback",
+                "search_cached_at_utc": "2026-07-13T07:30:00+00:00",
                 "search_engine": "google news",
                 "search_rank": 3,
             }
@@ -274,6 +475,8 @@ def test_page_evidence_preserves_publication_and_search_metadata():
     assert evidence[0]["freshness_status"] == "exact_match"
     assert evidence[0]["search_engine"] == "google news"
     assert evidence[0]["search_rank"] == 3
+    assert evidence[0]["freshness_unverified"] is True
+    assert evidence[0]["search_cache_status"] == "stale_fallback"
     assert evidence[0]["evidence_type"] == "extracted_page_content"
 
 
@@ -318,8 +521,8 @@ async def test_research_uses_one_date_safe_recovery_and_surfaces_diagnostics(
                         "undated_results": 1,
                         "unresponsive_engines": 1,
                     },
-                    "unresponsive_engines": [
-                        {"engine": "news-engine", "reason": "timeout"}
+                        "unresponsive_engines": [
+                            {"engine": "news-engine", "reason_code": "timeout"}
                     ],
                 },
                 policy=policy,
@@ -391,7 +594,7 @@ async def test_research_uses_one_date_safe_recovery_and_surfaces_diagnostics(
         "freshness_recovery",
     ]
     assert result["search_diagnostics"][0]["unresponsive_engines"] == [
-        {"engine": "news-engine", "reason": "timeout"}
+        {"engine": "news-engine", "reason_code": "timeout"}
     ]
     assert result["evidence"][0]["url"] == "https://current.example/story"
     assert result["evidence"][0]["freshness_status"] == "exact_match"
@@ -1157,3 +1360,81 @@ async def test_interactive_deadline_returns_snippet_evidence_instead_of_hanging(
     assert result["completion"]["status"] == "partial"
     assert result["evidence"][0]["evidence_type"] == "search_result_snippet"
     assert result["evidence"][0]["url"] == candidate["url"]
+
+
+@pytest.mark.asyncio
+async def test_successful_crawl_separates_stale_discovery_from_current_extraction(
+    monkeypatch,
+):
+    current_context = {
+        "retrieved_at_utc": "2026-07-13T12:00:00+00:00",
+        "current_date_utc": "2026-07-13",
+        "freshness": "runtime_retrieved",
+    }
+    candidate = {
+        "title": "Cached discovery",
+        "url": "https://example.com/current-page",
+        "domain": "example.com",
+        "retrieval_context": current_context,
+        "retrieved_at_utc": "2026-07-13T08:00:00+00:00",
+        "freshness": "stale_cache_unverified",
+        "freshness_unverified": True,
+        "freshness_status": "within_window",
+        "search_cache_status": "stale_fallback",
+        "search_cached_at_utc": "2026-07-13T08:00:00+00:00",
+    }
+
+    async def crawl(_url):
+        return {
+            "url": candidate["url"],
+            "content": "Freshly fetched page content " * 100,
+            "extraction_method": "direct",
+        }
+
+    monkeypatch.setattr(pipelines, "crawl_url_impl", crawl)
+
+    source = await pipelines.crawl_source(candidate, "current page")
+    evidence = pipelines.build_crawled_source_evidence([source], [])
+
+    assert source["ok"] is True
+    assert source["retrieved_at_utc"] == current_context["retrieved_at_utc"]
+    assert source["freshness"] == "runtime_retrieved"
+    assert source["freshness_unverified"] is False
+    assert source["search_cache_status"] == "stale_fallback"
+    assert source["discovery_retrieved_at_utc"] == "2026-07-13T08:00:00+00:00"
+    assert source["discovery_freshness"] == "stale_cache_unverified"
+    assert source["discovery_freshness_unverified"] is True
+    assert evidence[0]["freshness"] == "runtime_retrieved"
+    assert evidence[0]["discovery_freshness_unverified"] is True
+
+
+@pytest.mark.asyncio
+async def test_failed_crawl_retains_stale_discovery_freshness(monkeypatch):
+    candidate = {
+        "title": "Cached discovery",
+        "url": "https://example.com/unavailable",
+        "domain": "example.com",
+        "retrieval_context": {
+            "retrieved_at_utc": "2026-07-13T12:00:00+00:00",
+            "current_date_utc": "2026-07-13",
+            "freshness": "runtime_retrieved",
+        },
+        "retrieved_at_utc": "2026-07-13T08:00:00+00:00",
+        "freshness": "stale_cache_unverified",
+        "freshness_unverified": True,
+        "search_cache_status": "stale_fallback",
+        "search_cached_at_utc": "2026-07-13T08:00:00+00:00",
+    }
+
+    async def crawl(_url):
+        raise OSError("unavailable")
+
+    monkeypatch.setattr(pipelines, "crawl_url_impl", crawl)
+
+    source = await pipelines.crawl_source(candidate, "current page")
+
+    assert source["ok"] is False
+    assert source["retrieved_at_utc"] == "2026-07-13T08:00:00+00:00"
+    assert source["freshness"] == "stale_cache_unverified"
+    assert source["freshness_unverified"] is True
+    assert source["discovery_freshness_unverified"] is True

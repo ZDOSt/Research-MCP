@@ -1,4 +1,5 @@
 import asyncio
+import os
 import unittest
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -15,6 +16,7 @@ from job_store import (
     InvalidJobError,
     JobLeaseLostError,
     JobQueueFullError,
+    ResearchAdmissionLimitedError,
     JobStoreError,
     RedisJobStore,
 )
@@ -28,6 +30,8 @@ class RedisJobStoreTests(unittest.IsolatedAsyncioTestCase):
             queue_name="test:jobs",
             result_ttl_seconds=120,
             ingestion_waitaof_timeout_ms=0,
+            research_admission_max_active=0,
+            research_admission_max_new_jobs=0,
         )
 
     async def asyncTearDown(self):
@@ -392,6 +396,306 @@ class RedisJobStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first["job_id"], second["job_id"])
         self.assertFalse(first["coalesced"])
         self.assertTrue(second["coalesced"])
+
+    async def test_research_admission_coalesces_before_owner_budget(self):
+        store = RedisJobStore(
+            redis_client=self.redis,
+            queue_name="test:admission-coalescing",
+            result_ttl_seconds=120,
+            ingestion_waitaof_timeout_ms=0,
+            research_admission_max_active=1,
+            research_admission_max_new_jobs=1,
+            research_admission_window_seconds=60,
+        )
+        first = await store.create_job(
+            "research_web",
+            {"query": "same"},
+            owner_id="client-a",
+            coalesce_active=True,
+        )
+        joined = await store.create_job(
+            "research_web",
+            {"query": "same"},
+            owner_id="client-a",
+            coalesce_active=True,
+        )
+
+        self.assertEqual(joined["job_id"], first["job_id"])
+        self.assertTrue(joined["coalesced"])
+        _, history_key = store._research_admission_keys("client-a")
+        self.assertEqual(await self.redis.zcard(history_key), 1)
+
+    async def test_research_admission_limits_active_jobs_per_owner(self):
+        store = RedisJobStore(
+            redis_client=self.redis,
+            queue_name="test:admission-active",
+            result_ttl_seconds=120,
+            ingestion_waitaof_timeout_ms=0,
+            research_admission_max_active=1,
+            research_admission_max_new_jobs=4,
+            research_admission_window_seconds=60,
+        )
+        await store.create_job(
+            "research_web",
+            {"query": "first"},
+            owner_id="client-a",
+            coalesce_active=True,
+        )
+
+        with self.assertRaises(ResearchAdmissionLimitedError) as raised:
+            await store.create_job(
+                "research_web",
+                {"query": "second"},
+                owner_id="client-a",
+                coalesce_active=True,
+            )
+
+        self.assertEqual(raised.exception.reason, "active_limit")
+        self.assertEqual(raised.exception.active_jobs, 1)
+        self.assertEqual(raised.exception.max_active, 1)
+        other_owner = await store.create_job(
+            "research_web",
+            {"query": "second"},
+            owner_id="client-b",
+            coalesce_active=True,
+        )
+        self.assertEqual(other_owner["owner_id"], "client-b")
+
+    async def test_running_cancellation_counts_until_job_is_terminal(self):
+        store = RedisJobStore(
+            redis_client=self.redis,
+            queue_name="test:admission-running-cancellation",
+            result_ttl_seconds=120,
+            ingestion_waitaof_timeout_ms=0,
+            research_admission_max_active=1,
+            research_admission_max_new_jobs=0,
+        )
+        first = await store.create_job(
+            "research_web",
+            {"query": "first"},
+            owner_id="client-a",
+            coalesce_active=True,
+        )
+        claimed = await store.claim_job(timeout=0.01, worker_id="worker-a")
+        self.assertEqual(claimed["job_id"], first["job_id"])
+        await store.request_cancellation(first["job_id"])
+
+        with self.assertRaises(ResearchAdmissionLimitedError):
+            await store.create_job(
+                "research_web",
+                {"query": "second"},
+                owner_id="client-a",
+                coalesce_active=True,
+            )
+
+        await store.mark_cancelled(
+            first["job_id"],
+            "cancelled by test",
+            lease_token=claimed["lease_token"],
+        )
+        second = await store.create_job(
+            "research_web",
+            {"query": "second"},
+            owner_id="client-a",
+            coalesce_active=True,
+        )
+        self.assertNotEqual(second["job_id"], first["job_id"])
+
+    async def test_research_admission_is_atomic_for_concurrent_distinct_jobs(self):
+        store = RedisJobStore(
+            redis_client=self.redis,
+            queue_name="test:admission-concurrent",
+            result_ttl_seconds=120,
+            ingestion_waitaof_timeout_ms=0,
+            research_admission_max_active=1,
+            research_admission_max_new_jobs=0,
+        )
+        outcomes = await asyncio.gather(
+            store.create_job(
+                "research_web",
+                {"query": "first"},
+                owner_id="client-a",
+                coalesce_active=True,
+            ),
+            store.create_job(
+                "research_web",
+                {"query": "second"},
+                owner_id="client-a",
+                coalesce_active=True,
+            ),
+            return_exceptions=True,
+        )
+
+        admitted = [item for item in outcomes if isinstance(item, dict)]
+        rejected = [
+            item
+            for item in outcomes
+            if isinstance(item, ResearchAdmissionLimitedError)
+        ]
+        self.assertEqual(len(admitted), 1)
+        self.assertEqual(len(rejected), 1)
+        self.assertEqual(rejected[0].reason, "active_limit")
+        self.assertEqual(await self.redis.llen(store.queue_key), 1)
+
+    async def test_research_admission_rolling_window_returns_retry_after(self):
+        store = RedisJobStore(
+            redis_client=self.redis,
+            queue_name="test:admission-window",
+            result_ttl_seconds=120,
+            ingestion_waitaof_timeout_ms=0,
+            research_admission_max_active=1,
+            research_admission_max_new_jobs=2,
+            research_admission_window_seconds=60,
+        )
+        first = await store.create_job(
+            "research_web",
+            {"query": "first"},
+            owner_id="client-a",
+            coalesce_active=True,
+        )
+        await store.request_cancellation(first["job_id"])
+        second = await store.create_job(
+            "research_web",
+            {"query": "second"},
+            owner_id="client-a",
+            coalesce_active=True,
+        )
+        await store.request_cancellation(second["job_id"])
+        _, history_key = store._research_admission_keys("client-a")
+        seconds, microseconds = await self.redis.time()
+        now = float(seconds) + (float(microseconds) / 1_000_000)
+        await self.redis.zadd(
+            history_key,
+            {
+                first["job_id"]: now - 20,
+                second["job_id"]: now - 10,
+            },
+        )
+
+        with self.assertRaises(ResearchAdmissionLimitedError) as raised:
+            await store.create_job(
+                "research_web",
+                {"query": "third"},
+                owner_id="client-a",
+                coalesce_active=True,
+            )
+
+        self.assertEqual(raised.exception.reason, "rolling_window")
+        self.assertEqual(raised.exception.recent_jobs, 2)
+        self.assertIn(raised.exception.retry_after_seconds, {39, 40})
+
+    async def test_research_admission_anonymous_modes_are_explicit(self):
+        shared = RedisJobStore(
+            redis_client=self.redis,
+            queue_name="test:admission-anonymous-shared",
+            result_ttl_seconds=120,
+            ingestion_waitaof_timeout_ms=0,
+            research_admission_max_active=1,
+            research_admission_max_new_jobs=0,
+            research_admission_anonymous="shared",
+        )
+        await shared.create_job("research_web", {"query": "first"})
+        with self.assertRaises(ResearchAdmissionLimitedError):
+            await shared.create_job("research_web", {"query": "second"})
+
+        disabled = RedisJobStore(
+            redis_client=self.redis,
+            queue_name="test:admission-anonymous-off",
+            result_ttl_seconds=120,
+            ingestion_waitaof_timeout_ms=0,
+            research_admission_max_active=1,
+            research_admission_max_new_jobs=1,
+            research_admission_anonymous="off",
+        )
+        await disabled.create_job("research_web", {"query": "first"})
+        await disabled.create_job("research_web", {"query": "second"})
+
+        denied = RedisJobStore(
+            redis_client=self.redis,
+            queue_name="test:admission-anonymous-denied",
+            result_ttl_seconds=120,
+            ingestion_waitaof_timeout_ms=0,
+            research_admission_max_active=0,
+            research_admission_max_new_jobs=0,
+            research_admission_anonymous="deny",
+        )
+        with self.assertRaises(ResearchAdmissionLimitedError) as raised:
+            await denied.create_job("research_web", {"query": "first"})
+        self.assertEqual(raised.exception.reason, "anonymous_disabled")
+
+    async def test_anonymous_deny_precedes_existing_job_coalescing(self):
+        queue_name = "test:admission-anonymous-deny-coalescing"
+        seed_store = RedisJobStore(
+            redis_client=self.redis,
+            queue_name=queue_name,
+            result_ttl_seconds=120,
+            ingestion_waitaof_timeout_ms=0,
+            research_admission_max_active=0,
+            research_admission_max_new_jobs=0,
+            research_admission_anonymous="off",
+        )
+        await seed_store.create_job(
+            "research_web",
+            {"query": "same"},
+            coalesce_active=True,
+        )
+        denied = RedisJobStore(
+            redis_client=self.redis,
+            queue_name=queue_name,
+            result_ttl_seconds=120,
+            ingestion_waitaof_timeout_ms=0,
+            research_admission_max_active=0,
+            research_admission_max_new_jobs=0,
+            research_admission_anonymous="deny",
+        )
+
+        with self.assertRaises(ResearchAdmissionLimitedError) as raised:
+            await denied.create_job(
+                "research_web",
+                {"query": "same"},
+                coalesce_active=True,
+            )
+
+        self.assertEqual(raised.exception.reason, "anonymous_disabled")
+
+    async def test_research_admission_numeric_limits_can_be_disabled(self):
+        store = RedisJobStore(
+            redis_client=self.redis,
+            queue_name="test:admission-disabled",
+            result_ttl_seconds=120,
+            ingestion_waitaof_timeout_ms=0,
+            research_admission_max_active=0,
+            research_admission_max_new_jobs=0,
+        )
+        first = await store.create_job(
+            "research_web", {"query": "first"}, owner_id="client-a"
+        )
+        second = await store.create_job(
+            "research_web", {"query": "second"}, owner_id="client-a"
+        )
+        self.assertNotEqual(first["job_id"], second["job_id"])
+
+    async def test_research_admission_reads_environment_configuration(self):
+        with patch.dict(
+            os.environ,
+            {
+                "RESEARCH_ADMISSION_MAX_ACTIVE": "3",
+                "RESEARCH_ADMISSION_MAX_NEW_JOBS": "7",
+                "RESEARCH_ADMISSION_WINDOW_SECONDS": "90",
+                "RESEARCH_ADMISSION_ANONYMOUS": "off",
+            },
+        ):
+            store = RedisJobStore(
+                redis_client=self.redis,
+                queue_name="test:admission-environment",
+                result_ttl_seconds=120,
+                ingestion_waitaof_timeout_ms=0,
+            )
+
+        self.assertEqual(store.research_admission_max_active, 3)
+        self.assertEqual(store.research_admission_max_new_jobs, 7)
+        self.assertEqual(store.research_admission_window_seconds, 90)
+        self.assertEqual(store.research_admission_anonymous, "off")
 
     async def test_cancelling_a_queued_job_removes_it_without_worker_claim(self):
         created = await self.store.create_job("query_memory", {"query": "cached"})

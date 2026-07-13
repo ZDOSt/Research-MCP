@@ -509,6 +509,31 @@ The default is `3`; valid values are `1` through `4`. It controls acquisition
 source concurrency; each persistence job indexes one source. Increase it only
 when the worker has enough CPU and memory for concurrent extraction.
 
+Open-web admission is enforced before a job reaches the queue. By default, one
+authenticated MCP client principal may have one distinct research job active
+and may admit two new research jobs per rolling 60-second window. Exact active
+duplicates coalesce before consuming this budget. These settings are controlled
+by `RESEARCH_ADMISSION_MAX_ACTIVE`, `RESEARCH_ADMISSION_MAX_NEW_JOBS`, and
+`RESEARCH_ADMISSION_WINDOW_SECONDS`; `0` disables the corresponding numeric
+limit. A single bearer token represents one client principal, so all LibreChat
+users configured through that token share its budget. Use separate entries in
+`MCP_AUTH_TOKENS_JSON` when independent client budgets are required.
+
+Within one admitted job, the first query for each planned intent runs with at
+most `SEARCH_QUERY_CONCURRENCY` queries in flight. One reserve query is used only
+for an intent whose primary query lacks independent source coverage. Each query
+uses explicit staged SearXNG engine groups and stops once
+`SEARCH_STAGE_MIN_RESULTS` is satisfied. `SEARCH_MAX_ENGINE_STAGES` bounds normal
+modes; `SEARCH_DEEP_MAX_ENGINE_STAGES` permits broader durable research.
+
+Workers cache exact normalized public-web discovery results in Redis for
+`SEARCH_CACHE_TTL_SECONDS`, scoped to the MCP client principal. Entries remain
+eligible for explicitly labeled stale fallback until
+`SEARCH_CACHE_STALE_TTL_SECONDS`, but only after a transient acquisition failure.
+Shared per-engine and SearXNG-service circuits suppress repeated calls while an
+upstream is rate-limited or failing. Redis cache/circuit operations use short
+timeouts and fail open to bounded local behavior.
+
 For ordinary static pages, direct extraction receives a short
 `DIRECT_FIRST_HEDGE_SECONDS` head start. Results must pass the conservative
 `DIRECT_FIRST_MIN_CONTENT_CHARS` quality gate; thin, blocked, or dynamic pages
@@ -559,8 +584,10 @@ Important invariants:
   indexing; `false` is a safe but slower synchronous compatibility mode.
 - SearXNG is the mandatory discovery layer. Its `keep_only` list intentionally
   limits broad web, news, technical, and academic providers to reduce latency
-  and failure noise. Inspect `unresponsive_engines` diagnostics before adding
-  providers, and revalidate names against the pinned image during upgrades.
+  and failure noise. Research requests select small explicit engine stages rather
+  than fanning out to every engine in a category. Inspect `search_stages`, cache,
+  and `unresponsive_engines` diagnostics before adding providers, and revalidate
+  names against the pinned image during upgrades.
 - Keep `RESEARCH_BROWSER_DISABLE_SANDBOX=false` and
   `RESEARCH_BROWSER_IGNORE_HTTPS_ERRORS=false` unless a controlled environment
   has a documented compatibility requirement.

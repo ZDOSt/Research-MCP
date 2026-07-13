@@ -34,6 +34,7 @@ Dispatcher = Callable[[str, Mapping[str, Any]], Awaitable[Any]]
 _INTERNAL_ATTEMPT_ID = "_research_job_attempt_id"
 _INTERNAL_ATTEMPT_ORDER_NS = "_research_job_attempt_order_ns"
 _INTERNAL_JOB_ID = "_research_job_id"
+_INTERNAL_SEARCH_CACHE_SCOPE = "_research_search_cache_scope"
 _MAX_QDRANT_ORDER = 2**63 - 1
 _INGESTING_JOB_KINDS = {
     "investigate_url",
@@ -230,6 +231,10 @@ async def dispatch_job(kind: str, payload: Mapping[str, Any]) -> Any:
             defer_persistence=_env_bool("RESEARCH_DEFER_PERSISTENCE", True),
             ingestion_attempt_id=ingestion_attempt_id,
             ingestion_order_ns=ingestion_order_ns,
+            search_cache_scope=_optional_string(
+                payload,
+                _INTERNAL_SEARCH_CACHE_SCOPE,
+            ),
         )
 
     if kind == "persist_research_source":
@@ -939,6 +944,7 @@ class JobWorker:
         payload.pop("ingestion_attempt_id", None)
         payload.pop("ingestion_order_ns", None)
         payload.pop(_INTERNAL_JOB_ID, None)
+        payload.pop(_INTERNAL_SEARCH_CACHE_SCOPE, None)
         payload[_INTERNAL_JOB_ID] = job_id
         payload[_INTERNAL_ATTEMPT_ID] = ingestion_attempt_id
         payload[_INTERNAL_ATTEMPT_ORDER_NS] = ingestion_order_ns
@@ -946,6 +952,10 @@ class JobWorker:
             payload["research_run_id"] = job_id
         may_have_ingested = _job_may_ingest(kind, payload)
         owner_id = str(job.get("owner_id") or "").strip()
+        scope_identity = f"owner\x00{owner_id}" if owner_id else "anonymous"
+        payload[_INTERNAL_SEARCH_CACHE_SCOPE] = hashlib.sha256(
+            scope_identity.encode("utf-8")
+        ).hexdigest()
         if owner_id:
             bind_owner_principal = getattr(self.artifacts, "bind_owner_principal", None)
             try:
