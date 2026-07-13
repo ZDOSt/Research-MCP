@@ -1674,6 +1674,10 @@ async def rag_ingest_impl(req: IngestRequest) -> Dict[str, Any]:
         content_type = metadata.get("content_type", "webpage")
         source_score = metadata.get("source_score")
         source_reason = metadata.get("source_reason")
+        published_at = metadata.get("published_at")
+        freshness_status = metadata.get("freshness_status")
+        search_engine = metadata.get("search_engine")
+        search_rank = metadata.get("search_rank")
         retrieved_at_utc = metadata.get("retrieved_at_utc")
         retrieval_current_date_utc = metadata.get("retrieval_current_date_utc")
         namespace = normalize_namespace(metadata.get("namespace"))
@@ -1782,6 +1786,10 @@ async def rag_ingest_impl(req: IngestRequest) -> Dict[str, Any]:
                 "ingested_at_unix": ingested_at_unix,
                 "retrieved_at_utc": retrieved_at_utc,
                 "retrieval_current_date_utc": retrieval_current_date_utc,
+                "published_at": published_at,
+                "freshness_status": freshness_status,
+                "search_engine": search_engine,
+                "search_rank": search_rank,
             }
 
             if title:
@@ -1916,6 +1924,10 @@ async def rag_query_impl(req: QueryRequest) -> Dict[str, Any]:
                 "ingested_at": payload.get("ingested_at"),
                 "retrieved_at_utc": payload.get("retrieved_at_utc"),
                 "retrieval_current_date_utc": payload.get("retrieval_current_date_utc"),
+                "published_at": payload.get("published_at"),
+                "freshness_status": payload.get("freshness_status"),
+                "search_engine": payload.get("search_engine"),
+                "search_rank": payload.get("search_rank"),
                 "source_score": payload.get("source_score"),
                 "source_reason": payload.get("source_reason"),
                 "namespace": payload.get("namespace", namespace),

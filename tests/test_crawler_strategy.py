@@ -107,6 +107,50 @@ class DirectFirstCrawlerStrategyTests(unittest.IsolatedAsyncioTestCase):
             2000,
         )
 
+    def test_direct_result_accepts_legitimate_access_denied_article(self):
+        content = (
+            "An access denied error usually means the current account lacks permission. "
+            "This technical guide explains how file ownership, directory modes, and service "
+            "credentials interact. Administrators should inspect the effective user, verify "
+            "the parent directory permissions, review audit logs, and change only the narrowest "
+            "required policy. The access denied message is a symptom rather than proof that a "
+            "firewall blocked the request. These troubleshooting steps preserve existing access "
+            "controls while identifying the actual cause."
+        )
+        result = {
+            "title": "How to fix Access Denied errors safely",
+            "content": content,
+            "body_format": "text",
+        }
+
+        with patch.object(crawler, "DIRECT_FIRST_MIN_CONTENT_CHARS", 200):
+            self.assertTrue(crawler._direct_result_is_sufficient(result))
+
+    def test_direct_result_rejects_padded_single_marker_challenge_shell(self):
+        result = {
+            "title": "Please wait",
+            "content": "Just a moment. " + ("Request processing. " * 100),
+            "body_format": "text",
+        }
+
+        with patch.object(crawler, "DIRECT_FIRST_MIN_CONTENT_CHARS", 200):
+            self.assertFalse(crawler._direct_result_is_sufficient(result))
+
+    def test_direct_result_rejects_bare_challenge_title_with_rich_boilerplate(self):
+        result = {
+            "title": "Access Denied",
+            "content": (
+                "The requested resource cannot be displayed. Reference identifier region "
+                "timestamp security policy gateway network request browser session client "
+                "support diagnostic incident details privacy terms service availability. "
+                "Contact the site owner with the reference identifier if the problem persists."
+            ),
+            "body_format": "text",
+        }
+
+        with patch.object(crawler, "DIRECT_FIRST_MIN_CONTENT_CHARS", 200):
+            self.assertFalse(crawler._direct_result_is_sufficient(result))
+
     async def test_crawl4ai_winner_cancels_and_drains_direct_task(self):
         direct_started = asyncio.Event()
         direct_cancelled = asyncio.Event()
@@ -237,6 +281,224 @@ class DirectFirstCrawlerStrategyTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIs(result, direct_result)
         self.assertTrue(result["_direct_low_confidence"])
+
+    async def test_crawl4ai_challenge_shell_does_not_suppress_direct_fallback(self):
+        direct_result = {"content": "short"}
+        crawl_result = {
+            "success": True,
+            "results": [
+                {
+                    "success": True,
+                    "status_code": 200,
+                    "title": "Reuters | Please enable JS",
+                    "content": "Please enable JS and disable any ad blocker. " * 100,
+                }
+            ],
+        }
+
+        with patch.dict(
+            os.environ,
+            {"WEB_RUNNER_SOCKET": "/run/web.sock"},
+            clear=False,
+        ), patch.object(
+            crawler, "DIRECT_FIRST_HEDGE_SECONDS", 0.0
+        ), patch.object(
+            crawler, "validate_url_safety", new=AsyncMock(return_value="https://example.com")
+        ), patch.object(
+            crawler, "direct_fetch_url", new=AsyncMock(return_value=direct_result)
+        ), patch.object(
+            crawler, "crawl4ai_request", new=AsyncMock(return_value=crawl_result)
+        ):
+            result = await crawler.crawl_url_impl("https://example.com")
+
+        self.assertIs(result, direct_result)
+        self.assertTrue(result["_direct_low_confidence"])
+        self.assertEqual(
+            result["crawl4ai_errors"],
+            ["Crawl4AI returned a challenge or access-denied page"],
+        )
+
+    async def test_crawl4ai_accepts_articles_about_challenge_messages(self):
+        cases = [
+            (
+                "CAPTCHA and the Are You a Robot prompt explained",
+                (
+                    "This article explains why a site may ask, are you a robot, before allowing "
+                    "a request. CAPTCHA systems compare interaction signals, network reputation, "
+                    "and browser state. Researchers evaluate accessibility, false positives, and "
+                    "privacy tradeoffs when these checks affect legitimate users. The prompt is "
+                    "quoted here as the subject of the technical analysis."
+                ),
+            ),
+            (
+                "Why Google displays unusual traffic warnings",
+                (
+                    "A user may see our systems have detected unusual traffic when many searches "
+                    "share an address. This incident report explains common causes such as carrier "
+                    "NAT, automated requests, VPN exits, and compromised devices. It also reviews "
+                    "why a service may ask users to verify you are not a robot and how operators "
+                    "can troubleshoot the underlying network behavior."
+                ),
+            ),
+            (
+                "Cloud service permission incident report",
+                (
+                    "The service returned access denied during a regional deployment. Engineers "
+                    "traced the error to a stale role binding, compared audit events, restored the "
+                    "intended policy, and verified each affected workload. The report documents "
+                    "the timeline, impact, corrective actions, and safeguards added after recovery."
+                ),
+            ),
+        ]
+
+        for title, content in cases:
+            with self.subTest(title=title), patch.object(
+                crawler, "DIRECT_FIRST_HEDGE_SECONDS", 0.0
+            ), patch.object(
+                crawler,
+                "validate_url_safety",
+                new=AsyncMock(return_value="https://example.com"),
+            ), patch.object(
+                crawler,
+                "direct_fetch_url",
+                new=AsyncMock(side_effect=RuntimeError("direct unavailable")),
+            ), patch.object(
+                crawler,
+                "crawl4ai_request",
+                new=AsyncMock(
+                    return_value={
+                        "results": [
+                            {
+                                "title": title,
+                                "content": content,
+                                "cleaned_html": f"<article><p>{content}</p></article>",
+                            }
+                        ]
+                    }
+                ),
+            ):
+                result = await crawler.crawl_url_impl("https://example.com/article")
+
+            self.assertEqual(result["title"], title)
+            self.assertEqual(result["extraction_method"], "crawl4ai")
+
+    async def test_crawl4ai_failure_metadata_does_not_suppress_direct_fallback(self):
+        cases = [
+            (
+                {"success": False, "results": [{"content": "article " * 100}]},
+                "Crawl4AI reported unsuccessful extraction",
+            ),
+            (
+                {
+                    "success": True,
+                    "results": [
+                        {
+                            "success": True,
+                            "status_code": 403,
+                            "content": "article " * 100,
+                        }
+                    ],
+                },
+                "Crawl4AI returned HTTP 403",
+            ),
+        ]
+
+        for crawl_result, expected_error in cases:
+            with self.subTest(expected_error=expected_error):
+                direct_result = {"content": "short"}
+                with patch.dict(
+                    os.environ,
+                    {"WEB_RUNNER_SOCKET": "/run/web.sock"},
+                    clear=False,
+                ), patch.object(
+                    crawler, "DIRECT_FIRST_HEDGE_SECONDS", 0.0
+                ), patch.object(
+                    crawler,
+                    "validate_url_safety",
+                    new=AsyncMock(return_value="https://example.com"),
+                ), patch.object(
+                    crawler,
+                    "direct_fetch_url",
+                    new=AsyncMock(return_value=direct_result),
+                ), patch.object(
+                    crawler,
+                    "crawl4ai_request",
+                    new=AsyncMock(return_value=crawl_result),
+                ):
+                    result = await crawler.crawl_url_impl("https://example.com")
+
+                self.assertIs(result, direct_result)
+                self.assertEqual(result["crawl4ai_errors"], [expected_error])
+
+    async def test_crawl4ai_navigation_shell_fails_primary_content_check(self):
+        direct_result = {"content": "short"}
+        crawl_result = {
+            "success": True,
+            "results": [
+                {
+                    "success": True,
+                    "status_code": 200,
+                    "content": "Documentation menu " * 200,
+                    "cleaned_html": (
+                        "<html><body><nav>" + "Documentation menu " * 200 + "</nav>"
+                        "<div id='root'></div></body></html>"
+                    ),
+                }
+            ],
+        }
+
+        with patch.dict(
+            os.environ,
+            {"WEB_RUNNER_SOCKET": "/run/web.sock"},
+            clear=False,
+        ), patch.object(
+            crawler, "DIRECT_FIRST_HEDGE_SECONDS", 0.0
+        ), patch.object(
+            crawler, "DIRECT_FIRST_MIN_CONTENT_CHARS", 200
+        ), patch.object(
+            crawler, "validate_url_safety", new=AsyncMock(return_value="https://example.com")
+        ), patch.object(
+            crawler, "direct_fetch_url", new=AsyncMock(return_value=direct_result)
+        ), patch.object(
+            crawler, "crawl4ai_request", new=AsyncMock(return_value=crawl_result)
+        ):
+            result = await crawler.crawl_url_impl("https://example.com")
+
+        self.assertIs(result, direct_result)
+        self.assertEqual(
+            result["crawl4ai_errors"],
+            ["Crawl4AI returned too little primary content"],
+        )
+
+    async def test_crawl4ai_markdown_challenge_is_rejected(self):
+        direct_result = {"content": "short"}
+        with patch.dict(
+            os.environ,
+            {"WEB_RUNNER_SOCKET": ""},
+            clear=False,
+        ), patch.object(
+            crawler, "DIRECT_FIRST_HEDGE_SECONDS", 0.0
+        ), patch.object(
+            crawler, "validate_url_safety", new=AsyncMock(return_value="https://example.com")
+        ), patch.object(
+            crawler, "direct_fetch_url", new=AsyncMock(return_value=direct_result)
+        ), patch.object(
+            crawler, "crawl4ai_request", new=AsyncMock(return_value={"results": []})
+        ), patch.object(
+            crawler,
+            "crawl4ai_markdown_request",
+            new=AsyncMock(return_value={"content": "Checking your browser. " * 100}),
+        ):
+            result = await crawler.crawl_url_impl("https://example.com")
+
+        self.assertIs(result, direct_result)
+        self.assertEqual(
+            result["crawl4ai_errors"],
+            [
+                "Crawl4AI returned too little content",
+                "Crawl4AI /md returned a challenge or access-denied page",
+            ],
+        )
 
     async def test_crawl4ai_result_url_is_revalidated(self):
         validate = AsyncMock(return_value="https://example.com")

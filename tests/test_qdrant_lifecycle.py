@@ -262,6 +262,54 @@ async def test_current_lease_attempt_commits_and_becomes_active(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_search_provenance_survives_qdrant_ingest_and_query(monkeypatch):
+    client = _client(monkeypatch, "search-provenance")
+    monkeypatch.setattr(shared, "VECTOR_SIZE", 1)
+
+    async def embed(_texts):
+        return [[0.1]]
+
+    async def no_rerank(_query, docs, _top_k):
+        return docs
+
+    monkeypatch.setattr(shared, "embed_texts_async", embed)
+    monkeypatch.setattr(shared, "rerank_docs", no_rerank)
+    provenance = {
+        "published_at": "2026-07-13T08:30:00+00:00",
+        "freshness_status": "exact_match",
+        "search_engine": "google news",
+        "search_rank": 2,
+    }
+
+    await shared.rag_ingest_impl(
+        IngestRequest(
+            text="A current AI news report with enough content for retrieval.",
+            metadata={
+                "source": "https://example.com/ai-news",
+                "namespace": "news",
+                **provenance,
+            },
+        )
+    )
+
+    records, _ = client.scroll(
+        collection_name="search-provenance", limit=10, with_payload=True
+    )
+    assert len(records) == 1
+    assert {
+        field: records[0].payload[field] for field in provenance
+    } == provenance
+
+    result = await shared.rag_query_impl(
+        QueryRequest(query="current AI news", namespace="news")
+    )
+    assert len(result["results"]) == 1
+    assert {
+        field: result["results"][0][field] for field in provenance
+    } == provenance
+
+
+@pytest.mark.asyncio
 async def test_remote_worker_compensates_when_post_request_lease_check_fails(
     monkeypatch,
 ):

@@ -49,11 +49,186 @@ def test_verbose_instruction_is_compacted_for_search_engines(monkeypatch):
 
     assert plan["query"] == VERBOSE_AI_NEWS_QUERY
     assert plan["queries"][0] == "Today's most important AI news 2026-07-12"
-    assert "AI news today 2026-07-12" in plan["queries"]
-    assert any("official documentation" in item for item in plan["queries"])
+    assert "AI news published today 2026-07-12" in plan["queries"]
+    assert any("latest headlines" in item for item in plan["queries"])
+    assert all("official documentation" not in item for item in plan["queries"])
     assert all(len(item) <= 220 for item in plan["queries"])
     assert all("For each" not in item for item in plan["queries"])
-    assert fallback_search_query(VERBOSE_AI_NEWS_QUERY) == "AI news today"
+    assert fallback_search_query(VERBOSE_AI_NEWS_QUERY) == "AI news published today"
+
+
+def test_publication_date_semantics_survive_every_query_variant():
+    plan = deterministic_plan(
+        "Find articles published on 2026-06-10 about Product X",
+        "balanced",
+    )
+
+    assert len(plan["queries"]) == 3
+    assert all("published on 2026-06-10" in query for query in plan["queries"])
+
+
+def test_simple_news_request_removes_selection_clause_and_uses_news_variants(monkeypatch):
+    source_query = "Tell me today's AI news. Choose the top three articles."
+    monkeypatch.setattr(
+        "planner.runtime_retrieval_context",
+        lambda: {"current_date_local": "2026-07-13"},
+    )
+
+    compact = compact_search_query(source_query)
+    plan = deterministic_plan(source_query, "balanced")
+
+    assert compact == "today's AI news"
+    assert plan["queries"] == [
+        "today's AI news 2026-07-13",
+        "AI news today 2026-07-13",
+        "today's AI news 2026-07-13 latest headlines",
+    ]
+    assert all("choose" not in item.lower() for item in plan["queries"])
+    assert all("top three" not in item.lower() for item in plan["queries"])
+
+
+@pytest.mark.parametrize("verb", ["Choose", "Select", "Pick"])
+def test_leading_selection_count_is_removed_without_losing_subject(verb):
+    source_query = f"{verb} the top five AI news articles published today."
+
+    compact = compact_search_query(source_query)
+
+    assert compact == "AI news articles published today"
+
+
+def test_count_and_format_segments_do_not_become_search_terms():
+    source_query = (
+        "Find today's PostgreSQL news. Select five articles. Count only original reports. "
+        "Format the answer as JSON."
+    )
+
+    compact = compact_search_query(source_query)
+
+    assert compact == "today's PostgreSQL news"
+    assert all(
+        term not in compact.lower()
+        for term in ("select", "five articles", "count", "format", "json")
+    )
+
+
+@pytest.mark.parametrize(
+    "source_query",
+    [
+        "How do I select rows in PostgreSQL?",
+        "How do I count rows in PostgreSQL?",
+    ],
+)
+def test_technical_query_verbs_are_not_mistaken_for_output_instructions(source_query):
+    compact = compact_search_query(source_query)
+
+    assert "rows in PostgreSQL" in compact
+    assert compact.split()[0] in {"select", "count"}
+
+
+@pytest.mark.parametrize(
+    "source_query",
+    ["Three Body Problem", "seven layer OSI", "two stroke engine"],
+)
+def test_number_words_in_subjects_are_not_treated_as_output_counts(source_query):
+    assert compact_search_query(source_query) == source_query
+    assert deterministic_plan(source_query, "balanced")["queries"][0] == source_query
+
+
+def test_short_acronym_anchor_is_not_satisfied_by_a_substring():
+    planner = pytest.importorskip("planner")
+
+    assert planner._compose_bounded_query("maintainability", ["AI"], [], 180) == (
+        "maintainability AI"
+    )
+
+
+def test_exact_version_anchor_is_not_satisfied_by_a_longer_version():
+    compact = compact_search_query(
+        "Explain migration to v2.29. Include behavior from v2.2."
+    )
+
+    assert "v2.29" in compact
+    assert "v2.2" in compact.split()
+
+
+@pytest.mark.parametrize(
+    "source_query",
+    ["best paper shredder", "how to make a paper airplane", "study desk buying guide"],
+)
+def test_nonacademic_uses_of_academic_words_keep_general_variants(source_query):
+    queries = deterministic_plan(source_query, "balanced")["queries"]
+
+    assert any("authoritative sources" in query for query in queries)
+    assert all("systematic review" not in query for query in queries)
+
+
+def test_technical_journal_product_is_not_forced_into_academic_variants():
+    queries = deterministic_plan("Journal app installation", "balanced")["queries"]
+
+    assert any("official documentation" in query for query in queries)
+    assert all("systematic review" not in query for query in queries)
+
+
+@pytest.mark.parametrize(
+    ("source_query", "mode", "required", "forbidden"),
+    [
+        (
+            "How do I install Docker on Ubuntu 24.04?",
+            "technical",
+            ("official documentation", "GitHub issues release notes"),
+            ("latest headlines", "primary research"),
+        ),
+        (
+            "Latest peer-reviewed battery storage papers",
+            "academic",
+            ("primary research", "systematic review"),
+            ("official documentation", "latest headlines"),
+        ),
+        (
+            "Current mortgage rates",
+            "balanced",
+            ("latest updates",),
+            ("official documentation", "primary research"),
+        ),
+        (
+            "photosynthesis",
+            "balanced",
+            ("authoritative sources", "independent sources"),
+            ("official documentation", "latest headlines"),
+        ),
+    ],
+)
+def test_deterministic_variants_match_research_intent(
+    source_query,
+    mode,
+    required,
+    forbidden,
+):
+    queries = deterministic_plan(source_query, mode)["queries"]
+
+    assert all(any(term in query for query in queries) for term in required)
+    assert all(all(term not in query for query in queries) for term in forbidden)
+
+
+@pytest.mark.parametrize(
+    "source_query",
+    [
+        "today's GitHub news",
+        "latest news about Docker installation",
+    ],
+)
+def test_explicit_news_uses_news_variants_even_with_technical_terms(source_query):
+    queries = deterministic_plan(source_query, "balanced")["queries"]
+
+    assert any("latest headlines" in query for query in queries)
+    assert all("official documentation" not in query for query in queries)
+
+
+def test_hacker_news_api_documentation_keeps_technical_variants():
+    queries = deterministic_plan("Hacker News API documentation", "balanced")["queries"]
+
+    assert any("official documentation" in query for query in queries)
+    assert all("latest headlines" not in query for query in queries)
 
 
 @pytest.mark.parametrize(
@@ -232,6 +407,19 @@ def test_multisentence_error_keeps_diagnostic_context_and_fix_intent():
     assert any("fix it safely" in query.lower() for query in queries)
 
 
+def test_dependent_output_sentence_does_not_consume_query_budget():
+    source_query = (
+        "I want to install SillyTavern on Ubuntu using Docker. "
+        "Tell me how to do it safely and cite current official docs."
+    )
+
+    queries = deterministic_plan(source_query, "balanced")["queries"]
+
+    assert queries[0] == "install SillyTavern on Ubuntu using Docker"
+    assert all("how to do it safely" not in query.lower() for query in queries)
+    assert any("official documentation" in query.lower() for query in queries)
+
+
 def test_multi_intent_request_produces_queries_for_each_intent(monkeypatch):
     source_query = (
         "What is the current Docker release? "
@@ -277,6 +465,219 @@ def test_relative_date_context_does_not_leak_between_independent_intents():
     assert any("AI today" in query and "2026-07-12" in query for query in queries)
     docker_queries = [query for query in queries if "install Docker" in query and "AI" not in query]
     assert docker_queries == ["install Docker"]
+
+
+def test_declarative_mixed_intents_do_not_share_date_scope():
+    queries = compact_search_queries(
+        "Tell me today's AI news. Also explain how to install Docker.",
+        current_date="2026-07-12",
+    )
+
+    assert any("AI news" in query and "2026-07-12" in query for query in queries)
+    assert any("install Docker" in query for query in queries)
+    assert all(
+        "today" not in query.lower() and "2026-07-12" not in query
+        for query in queries
+        if "install Docker" in query
+    )
+
+
+def test_compound_mixed_intents_are_split_and_grouped_without_date_leakage(monkeypatch):
+    source_query = "Tell me today's AI news and explain how to install Docker"
+    monkeypatch.setattr(
+        "planner.runtime_retrieval_context",
+        lambda: {"current_date_local": "2026-07-13"},
+    )
+
+    plan = deterministic_plan(source_query, "balanced")
+
+    assert len(plan["queries"]) == len(plan["query_intent_ids"])
+    assert any(
+        "AI news" in query
+        and "2026-07-13" in query
+        and intent_id == "intent-1"
+        for query, intent_id in zip(plan["queries"], plan["query_intent_ids"])
+    )
+    assert any(
+        "install Docker" in query
+        and "today" not in query.lower()
+        and "2026-07-13" not in query
+        and intent_id == "intent-2"
+        for query, intent_id in zip(plan["queries"], plan["query_intent_ids"])
+    )
+    assert plan["query_intent_ids"].count("intent-1") == 2
+    assert plan["query_intent_ids"].count("intent-2") == 1
+
+
+@pytest.mark.parametrize(
+    "second_intent",
+    [
+        "how Docker works",
+        "what Docker does",
+        "why Docker matters",
+        "where Docker stores data",
+        "when Docker was released",
+        "which Docker edition supports Windows",
+        "who maintains Docker",
+    ],
+)
+def test_compound_wh_intents_are_kept_without_terminal_question_marks(
+    monkeypatch,
+    second_intent,
+):
+    monkeypatch.setattr(
+        "planner.runtime_retrieval_context",
+        lambda: {"current_date_local": "2026-07-13"},
+    )
+
+    plan = deterministic_plan(
+        f"Tell me today's AI news and {second_intent}",
+        "balanced",
+    )
+    grouped = list(zip(plan["queries"], plan["query_intent_ids"]))
+
+    assert (second_intent, "intent-2") in grouped
+    assert all(
+        "today" not in query.lower() and "2026-07-13" not in query
+        for query, intent_id in grouped
+        if intent_id == "intent-2"
+    )
+
+
+def test_dependent_compound_clause_does_not_create_a_new_intent(monkeypatch):
+    monkeypatch.setattr(
+        "planner.runtime_retrieval_context",
+        lambda: {"current_date_local": "2026-07-13"},
+    )
+
+    plan = deterministic_plan(
+        "Tell me how to install LibreChat and explain how to do it safely",
+        "balanced",
+    )
+
+    assert set(plan["query_intent_ids"]) == {"intent-1"}
+    assert all("do it safely" not in query.lower() for query in plan["queries"])
+
+
+def test_general_declarative_multi_intent_request_keeps_each_topic():
+    queries = compact_search_queries(
+        "Give me an overview of quantum computing. Cover error correction.",
+        current_date="2026-07-12",
+    )
+
+    assert any("quantum computing" in query for query in queries)
+    assert any("error correction" in query for query in queries)
+
+
+def test_topical_instruction_verb_does_not_discard_a_distinct_intent():
+    queries = compact_search_queries(
+        "Summarize today's AI news. Explain how to install Docker.",
+        current_date="2026-07-12",
+    )
+
+    assert any("AI news" in query and "2026-07-12" in query for query in queries)
+    assert any("install Docker" in query for query in queries)
+    assert all(
+        "today" not in query.lower() and "2026-07-12" not in query
+        for query in queries
+        if "install Docker" in query
+    )
+
+
+@pytest.mark.parametrize(
+    ("source_query", "required_topics"),
+    [
+        (
+            "Provide Docker installation steps. Explain Redis setup.",
+            ("Docker installation", "Redis setup"),
+        ),
+        (
+            "Write a guide to installing Docker. Explain how to configure Redis.",
+            ("installing Docker", "configure Redis"),
+        ),
+        (
+            "Identify and rank PostgreSQL backup tools. Explain how to configure WAL.",
+            ("PostgreSQL backup tools", "configure WAL"),
+        ),
+    ],
+)
+def test_topical_output_verbs_keep_distinct_research_intents(
+    source_query,
+    required_topics,
+):
+    queries = compact_search_queries(source_query, current_date="2026-07-12")
+
+    assert all(any(topic in query for query in queries) for topic in required_topics)
+
+
+@pytest.mark.parametrize(
+    "source_query",
+    [
+        "I need Docker installation steps. Explain Redis setup.",
+        "I want to install Docker. Explain Redis setup.",
+        "I am trying to install Docker. Explain Redis setup.",
+        "I'm trying to install Docker. Explain Redis setup.",
+        "My goal is to install Docker. Explain Redis setup.",
+        "Install Docker. Configure Redis.",
+    ],
+)
+def test_common_goal_phrasing_keeps_each_research_intent_independent(source_query):
+    queries = compact_search_queries(source_query, current_date="2026-07-12")
+
+    assert any("Docker" in query and "Redis" not in query for query in queries)
+    assert any("Redis" in query and "Docker" not in query for query in queries)
+
+
+def test_environment_context_supports_but_does_not_displace_the_explicit_intent():
+    queries = compact_search_queries(
+        "My server uses Debian 12. How do I install Docker?",
+        current_date="2026-07-12",
+    )
+
+    assert queries[0] == "install Docker"
+    assert any("install Docker" in query and "Debian" in query for query in queries)
+    assert all(query != "My server uses Debian 12." for query in queries)
+
+
+@pytest.mark.parametrize(
+    ("source_query", "required_terms"),
+    [
+        (
+            'Help me fix Docker Compose. I run Ubuntu 24.04. The exact error is "network app-network not found".',
+            ("Docker Compose", "Ubuntu", "24.04", '"network app-network not found"'),
+        ),
+        (
+            'My LibreChat container fails to start. It runs on Ubuntu 24.04. The log says "ECONNREFUSED redis:6379".',
+            ("LibreChat", "Ubuntu", "24.04", '"ECONNREFUSED redis:6379"'),
+        ),
+        (
+            "I need to install SillyTavern. My VPS uses Ubuntu 24.04. Give me current steps.",
+            ("SillyTavern", "Ubuntu", "24.04"),
+        ),
+    ],
+)
+def test_supporting_context_is_combined_with_the_primary_intent(
+    source_query,
+    required_terms,
+):
+    queries = compact_search_queries(source_query, current_date="2026-07-12")
+
+    assert any(all(term in query for term in required_terms) for query in queries)
+    assert all(query.lower() != "current steps" for query in queries)
+
+
+def test_relative_date_append_preserves_quoted_terminal_punctuation():
+    planner = pytest.importorskip("planner")
+
+    result = planner._apply_relative_date_context(
+        'Coverage of "Today."',
+        'Coverage of "Today."',
+        "2026-07-12",
+        180,
+    )
+
+    assert '"Today."' in result
+    assert result.endswith("2026-07-12")
 
 
 def test_long_quoted_error_is_kept_as_a_search_anchor():
@@ -428,7 +829,7 @@ async def test_research_pipeline_retries_compact_query_after_zero_results(monkey
     async def fake_plan(query, mode):
         return {"query": query, "mode": mode, "queries": ["verbose instruction query"]}
 
-    async def fake_search(query, max_results, mode):
+    async def fake_search(query, max_results, mode, policy=None):
         calls.append(query)
         if query == "verbose instruction query":
             return []
@@ -452,7 +853,7 @@ async def test_research_pipeline_retries_compact_query_after_zero_results(monkey
     )
     monkeypatch.setattr(
         pipelines,
-        "crawl_and_ingest_limited",
+        "crawl_source_limited",
         AsyncMock(
             return_value={"ok": True, "url": "https://example.com/news", "domain": "example.com"}
         ),
@@ -470,13 +871,20 @@ async def test_research_pipeline_retries_compact_query_after_zero_results(monkey
         persist_source_artifacts=False,
     )
 
-    assert calls == ["verbose instruction query", "AI news today 2026-07-12"]
+    assert calls == [
+        "verbose instruction query",
+        "AI news published today 2026-07-12",
+    ]
     assert result["searched"][0]["url"] == "https://example.com/news"
     assert result["search_fallback"] == {
         "triggered": True,
         "reason": "initial_queries_returned_no_results",
-        "query": "AI news today 2026-07-12",
+        "query": "AI news published today 2026-07-12",
+        "policy_relaxation": "engine_time_range_only",
+        "exact_matches_before": 0,
+        "target_exact_matches": 1,
         "produced_results": True,
+        "exact_matches_after": 0,
     }
 
 
@@ -491,7 +899,7 @@ async def test_research_pipeline_does_not_fallback_on_error_or_raw_results(
     async def fake_plan(query, mode):
         return {"query": query, "mode": mode, "queries": ["initial query"]}
 
-    async def fake_search(query, max_results, mode):
+    async def fake_search(query, max_results, mode, policy=None):
         calls.append(query)
         if isinstance(initial, Exception):
             raise initial
@@ -588,6 +996,148 @@ async def test_configured_planner_preserves_full_deterministic_intent_coverage(m
 
 
 @pytest.mark.asyncio
+async def test_configured_planner_keeps_relative_dates_on_the_matching_intent(monkeypatch):
+    planner = pytest.importorskip("planner")
+    source_query = "Tell me today's AI news. Also explain how to install Docker."
+    monkeypatch.setattr(planner, "PLANNER_BASE_URL", "https://planner.example")
+    monkeypatch.setattr(planner, "PLANNER_MODEL", "private-planner")
+    monkeypatch.setattr(
+        planner,
+        "runtime_retrieval_context",
+        lambda: {"current_date_local": "2026-07-12"},
+    )
+    monkeypatch.setattr(
+        planner,
+        "_chat",
+        AsyncMock(
+            return_value=json.dumps(
+                {"queries": ["AI industry news coverage"], "subquestions": []}
+            )
+        ),
+    )
+
+    plan = await planner.build_research_plan(source_query, "balanced")
+
+    assert len(plan["queries"]) == 3
+    assert any("AI news" in query and "2026-07-12" in query for query in plan["queries"])
+    assert all(
+        "today" not in query.lower() and "2026-07-12" not in query
+        for query in plan["queries"]
+        if "Docker" in query
+    )
+    assert plan["generated_by"] == "model:private-planner"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("source_query", "model_query", "required_temporal"),
+    [
+        (
+            "Explain AI regulation as of January 2024.",
+            "AI regulatory landscape",
+            "as of January 2024",
+        ),
+        (
+            "Find Docker security advisories from the last 7 days.",
+            "Docker security notices",
+            "last 7 days",
+        ),
+        (
+            "Compare AI news between 01/01/2024 and 03/31/2024.",
+            "AI coverage comparison",
+            "between 01/01/2024 and 03/31/2024",
+        ),
+    ],
+)
+async def test_configured_planner_propagates_full_temporal_scope_to_model_queries(
+    monkeypatch,
+    source_query,
+    model_query,
+    required_temporal,
+):
+    planner = pytest.importorskip("planner")
+    monkeypatch.setattr(planner, "PLANNER_BASE_URL", "https://planner.example")
+    monkeypatch.setattr(planner, "PLANNER_MODEL", "private-planner")
+    monkeypatch.setattr(
+        planner,
+        "runtime_retrieval_context",
+        lambda: {"current_date_local": "2026-07-13"},
+    )
+    monkeypatch.setattr(
+        planner,
+        "_chat",
+        AsyncMock(
+            return_value=json.dumps(
+                {"queries": [model_query], "subquestions": []}
+            )
+        ),
+    )
+
+    plan = await planner.build_research_plan(source_query, "balanced")
+
+    derived = [query for query in plan["queries"] if model_query in query]
+    assert len(derived) == 1
+    assert required_temporal.lower() in derived[0].lower()
+    assert plan["generated_by"] == "model:private-planner"
+
+
+@pytest.mark.asyncio
+async def test_configured_planner_discards_ambiguous_multi_intent_model_query(monkeypatch):
+    planner = pytest.importorskip("planner")
+    source_query = "Tell me today's AI news and explain how to install Docker"
+    monkeypatch.setattr(planner, "PLANNER_BASE_URL", "https://planner.example")
+    monkeypatch.setattr(planner, "PLANNER_MODEL", "private-planner")
+    monkeypatch.setattr(
+        planner,
+        "runtime_retrieval_context",
+        lambda: {"current_date_local": "2026-07-13"},
+    )
+    monkeypatch.setattr(
+        planner,
+        "_chat",
+        AsyncMock(
+            return_value=json.dumps(
+                {"queries": ["unrelated technology developments"], "subquestions": []}
+            )
+        ),
+    )
+
+    plan = await planner.build_research_plan(source_query, "balanced")
+
+    assert all("unrelated technology" not in query for query in plan["queries"])
+    assert plan["generated_by"] == "deterministic"
+
+
+@pytest.mark.asyncio
+async def test_configured_planner_groups_model_query_with_matching_intent(monkeypatch):
+    planner = pytest.importorskip("planner")
+    source_query = "Tell me today's AI news and explain how to install Docker"
+    monkeypatch.setattr(planner, "PLANNER_BASE_URL", "https://planner.example")
+    monkeypatch.setattr(planner, "PLANNER_MODEL", "private-planner")
+    monkeypatch.setattr(
+        planner,
+        "runtime_retrieval_context",
+        lambda: {"current_date_local": "2026-07-13"},
+    )
+    monkeypatch.setattr(
+        planner,
+        "_chat",
+        AsyncMock(
+            return_value=json.dumps(
+                {"queries": ["Docker Engine official setup"], "subquestions": []}
+            )
+        ),
+    )
+
+    plan = await planner.build_research_plan(source_query, "balanced")
+    grouped = list(zip(plan["queries"], plan["query_intent_ids"]))
+
+    assert len(plan["queries"]) == len(plan["query_intent_ids"])
+    assert ("Docker Engine official setup", "intent-2") in grouped
+    assert plan["generated_by"] == "model:private-planner"
+
+
+@pytest.mark.asyncio
 async def test_empty_configured_planner_output_remains_deterministic(monkeypatch):
     planner = pytest.importorskip("planner")
     monkeypatch.setattr(planner, "PLANNER_BASE_URL", "https://planner.example")
@@ -634,10 +1184,11 @@ def test_source_concurrency_rejects_unsafe_values(value):
 @pytest.mark.asyncio
 async def test_research_pipeline_deduplicates_queries_and_scopes_retrieval(monkeypatch):
     crawl_kwargs = []
+    persist_kwargs = []
     async def fake_plan(query, mode):
         return {"query": query, "mode": mode, "queries": [query, f"{query} docs"]}
 
-    async def fake_search(query, max_results, mode):
+    async def fake_search(query, max_results, mode, policy=None):
         return [
             {
                 "title": "Official docs",
@@ -652,6 +1203,10 @@ async def test_research_pipeline_deduplicates_queries_and_scopes_retrieval(monke
     async def fake_crawl(semaphore, result, **kwargs):
         crawl_kwargs.append(kwargs)
         return {"ok": True, "url": result["url"], "domain": result["domain"]}
+
+    async def fake_persist(result, **kwargs):
+        persist_kwargs.append(kwargs)
+        return result
 
     captured_request = None
 
@@ -671,7 +1226,8 @@ async def test_research_pipeline_deduplicates_queries_and_scopes_retrieval(monke
 
     monkeypatch.setattr(pipelines, "build_research_plan", fake_plan)
     monkeypatch.setattr(pipelines, "searxng_search", fake_search)
-    monkeypatch.setattr(pipelines, "crawl_and_ingest_limited", fake_crawl)
+    monkeypatch.setattr(pipelines, "crawl_source_limited", fake_crawl)
+    monkeypatch.setattr(pipelines, "persist_crawled_source", fake_persist)
     monkeypatch.setattr(pipelines, "rag_query_impl", fake_rag)
 
     result = await pipelines.research_pipeline(
@@ -689,5 +1245,6 @@ async def test_research_pipeline_deduplicates_queries_and_scopes_retrieval(monke
     assert captured_request.namespace == "project-a"
     assert captured_request.research_run_id == result["research_run_id"]
     assert captured_request.ingestion_attempt_id == "b" * 64
-    assert crawl_kwargs[0]["ingestion_attempt_id"] == "b" * 64
-    assert crawl_kwargs[0]["ingestion_order_ns"] == 123456
+    assert "ingestion_attempt_id" not in crawl_kwargs[0]
+    assert persist_kwargs[0]["ingestion_attempt_id"] == "b" * 64
+    assert persist_kwargs[0]["ingestion_order_ns"] == 123456

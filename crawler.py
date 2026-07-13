@@ -67,6 +67,38 @@ DIRECT_LOW_CONFIDENCE_MARKERS = (
     "please verify you are human",
     "security check required",
 )
+CRAWL4AI_LOW_CONFIDENCE_MARKERS = DIRECT_LOW_CONFIDENCE_MARKERS + (
+    "are you a robot",
+    "access to this page has been denied",
+    "disable any ad blocker",
+    "please enable js",
+    "request blocked",
+    "our systems have detected unusual traffic",
+    "verify you are not a robot",
+)
+CHALLENGE_STRONG_MARKERS = {
+    "checking your browser",
+    "enable javascript",
+    "just a moment",
+    "please verify you are human",
+    "security check required",
+    "access to this page has been denied",
+    "disable any ad blocker",
+    "please enable js",
+    "our systems have detected unusual traffic",
+    "verify you are not a robot",
+}
+CHALLENGE_ARTICLE_TITLE_RE = re.compile(
+    r"\b(?:analysis|causes?|explained|explanation|fix(?:ing)?|guide|history|how|"
+    r"meaning|prevent(?:ing|ion)?|research|review|solutions?|troubleshoot(?:ing)?|"
+    r"tutorial|understanding|why)\b",
+    re.IGNORECASE,
+)
+CHALLENGE_ARTICLE_CONTENT_RE = re.compile(
+    r"\b(?:article|documentation|error message|explains?|guide|incident|means|"
+    r"report|research|technical|troubleshoot|users?)\b",
+    re.IGNORECASE,
+)
 DIRECT_PRIMARY_EXCLUDED_TAGS = {
     "aside",
     "footer",
@@ -845,12 +877,78 @@ def crawl4ai_payload(url: str, crawler_config: dict | None = None) -> dict:
     }
 
 
+def _looks_like_challenge_shell(
+    title: str,
+    content: str,
+    markers: tuple[str, ...],
+) -> bool:
+    """Distinguish low-information challenge shells from articles discussing them."""
+    title_preview = re.sub(r"\s+", " ", title or "").strip().lower()
+    content_preview = re.sub(r"\s+", " ", (content or "")[:5_000]).strip().lower()
+    content_markers = {marker for marker in markers if marker in content_preview}
+    title_markers = {marker for marker in markers if marker in title_preview}
+    if not content_markers and not title_markers:
+        return False
+
+    marker_occurrences = sum(content_preview.count(marker) for marker in content_markers)
+    residual = content_preview
+    for marker in content_markers:
+        residual = residual.replace(marker, " ")
+    residual_words = re.findall(r"[a-z0-9][a-z0-9'-]*", residual)
+    unique_residual_words = set(residual_words)
+    low_information = len(residual_words) < 25 or len(unique_residual_words) < 18
+    marker_chars = sum(
+        len(marker) * content_preview.count(marker) for marker in content_markers
+    )
+    marker_density = marker_chars / max(1, len(content_preview))
+    article_context = bool(CHALLENGE_ARTICLE_TITLE_RE.search(title_preview)) and (
+        bool(CHALLENGE_ARTICLE_CONTENT_RE.search(content_preview))
+        or len(unique_residual_words) >= 20
+    )
+
+    # Explanatory titles plus substantive prose are strong evidence that the
+    # phrases are the subject of the page. Still reject degenerate repeated
+    # shell copy even if its title happens to contain a discussion keyword.
+    if article_context:
+        return (
+            len(content_markers) >= 3
+            and marker_occurrences >= 8
+            and len(unique_residual_words) < 12
+        )
+
+    strong_marker_near_start = any(
+        marker in content_preview[:300]
+        for marker in content_markers & CHALLENGE_STRONG_MARKERS
+    )
+    title_segments = {
+        segment.strip(" .:;!?-_")
+        for segment in re.split(
+            r"\s*(?:\||\u00b7|\u2022|\u2014|\s-\s)\s*",
+            title_preview,
+        )
+        if segment.strip(" .:;!?-_")
+    }
+    title_is_bare_challenge = any(
+        segment in title_markers for segment in title_segments
+    )
+    repetitive = marker_occurrences >= 3
+    return (
+        len(content_markers) >= 2
+        and (low_information or repetitive or marker_density >= 0.08)
+    ) or (strong_marker_near_start and low_information) or title_is_bare_challenge or (
+        repetitive and low_information
+    )
+
+
 def _direct_result_is_sufficient(result: dict) -> bool:
     content = extract_content(result)
     if result.get("extraction_error") or len(content) < DIRECT_FIRST_MIN_CONTENT_CHARS:
         return False
-    preview = content[:20_000].lower()
-    if any(marker in preview for marker in DIRECT_LOW_CONFIDENCE_MARKERS):
+    if _looks_like_challenge_shell(
+        extract_title(result) or "",
+        content,
+        DIRECT_LOW_CONFIDENCE_MARKERS,
+    ):
         return False
     if result.get("body_format") == "html":
         primary_chars = result.get("_direct_primary_content_chars")
@@ -860,6 +958,47 @@ def _direct_result_is_sufficient(result: dict) -> bool:
         if primary_chars < minimum_primary_chars:
             return False
     return True
+
+
+def _crawl4ai_quality_error(result: dict, label: str = "Crawl4AI") -> str | None:
+    for success_key in ("success", "_crawl4ai_success"):
+        if result.get(success_key) is False:
+            return f"{label} reported unsuccessful extraction"
+
+    status_code = result.get("status_code")
+    if status_code is not None and not isinstance(status_code, bool):
+        try:
+            parsed_status = int(status_code)
+        except (TypeError, ValueError):
+            parsed_status = 0
+        if parsed_status >= 400:
+            return f"{label} returned HTTP {parsed_status}"
+
+    extraction_error = result.get("error_message") or result.get("extraction_error")
+    if extraction_error:
+        return f"{label} reported an extraction error: {_safe_error_detail(extraction_error)}"
+
+    content = extract_content(result)
+    if len(content) < 200:
+        return f"{label} returned too little content"
+
+    if _looks_like_challenge_shell(
+        extract_title(result) or "",
+        content,
+        CRAWL4AI_LOW_CONFIDENCE_MARKERS,
+    ):
+        return f"{label} returned a challenge or access-denied page"
+
+    primary_html = result.get("cleaned_html")
+    markdown = result.get("markdown")
+    if not primary_html and isinstance(markdown, dict):
+        primary_html = markdown.get("fit_html")
+    if isinstance(primary_html, str) and primary_html.strip():
+        primary_chars = _direct_html_primary_content_chars(primary_html)
+        if primary_chars < 200:
+            return f"{label} returned too little primary content"
+
+    return None
 
 
 async def _cancel_and_drain(task: asyncio.Task | None) -> None:
@@ -919,11 +1058,12 @@ async def crawl_url_impl(url: str, config: dict | None = None) -> dict:
                         ):
                             if result_url:
                                 await validate_url_safety(urljoin(url, str(result_url)))
-                    content = extract_content(data)
-                    if content and len(content) >= 200:
+                    quality_error = _crawl4ai_quality_error(data)
+                    if quality_error is None:
                         data["extraction_method"] = "crawl4ai"
                         return data
-                    crawl4ai_errors.append("Crawl4AI returned too little content")
+                    data["_crawl4ai_low_confidence"] = True
+                    crawl4ai_errors.append(quality_error)
                 except Exception as exc:
                     crawl4ai_errors.append(_safe_error_detail(exc))
                 crawl4ai_task = None
@@ -944,11 +1084,12 @@ async def crawl_url_impl(url: str, config: dict | None = None) -> dict:
         if not os.getenv("WEB_RUNNER_SOCKET", "").strip():
             try:
                 data = await crawl4ai_markdown_request(url)
-                content = extract_content(data)
-                if content and len(content) >= 200:
+                quality_error = _crawl4ai_quality_error(data, "Crawl4AI /md")
+                if quality_error is None:
                     data["crawl4ai_errors"] = crawl4ai_errors
                     return data
-                crawl4ai_errors.append("Crawl4AI /md returned too little content")
+                data["_crawl4ai_low_confidence"] = True
+                crawl4ai_errors.append(quality_error)
             except Exception as exc:
                 crawl4ai_errors.append(
                     f"crawl4ai /md failed: {_safe_error_detail(exc)}"
