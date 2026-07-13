@@ -26,6 +26,11 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 FROM ${CRAWL4AI_IMAGE} AS crawl4ai-runtime
 
 USER root
+# Crawl4AI 0.9.1 copies Chromium but omits Playwright's headless shell from
+# the non-root runtime cache (upstream issue #2064).
+RUN mkdir -p /home/appuser/.cache/ms-playwright \
+    && cp -r /root/.cache/ms-playwright/chromium_headless_shell-* /home/appuser/.cache/ms-playwright/ \
+    && chown -R appuser:appuser /home/appuser/.cache/ms-playwright
 COPY --chown=0:0 --chmod=0444 socks5_client.py /app/socks5_client.py
 COPY --chown=0:0 --chmod=0444 crawl4ai_egress_proxy.py /app/egress_proxy.py
 USER appuser

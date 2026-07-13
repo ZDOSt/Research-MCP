@@ -775,6 +775,8 @@ class ComposeIsolationTests(unittest.TestCase):
         self.assertEqual(service["build"]["target"], "crawl4ai-runtime")
         self.assertIn("CRAWL4AI_IMAGE", service["build"]["args"])
         self.assertIn("CRAWL4AI_DERIVED_IMAGE", service["image"])
+        self.assertIs(service["read_only"], True)
+        self.assertEqual(service["user"], "appuser")
         self.assertEqual(
             service["environment"]["CRAWL4AI_EGRESS_SOCKS_HOST"],
             "safe-egress",
@@ -786,9 +788,50 @@ class ComposeIsolationTests(unittest.TestCase):
         )
 
         dockerfile = (PROJECT_ROOT / "Dockerfile").read_text("utf-8")
-        self.assertIn("AS crawl4ai-runtime", dockerfile)
-        self.assertIn("crawl4ai_egress_proxy.py /app/egress_proxy.py", dockerfile)
-        self.assertIn("socks5_client.py /app/socks5_client.py", dockerfile)
+        dockerfile_lines = dockerfile.splitlines()
+        stage_start = next(
+            index
+            for index, line in enumerate(dockerfile_lines)
+            if line.strip().startswith("FROM ")
+            and line.strip().endswith(" AS crawl4ai-runtime")
+        )
+        stage_end = next(
+            (
+                index
+                for index in range(stage_start + 1, len(dockerfile_lines))
+                if dockerfile_lines[index].strip().startswith("FROM ")
+            ),
+            len(dockerfile_lines),
+        )
+        stage_lines = dockerfile_lines[stage_start:stage_end]
+        stage = "\n".join(stage_lines)
+        browser_cache_copy = (
+            "RUN mkdir -p /home/appuser/.cache/ms-playwright \\\n"
+            "    && cp -r /root/.cache/ms-playwright/chromium_headless_shell-* "
+            "/home/appuser/.cache/ms-playwright/ \\\n"
+            "    && chown -R appuser:appuser /home/appuser/.cache/ms-playwright"
+        )
+        self.assertIn(browser_cache_copy, stage)
+        root_index = next(
+            index for index, line in enumerate(stage_lines) if line.strip() == "USER root"
+        )
+        run_index = stage_lines.index(
+            "RUN mkdir -p /home/appuser/.cache/ms-playwright \\"
+        )
+        copy_index = stage_lines.index(
+            "    && cp -r /root/.cache/ms-playwright/chromium_headless_shell-* "
+            "/home/appuser/.cache/ms-playwright/ \\"
+        )
+        appuser_index = next(
+            index
+            for index, line in enumerate(stage_lines[copy_index + 1 :], copy_index + 1)
+            if line.strip() == "USER appuser"
+        )
+        self.assertLess(root_index, run_index)
+        self.assertLess(run_index, copy_index)
+        self.assertLess(copy_index, appuser_index)
+        self.assertIn("crawl4ai_egress_proxy.py /app/egress_proxy.py", stage)
+        self.assertIn("socks5_client.py /app/socks5_client.py", stage)
 
     def test_worker_does_not_receive_mcp_or_github_credentials(self):
         worker_environment = self.services["research-worker"]["environment"]
