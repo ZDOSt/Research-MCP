@@ -79,6 +79,10 @@ mcp = FastMCP(
     strict_input_validation=True,
     instructions=(
         "This MCP exposes private web research, URL investigation, durable research jobs, and scoped memory. "
+        "Before answering, use research_web whenever the required information may have changed or needs external verification, "
+        "even when the user did not explicitly ask to search; answer stable, timeless questions directly. "
+        "This applies especially to current documentation, installation and setup guidance, troubleshooting unfamiliar errors, "
+        "and software or product behavior. "
         "Use research_web for open-ended web research without a specific URL. "
         "Use investigate_url when the user provides a URL and asks to find, extract, summarize, compare, or verify information on that page. "
         "Use query_memory for already-ingested local research memory. "
@@ -88,6 +92,9 @@ mcp = FastMCP(
         "Never start the same research request again while its durable job is queued or running. "
         "If a tool returns a running job ID, do not poll it repeatedly in the same assistant turn; "
         "report the job ID and check it in a later turn. "
+        "A completed research_web response or full research_job result already contains the complete result payload, "
+        "so its duplicate job-result artifact path is intentionally omitted. Use get_research_artifact only for a "
+        "specifically needed source artifact or for a job-result path returned by explicitly requested compact metadata. "
         "The server internally handles search, Crawl4AI, Playwright, scrolling, clicking, network capture, Qdrant, and reranking. "
         "Tool outputs include retrieval_context with the server runtime date. "
         "Treat runtime-retrieved evidence as current even when it is newer than the answering model's training cutoff. "
@@ -293,6 +300,44 @@ def _github_evidence_result(result: dict) -> dict:
     return output
 
 
+def _complete_research_result(result: dict) -> dict:
+    """Mark a full result complete and hide only its duplicate job archive path."""
+    if not isinstance(result, dict) or result.get("error"):
+        return result
+    if result.get("status") in {"queued", "running"} and result.get("terminal") is False:
+        return result
+
+    output = dict(result)
+    instructions = list(output.get("answering_instructions") or [])
+    artifact_instruction = (
+        "This response already contains the complete result payload. Its duplicate job-result "
+        "artifact path is intentionally omitted. Do not call get_research_artifact to reread this "
+        "result. Use get_research_artifact only for a specifically needed source artifact or for a "
+        "job-result path returned by a prior compact-metadata response."
+    )
+    if artifact_instruction not in instructions:
+        instructions.append(artifact_instruction)
+    output["answering_instructions"] = instructions
+    output["result_payload_complete"] = True
+    job = output.get("job") if isinstance(output.get("job"), dict) else None
+    if job is not None:
+        job = dict(job)
+        job.pop("artifact_path", None)
+        job["result_payload_complete"] = True
+        output["job"] = job
+    output["artifact_guidance"] = {
+        "result_payload_complete": True,
+        "job_result_artifact_path_exposed": False,
+        "call_get_research_artifact_for_job_artifact": False,
+        "source_artifacts_may_contain_additional_content": True,
+        "valid_uses": [
+            "read a specifically referenced source artifact when its additional content is needed",
+            "read a job artifact after a prior response returned compact metadata instead of the full result",
+        ],
+    }
+    return output
+
+
 def _current_access_token():
     try:
         from fastmcp.server.dependencies import get_access_token
@@ -411,10 +456,18 @@ async def _load_completed_job(job_id: str) -> dict:
             "job_id": job_id,
             "status": "succeeded",
             "artifact_id": metadata.get("artifact_id"),
-            "artifact_path": artifact_path,
         }
-        return full_result
-    return {"job": job_result, "result": full_result}
+        return _complete_research_result(full_result)
+    return _complete_research_result(
+        {
+            "job": {
+                "job_id": job_id,
+                "status": "succeeded",
+                "artifact_id": metadata.get("artifact_id"),
+            },
+            "result": full_result,
+        }
+    )
 
 
 def _running_job_response(
@@ -566,7 +619,11 @@ async def research_web(
     """
     Open-ended web research pipeline.
 
-    Use this when the user asks a question or asks to find information but does not provide a specific URL.
+    Use this proactively whenever answering requires information that may have changed or should be
+    externally verified, even if the user did not explicitly ask to search. Answer stable, timeless
+    questions without calling this tool. Use this for open-ended research without a specific URL.
+    Pass the user's complete research question or task, including relevant constraints and desired
+    output; the server converts instruction-style requests into effective search queries internally.
     Internally uses SearXNG search, source scoring, Crawl4AI, optional Playwright fallback, Qdrant ingestion,
     Qdrant retrieval, and reranking.
 
@@ -598,7 +655,7 @@ async def research_web(
             "research_web",
         )
 
-    return await run_resilient(
+    result = await run_resilient(
         research_pipeline(
             query=query,
             mode=mode,
@@ -614,6 +671,7 @@ async def research_web(
         ),
         "research_web",
     )
+    return _complete_research_result(result)
 
 
 @mcp.tool
@@ -882,8 +940,9 @@ async def start_research(
 
     Prefer this over research_web when the client has a short tool timeout. Use
     research_job in a later assistant turn to inspect progress or retrieve the
-    result. Do not poll repeatedly or submit the same request again. Requires
-    JOB_BACKEND=redis.
+    result. Pass the complete research task; server-side planning derives the
+    search queries. Do not poll repeatedly or submit the same request again.
+    Requires JOB_BACKEND=redis.
     """
     query = _bounded_text(query, "query", MCP_MAX_QUERY_CHARS)
     namespace = normalize_namespace(namespace)
@@ -1022,7 +1081,13 @@ async def get_research_artifact(
     artifact_path: str,
     max_chars: ArtifactCharacterLimit = 50000,
 ) -> dict:
-    """Read a bounded JSON or text research artifact returned by a job or source."""
+    """Read a bounded source artifact or a job result that was not already returned in full.
+
+    Completed research_web responses and full research_job results intentionally omit their
+    duplicate job-result artifact path because the result is already present. Use this for a
+    specifically needed source artifact, or for a job-result path returned after a prior call
+    deliberately requested compact metadata with include_full_result=False.
+    """
     authorization_failure = _authorization_failure(scope="artifacts:read")
     if authorization_failure:
         return authorization_failure

@@ -28,7 +28,7 @@ from searching import (
     normalize_search_url,
     searxng_search,
 )
-from planner import build_research_plan, synthesize_report
+from planner import build_research_plan, fallback_search_query, synthesize_report
 from redaction import redact_sensitive_text
 from shared import (
     DEFAULT_NAMESPACE,
@@ -970,7 +970,7 @@ async def research_pipeline(
             "duration_seconds": round(time.monotonic() - start, 2),
         }
 
-    search_queries = plan.get("queries") or [query]
+    search_queries = list(plan.get("queries") or [query])
     search_outcomes = await asyncio.gather(
         *[
             searxng_search(query=item, max_results=search_results_value, mode=mode)
@@ -981,12 +981,13 @@ async def research_pipeline(
 
     merged_candidates: Dict[str, dict] = {}
     search_errors = []
-    for search_query, outcome in zip(search_queries, search_outcomes):
+
+    def merge_search_outcome(search_query: str, outcome: object) -> None:
         if isinstance(outcome, Exception):
             detail = _safe_error_detail(outcome)
             search_errors.append({"query": search_query, "error": detail})
             logger.error("SearXNG search failed for query %r: %s", search_query, detail)
-            continue
+            return
 
         for candidate in _stamp_retrieval_context(outcome, retrieval_context):
             candidate = dict(candidate)
@@ -1007,6 +1008,43 @@ async def research_pipeline(
                     existing["matched_queries"] = matched_queries
             else:
                 merged_candidates[normalized_url] = candidate
+
+    for search_query, outcome in zip(search_queries, search_outcomes):
+        merge_search_outcome(search_query, outcome)
+
+    fallback_metadata = None
+    successful_search = any(not isinstance(outcome, Exception) for outcome in search_outcomes)
+    any_raw_results = any(
+        bool(outcome)
+        for outcome in search_outcomes
+        if not isinstance(outcome, Exception)
+    )
+    compact_fallback = fallback_search_query(
+        query,
+        current_date=retrieval_context.get("current_date_local"),
+    )
+    if (
+        not merged_candidates
+        and successful_search
+        and not any_raw_results
+        and compact_fallback
+        and compact_fallback.lower() not in {item.lower() for item in search_queries}
+    ):
+        fallback_metadata = {
+            "triggered": True,
+            "reason": "initial_queries_returned_no_results",
+            "query": compact_fallback,
+        }
+        try:
+            fallback_outcome = await searxng_search(
+                query=compact_fallback,
+                max_results=search_results_value,
+                mode=mode,
+            )
+        except Exception as exc:
+            fallback_outcome = exc
+        search_queries.append(compact_fallback)
+        merge_search_outcome(compact_fallback, fallback_outcome)
 
     candidates = sorted(
         merged_candidates.values(),
@@ -1123,6 +1161,9 @@ async def research_pipeline(
 
     if search_errors:
         response["search_errors"] = search_errors
+    if fallback_metadata:
+        fallback_metadata["produced_results"] = bool(merged_candidates)
+        response["search_fallback"] = fallback_metadata
 
     if synthesize:
         report = await synthesize_report(query, evidence)

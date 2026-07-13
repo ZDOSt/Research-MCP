@@ -63,3 +63,27 @@ async def test_all_public_tools_expose_bounded_client_schemas():
     artifact_chars = tools["get_research_artifact"].parameters["properties"]["max_chars"]
     assert artifact_chars["minimum"] == 1_000
     assert artifact_chars["maximum"] == 250_000
+
+
+@pytest.mark.asyncio
+async def test_tool_discovery_promotes_proactive_research_without_redundant_artifact_reads():
+    tools = {tool.name: tool for tool in await mcp_server.mcp.list_tools()}
+
+    instructions = mcp_server.mcp.instructions
+    assert "may have changed or needs external verification" in instructions
+    assert "even when the user did not explicitly ask to search" in instructions
+    assert "answer stable, timeless questions directly" in instructions
+    assert "duplicate job-result artifact path is intentionally omitted" in instructions
+
+    research_description = tools["research_web"].description
+    assert "Use this proactively" in research_description
+    assert "may have changed" in research_description
+    assert "did not explicitly ask to search" in research_description
+    assert "complete research question or task" in research_description
+    assert "effective search queries internally" in research_description
+
+    artifact_description = tools["get_research_artifact"].description
+    assert "intentionally omit their" in artifact_description
+    assert "duplicate job-result artifact path" in artifact_description
+    assert "specifically needed source artifact" in artifact_description
+    assert "include_full_result=False" in artifact_description

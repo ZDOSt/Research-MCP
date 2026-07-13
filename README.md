@@ -85,6 +85,9 @@ echo "CRAWL4AI_API_TOKEN=$(openssl rand -hex 32)"
 
 Put the generated values in `.env` as `SEARXNG_SECRET`, `MCP_AUTH_TOKEN`, and
 `CRAWL4AI_API_TOKEN`; use a different value for each credential.
+Set `RESEARCH_TIMEZONE` to the primary user's IANA timezone, such as
+`America/New_York`, so relative-date searches and results use the expected
+local calendar date. It defaults to `UTC`.
 Keep `MCP_BIND_ADDRESS=127.0.0.1`, and add the public hostname to the strict Host
 allowlist, for example
 `MCP_ALLOWED_HOSTS=127.0.0.1:*,localhost:*,[::1]:*,mcp-gateway:*,research.example.com`.
@@ -175,11 +178,11 @@ when a token policy restricts its `namespaces` patterns.
 
 | Tool | Purpose and important behavior |
 | --- | --- |
-| `research_web` | Run open-ended research. Modes are `quick`, `balanced`, `deep`, `technical`, `academic`, `local_only`, and `web_only`. It can request cross-source corroboration, include existing memory, and request planner synthesis. With the Compose Redis backend it queues the work, waits up to `MCP_SYNC_JOB_WAIT_SECONDS` (60 seconds by default), then returns either the result or a job ID while longer work continues. An exact same-owner request already queued or running is coalesced and returns that job ID immediately. |
+| `research_web` | Run open-ended research. Pass the complete research task; server-side planning derives compact, complementary search queries while retaining exact errors, versions, URLs, products, and date constraints. Modes are `quick`, `balanced`, `deep`, `technical`, `academic`, `local_only`, and `web_only`. It can request cross-source corroboration, include existing memory, and request planner synthesis. With the Compose Redis backend it queues the work, waits up to `MCP_SYNC_JOB_WAIT_SECONDS` (60 seconds by default), then returns either the result or a job ID while longer work continues. An exact same-owner request already queued or running is coalesced and returns that job ID immediately. |
 | `investigate_url` | Investigate one public HTTP(S) URL with crawl, rendered-browser, scrolling, clicking, and network-data fallbacks. Modes are `auto`, `targeted`, `balanced`, and `exhaustive`; optional flags control ingestion, raw text, and diagnostics. |
 | `start_research` | Queue durable `research_web` work and return a job ID immediately. Use this for clients with short tool-call timeouts. It requires `JOB_BACKEND=redis`, which Compose configures. |
 | `research_job` | Operate on a durable job with `action=status`, `result`, or `cancel`. Status and result calls use bounded long polling (`wait_seconds`, default 15) to reduce model/tool polling loops. `include_full_result=false` returns compact Redis metadata instead of loading the complete artifact. Cancellation is cooperative and may not be instantaneous. |
-| `get_research_artifact` | Read a returned relative `artifact_path` as bounded text. `max_chars` is clamped to 1,000-250,000 characters. |
+| `get_research_artifact` | Read a returned source artifact, or a job-result path obtained through compact job metadata, as bounded text. Completed full results omit their duplicate job-result path because the payload is already present. `max_chars` is clamped to 1,000-250,000 characters. |
 | `query_memory` | Search Qdrant memory in a namespace, with `top_k` clamped to 1-30, and return reranked evidence. |
 | `ingest_text` | Store supplied text in a namespace. Common credentials and tokens are redacted by default. Under token policies, `redact_secrets=false` requires the separate `memory:write:unredacted` scope. |
 | `manage_sources` | `list`, inspect `stats`, or `delete` an ingested source within a namespace. Deletion removes its Qdrant chunks, not job artifact files. |
@@ -508,6 +511,9 @@ GitHub/planner credentials, browser safety switches, and resource bounds.
 Important invariants:
 
 - `VECTOR_SIZE` must match the selected `EMBEDDING_MODEL`.
+- `RESEARCH_TIMEZONE` must be an IANA timezone name. Retrieval context always
+  preserves UTC timestamps and also reports the configured timezone, local
+  timestamp, and local calendar date for interpreting relative dates.
 - `MCP_BIND_ADDRESS` defaults to loopback. `MCP_AUTH_TOKEN` enables static bearer
   authentication, but the application does not provide TLS. Require the token
   and terminate TLS at a reverse proxy before publishing to an untrusted

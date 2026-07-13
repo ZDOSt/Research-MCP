@@ -13,6 +13,7 @@ from contextvars import ContextVar, Token
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 from urllib.parse import urlparse
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 from dotenv import load_dotenv
@@ -97,6 +98,21 @@ COLLECTION_NAME = os.getenv("QDRANT_COLLECTION", "librechat_docs")
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
 MODEL_CACHE_DIR = os.getenv("MODEL_CACHE_DIR", "./models")
 DEFAULT_NAMESPACE = os.getenv("DEFAULT_RESEARCH_NAMESPACE", "default")
+
+
+def _load_research_timezone(value: str) -> ZoneInfo:
+    timezone_name = value.strip() or "UTC"
+    try:
+        return ZoneInfo(timezone_name)
+    except (ValueError, ZoneInfoNotFoundError) as exc:
+        raise ValueError(
+            "RESEARCH_TIMEZONE must be a valid IANA timezone name, such as "
+            "UTC or America/New_York"
+        ) from exc
+
+
+RESEARCH_TIMEZONE_NAME = os.getenv("RESEARCH_TIMEZONE", "UTC").strip() or "UTC"
+RESEARCH_TIMEZONE = _load_research_timezone(RESEARCH_TIMEZONE_NAME)
 
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1100"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "150"))
@@ -315,12 +331,17 @@ def next_ingestion_order_ns() -> int:
 
 def runtime_retrieval_context() -> Dict[str, Any]:
     now = datetime.now(timezone.utc)
+    local_now = now.astimezone(RESEARCH_TIMEZONE)
     return {
         "retrieved_at_utc": now.isoformat(),
         "current_date_utc": now.date().isoformat(),
+        "timezone": RESEARCH_TIMEZONE_NAME,
+        "retrieved_at_local": local_now.isoformat(),
+        "current_date_local": local_now.date().isoformat(),
         "freshness": "runtime_retrieved",
         "guidance": (
             "This MCP result was retrieved or queried at server runtime. "
+            "Interpret relative dates using current_date_local and timezone. "
             "Information dated after the answering model's training cutoff can be valid; "
             "do not discard it solely because it is newer than the model cutoff."
         ),

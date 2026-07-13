@@ -152,7 +152,11 @@ class MCPJobIntegrationTests(unittest.IsolatedAsyncioTestCase):
             )
             status.assert_awaited_once_with(job_id)
 
-        metadata_result = {"job_id": job_id, "status": "succeeded", "result": {"artifact_id": "a"}}
+        metadata_result = {
+            "job_id": job_id,
+            "status": "succeeded",
+            "result": {"artifact_id": "a", "artifact_path": f"{job_id}/result.json"},
+        }
         with patch.object(
             server,
             "get_job_status",
@@ -264,6 +268,51 @@ class MCPJobIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["evidence"], [1, 2])
         self.assertEqual(result["job"]["artifact_id"], artifact["artifact_id"])
         self.assertEqual(result["job"]["job_id"], job_id)
+        self.assertNotIn("artifact_path", result["job"])
+        self.assertTrue(result["job"]["result_payload_complete"])
+        self.assertTrue(result["result_payload_complete"])
+        self.assertTrue(result["artifact_guidance"]["result_payload_complete"])
+        self.assertFalse(result["artifact_guidance"]["job_result_artifact_path_exposed"])
+        self.assertFalse(
+            result["artifact_guidance"]["call_get_research_artifact_for_job_artifact"]
+        )
+        self.assertIn(
+            "Do not call get_research_artifact",
+            " ".join(result["answering_instructions"]),
+        )
+
+    async def test_full_result_hides_only_job_archive_path(self):
+        server = load_mcp_server()
+        source_path = "job/source-page.txt"
+        result = server._complete_research_result(
+            {
+                "query": "q",
+                "job": {
+                    "job_id": "job",
+                    "artifact_id": "job:result",
+                    "artifact_path": "job/result.json",
+                },
+                "evidence": [
+                    {
+                        "artifact_id": "job:source-page",
+                        "artifact_path": source_path,
+                        "artifact_reference": {
+                            "artifact_id": "job:source-page",
+                            "artifact_path": source_path,
+                        },
+                    }
+                ],
+            }
+        )
+
+        self.assertNotIn("artifact_path", result["job"])
+        self.assertEqual(result["job"]["artifact_id"], "job:result")
+        self.assertTrue(result["job"]["result_payload_complete"])
+        self.assertEqual(result["evidence"][0]["artifact_path"], source_path)
+        self.assertEqual(
+            result["evidence"][0]["artifact_reference"]["artifact_path"],
+            source_path,
+        )
 
     async def test_sync_research_tool_uses_queue_when_backend_is_redis(self):
         server = load_mcp_server(backend="redis")
@@ -286,7 +335,11 @@ class MCPJobIntegrationTests(unittest.IsolatedAsyncioTestCase):
         ):
             result = await server.research_web("question", namespace="project-a")
 
-        self.assertEqual(result, {"query": "question"})
+        self.assertEqual(result["query"], "question")
+        self.assertTrue(result["artifact_guidance"]["result_payload_complete"])
+        self.assertTrue(
+            result["artifact_guidance"]["source_artifacts_may_contain_additional_content"]
+        )
         self.assertFalse(pipeline.await_args.kwargs["persist_source_artifacts"])
 
     async def test_authenticated_stdio_tool_call_uses_local_trust_boundary(self):
@@ -297,7 +350,10 @@ class MCPJobIntegrationTests(unittest.IsolatedAsyncioTestCase):
         ):
             result = await server.research_web("question", namespace="project-a")
 
-        self.assertEqual(result, {"query": "question"})
+        self.assertEqual(result["query"], "question")
+        self.assertFalse(
+            result["artifact_guidance"]["call_get_research_artifact_for_job_artifact"]
+        )
         self.assertTrue(pipeline.await_args.kwargs["persist_source_artifacts"])
 
     async def test_authenticated_http_tool_call_still_requires_access_token(self):
