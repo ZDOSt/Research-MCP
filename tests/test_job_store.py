@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, patch
 
 import fakeredis.aioredis as fakeredis
 
+import job_store
 from job_store import (
     CANCELLED,
     FAILED,
@@ -55,6 +56,335 @@ class RedisJobStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["result"], metadata)
         self.assertGreater(await self.redis.ttl(self.store._job_key(created["job_id"])), 0)
         self.assertEqual(await self.redis.lrange(self.store.processing_key, 0, -1), [])
+
+    async def test_active_coalescing_is_opt_in_and_canonical(self):
+        first_default = await self.store.create_job(
+            "query_memory",
+            {"query": "same"},
+            owner_id="client-a",
+        )
+        second_default = await self.store.create_job(
+            "query_memory",
+            {"query": "same"},
+            owner_id="client-a",
+        )
+        self.assertNotEqual(first_default["job_id"], second_default["job_id"])
+
+        first, second = await asyncio.gather(
+            self.store.create_job(
+                "research_web",
+                {"query": "evidence", "options": {"mode": "deep", "verify": True}},
+                owner_id="client-a",
+                coalesce_active=True,
+            ),
+            self.store.create_job(
+                "research_web",
+                {"options": {"verify": True, "mode": "deep"}, "query": "evidence"},
+                owner_id="client-a",
+                coalesce_active=True,
+            ),
+        )
+
+        self.assertEqual(first["job_id"], second["job_id"])
+        self.assertEqual({first["coalesced"], second["coalesced"]}, {False, True})
+        queued = await self.redis.lrange(self.store.queue_key, 0, -1)
+        self.assertEqual(queued.count(first["job_id"]), 1)
+
+    async def test_active_coalescing_is_scoped_by_owner_kind_and_payload(self):
+        jobs = [
+            await self.store.create_job(
+                "research_web",
+                {"query": "same"},
+                owner_id="client-a",
+                coalesce_active=True,
+            ),
+            await self.store.create_job(
+                "research_web",
+                {"query": "same"},
+                owner_id="client-b",
+                coalesce_active=True,
+            ),
+            await self.store.create_job(
+                "investigate_url",
+                {"query": "same"},
+                owner_id="client-a",
+                coalesce_active=True,
+            ),
+            await self.store.create_job(
+                "research_web",
+                {"query": "different"},
+                owner_id="client-a",
+                coalesce_active=True,
+            ),
+        ]
+
+        self.assertEqual(len({job["job_id"] for job in jobs}), len(jobs))
+        self.assertEqual(await self.redis.llen(self.store.queue_key), len(jobs))
+
+    async def test_queue_full_allows_joining_an_identical_active_job(self):
+        self.store.max_queued_jobs = 1
+        first = await self.store.create_job(
+            "research_web",
+            {"query": "same"},
+            owner_id="client-a",
+            coalesce_active=True,
+        )
+        joined = await self.store.create_job(
+            "research_web",
+            {"query": "same"},
+            owner_id="client-a",
+            coalesce_active=True,
+        )
+
+        self.assertEqual(joined["job_id"], first["job_id"])
+        self.assertTrue(joined["coalesced"])
+        with self.assertRaises(JobQueueFullError):
+            await self.store.create_job(
+                "research_web",
+                {"query": "different"},
+                owner_id="client-a",
+                coalesce_active=True,
+            )
+
+    async def test_cancelling_shared_job_does_not_delete_replacement_index(self):
+        payload = {"query": "retry"}
+        fingerprint = job_store._coalescing_fingerprint(
+            "research_web",
+            job_store._json_dumps(payload),
+            "client-a",
+        )
+        active_key = self.store._active_job_key(fingerprint)
+        first = await self.store.create_job(
+            "research_web",
+            payload,
+            owner_id="client-a",
+            coalesce_active=True,
+        )
+        claimed = await self.store.claim_job(worker_id="worker-1")
+        joined = await self.store.create_job(
+            "research_web",
+            payload,
+            owner_id="client-a",
+            coalesce_active=True,
+        )
+        self.assertEqual(joined["job_id"], first["job_id"])
+
+        await self.store.request_cancellation(first["job_id"])
+        replacement = await self.store.create_job(
+            "research_web",
+            payload,
+            owner_id="client-a",
+            coalesce_active=True,
+        )
+        self.assertNotEqual(replacement["job_id"], first["job_id"])
+
+        await self.store.mark_cancelled(
+            first["job_id"],
+            lease_token=claimed["lease_token"],
+        )
+        self.assertEqual(await self.redis.get(active_key), replacement["job_id"])
+        self.assertGreater(await self.redis.ttl(active_key), 0)
+        replacement_join = await self.store.create_job(
+            "research_web",
+            payload,
+            owner_id="client-a",
+            coalesce_active=True,
+        )
+        self.assertEqual(replacement_join["job_id"], replacement["job_id"])
+        self.assertTrue(replacement_join["coalesced"])
+
+    async def test_terminal_and_stale_jobs_release_the_active_index(self):
+        completed = await self.store.create_job(
+            "query_memory",
+            {"query": "complete"},
+            owner_id="client-a",
+            coalesce_active=True,
+        )
+        completed_claim = await self.store.claim_job(worker_id="worker-1")
+        await self.store.complete_job(
+            completed["job_id"],
+            {"count": 1},
+            lease_token=completed_claim["lease_token"],
+        )
+        completed_replacement = await self.store.create_job(
+            "query_memory",
+            {"query": "complete"},
+            owner_id="client-a",
+            coalesce_active=True,
+        )
+        self.assertNotEqual(completed_replacement["job_id"], completed["job_id"])
+        await self.store.request_cancellation(completed_replacement["job_id"])
+
+        self.store.max_attempts = 1
+        stale = await self.store.create_job(
+            "research_web",
+            {"query": "stale"},
+            owner_id="client-a",
+            coalesce_active=True,
+        )
+        await self.store.claim_job(worker_id="dead-worker")
+        old = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+        await self.redis.hset(self.store._job_key(stale["job_id"]), "heartbeat_at", old)
+        self.assertEqual(await self.store.requeue_stale_jobs(60), 0)
+        stale_replacement = await self.store.create_job(
+            "research_web",
+            {"query": "stale"},
+            owner_id="client-a",
+            coalesce_active=True,
+        )
+        self.assertNotEqual(stale_replacement["job_id"], stale["job_id"])
+
+    async def test_stale_or_malformed_active_index_self_heals_without_leaking_metadata(self):
+        first = await self.store.create_job(
+            "research_web",
+            {"query": "private search"},
+            owner_id="client-a",
+            coalesce_active=True,
+        )
+        fingerprint = job_store._coalescing_fingerprint(
+            "research_web",
+            job_store._json_dumps({"query": "private search"}),
+            "client-a",
+        )
+        active_key = self.store._active_job_key(fingerprint)
+        await self.redis.set(active_key, "not-a-job-id")
+
+        replacement = await self.store.create_job(
+            "research_web",
+            {"query": "private search"},
+            owner_id="client-a",
+            coalesce_active=True,
+        )
+        self.assertNotEqual(replacement["job_id"], first["job_id"])
+        self.assertEqual(await self.redis.get(active_key), replacement["job_id"])
+        self.assertNotIn("coalesce_fingerprint", replacement)
+        self.assertNotIn(
+            "coalesce_fingerprint",
+            await self.store.get_status(replacement["job_id"]),
+        )
+
+    async def test_missing_job_hash_leaves_only_a_bounded_self_healing_active_index(self):
+        payload = {"query": "recover missing hash"}
+        first = await self.store.create_job(
+            "research_web",
+            payload,
+            owner_id="client-a",
+            coalesce_active=True,
+        )
+        fingerprint = job_store._coalescing_fingerprint(
+            "research_web",
+            job_store._json_dumps(payload),
+            "client-a",
+        )
+        active_key = self.store._active_job_key(fingerprint)
+        initial_ttl = await self.redis.ttl(active_key)
+        self.assertGreater(initial_ttl, 0)
+        self.assertLessEqual(initial_ttl, self.store.active_job_index_ttl_seconds)
+
+        await self.redis.delete(self.store._job_key(first["job_id"]))
+        self.assertIsNone(await self.store.claim_job(worker_id="worker-1"))
+        self.assertEqual(await self.redis.get(active_key), first["job_id"])
+        self.assertGreater(await self.redis.ttl(active_key), 0)
+
+        replacement = await self.store.create_job(
+            "research_web",
+            payload,
+            owner_id="client-a",
+            coalesce_active=True,
+        )
+        self.assertNotEqual(replacement["job_id"], first["job_id"])
+        self.assertEqual(await self.redis.get(active_key), replacement["job_id"])
+        self.assertGreater(await self.redis.ttl(active_key), 0)
+
+    async def test_active_index_ttl_refreshes_through_worker_lifecycle(self):
+        payload = {"query": "long-running"}
+        created = await self.store.create_job(
+            "research_web",
+            payload,
+            owner_id="client-a",
+            coalesce_active=True,
+        )
+        fingerprint = job_store._coalescing_fingerprint(
+            "research_web",
+            job_store._json_dumps(payload),
+            "client-a",
+        )
+        active_key = self.store._active_job_key(fingerprint)
+
+        await self.redis.expire(active_key, 1)
+        joined = await self.store.create_job(
+            "research_web",
+            payload,
+            owner_id="client-a",
+            coalesce_active=True,
+        )
+        self.assertEqual(joined["job_id"], created["job_id"])
+        self.assertTrue(joined["coalesced"])
+        self.assertGreater(await self.redis.ttl(active_key), 1)
+
+        await self.redis.expire(active_key, 1)
+        claimed = await self.store.claim_job(worker_id="worker-1")
+        self.assertEqual(claimed["job_id"], created["job_id"])
+        self.assertGreater(await self.redis.ttl(active_key), 1)
+
+        await self.redis.expire(active_key, 1)
+        self.assertTrue(
+            await self.store.heartbeat_job(
+                created["job_id"],
+                "worker-1",
+                claimed["lease_token"],
+            )
+        )
+        self.assertGreater(await self.redis.ttl(active_key), 1)
+
+        await self.redis.expire(active_key, 1)
+        self.assertTrue(
+            await self.store.requeue_job(
+                created["job_id"],
+                lease_token=claimed["lease_token"],
+            )
+        )
+        self.assertGreater(await self.redis.ttl(active_key), 1)
+
+    async def test_active_index_is_finite_when_result_expiration_is_disabled(self):
+        store = RedisJobStore(
+            redis_client=self.redis,
+            queue_name="test:no-result-expiry",
+            result_ttl_seconds=0,
+            ingestion_waitaof_timeout_ms=0,
+        )
+        payload = {"query": "bounded index"}
+        created = await store.create_job(
+            "research_web",
+            payload,
+            coalesce_active=True,
+        )
+        fingerprint = job_store._coalescing_fingerprint(
+            "research_web",
+            job_store._json_dumps(payload),
+            None,
+        )
+        active_key = store._active_job_key(fingerprint)
+
+        self.assertEqual(await self.redis.get(active_key), created["job_id"])
+        self.assertGreater(await self.redis.ttl(active_key), 0)
+
+    async def test_enqueue_job_enables_active_coalescing_by_default(self):
+        with patch.object(job_store, "get_job_store", return_value=self.store):
+            first = await job_store.enqueue_job(
+                "research_web",
+                {"query": "queued"},
+                owner_id="client-a",
+            )
+            second = await job_store.enqueue_job(
+                "research_web",
+                {"query": "queued"},
+                owner_id="client-a",
+            )
+
+        self.assertEqual(first["job_id"], second["job_id"])
+        self.assertFalse(first["coalesced"])
+        self.assertTrue(second["coalesced"])
 
     async def test_cancelling_a_queued_job_removes_it_without_worker_claim(self):
         created = await self.store.create_job("query_memory", {"query": "cached"})

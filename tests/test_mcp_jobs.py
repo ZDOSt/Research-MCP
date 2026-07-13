@@ -134,7 +134,9 @@ class MCPJobIntegrationTests(unittest.IsolatedAsyncioTestCase):
             },
         )
         self.assertEqual(result["job_id"], job_id)
-        self.assertEqual(result["next_action"]["tool"], "research_job")
+        self.assertFalse(result["terminal"])
+        self.assertGreaterEqual(result["retry_after_seconds"], 5)
+        self.assertIn("Do not poll repeatedly", " ".join(result["answering_instructions"]))
         self.assertIn("retrieval_context", result)
 
     async def test_research_job_routes_status_metadata_full_result_and_cancel(self):
@@ -144,26 +146,101 @@ class MCPJobIntegrationTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(
             server, "get_job_status", AsyncMock(return_value={"job_id": job_id, "status": "running"})
         ) as status:
-            self.assertEqual((await server.research_job("status", job_id))["status"], "running")
+            self.assertEqual(
+                (await server.research_job("status", job_id, wait_seconds=0))["status"],
+                "running",
+            )
             status.assert_awaited_once_with(job_id)
 
         metadata_result = {"job_id": job_id, "status": "succeeded", "result": {"artifact_id": "a"}}
-        with patch.object(server, "get_job_result", AsyncMock(return_value=metadata_result)) as get_result:
+        with patch.object(
+            server,
+            "get_job_status",
+            AsyncMock(return_value={"job_id": job_id, "status": "succeeded"}),
+        ), patch.object(
+            server, "get_job_result", AsyncMock(return_value=metadata_result)
+        ) as get_result:
             self.assertEqual(
-                await server.research_job("result", job_id, include_full_result=False),
+                await server.research_job(
+                    "result",
+                    job_id,
+                    include_full_result=False,
+                    wait_seconds=0,
+                ),
                 metadata_result,
             )
             get_result.assert_awaited_once_with(job_id)
 
         full_result = {"query": "q", "job": {"job_id": job_id}}
-        with patch.object(server, "_load_completed_job", AsyncMock(return_value=full_result)) as load:
-            self.assertEqual(await server.research_job("result", job_id), full_result)
+        with patch.object(
+            server,
+            "get_job_status",
+            AsyncMock(return_value={"job_id": job_id, "status": "succeeded"}),
+        ), patch.object(server, "_load_completed_job", AsyncMock(return_value=full_result)) as load:
+            self.assertEqual(
+                await server.research_job("result", job_id, wait_seconds=0),
+                full_result,
+            )
             load.assert_awaited_once_with(job_id)
 
         cancelled = {"job_id": job_id, "status": "cancelled"}
         with patch.object(server, "request_cancellation", AsyncMock(return_value=cancelled)) as cancel:
             self.assertEqual(await server.research_job("cancel", job_id), cancelled)
             cancel.assert_awaited_once_with(job_id)
+
+    async def test_research_job_long_poll_returns_completed_result_without_busy_loop(self):
+        server = load_mcp_server()
+        job_id = uuid.uuid4().hex
+        running = {"job_id": job_id, "status": "running"}
+        succeeded = {"job_id": job_id, "status": "succeeded"}
+        full_result = {"query": "q", "job": {"job_id": job_id}}
+
+        with patch.object(
+            server, "get_job_status", AsyncMock(return_value=running)
+        ), patch.object(
+            server, "_wait_for_terminal_job", AsyncMock(return_value=succeeded)
+        ) as wait, patch.object(
+            server, "_load_completed_job", AsyncMock(return_value=full_result)
+        ) as load:
+            result = await server.research_job("result", job_id, wait_seconds=12)
+
+        self.assertEqual(result, full_result)
+        wait.assert_awaited_once_with(job_id, 12)
+        load.assert_awaited_once_with(job_id)
+
+    async def test_research_job_running_response_discourages_same_turn_polling(self):
+        server = load_mcp_server()
+        job_id = uuid.uuid4().hex
+        running = {"job_id": job_id, "status": "running"}
+
+        with patch.object(
+            server, "get_job_status", AsyncMock(return_value=running)
+        ), patch.object(
+            server, "_wait_for_terminal_job", AsyncMock(return_value=running)
+        ):
+            result = await server.research_job("result", job_id, wait_seconds=5)
+
+        self.assertEqual(result["status"], "running")
+        self.assertFalse(result["terminal"])
+        self.assertEqual(result["job_id"], job_id)
+        self.assertIn("Do not poll repeatedly", " ".join(result["answering_instructions"]))
+
+    async def test_research_job_preserves_queued_status(self):
+        server = load_mcp_server()
+        job_id = uuid.uuid4().hex
+        queued = {"job_id": job_id, "status": "queued"}
+
+        with patch.object(server, "get_job_status", AsyncMock(return_value=queued)):
+            result = await server.research_job("status", job_id, wait_seconds=0)
+
+        self.assertEqual(result["status"], "queued")
+        self.assertFalse(result["terminal"])
+
+        with patch.object(server, "get_job_status", AsyncMock(return_value=queued)):
+            result = await server.research_job("result", job_id, wait_seconds=0)
+
+        self.assertEqual(result["status"], "queued")
+        self.assertFalse(result["terminal"])
 
     async def test_completed_job_loads_full_json_artifact(self):
         server = load_mcp_server()
@@ -279,6 +356,34 @@ class MCPJobIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["job_id"], job_id)
         self.assertEqual(result["warning"], "job_status_temporarily_unavailable")
+
+    async def test_coalesced_sync_request_returns_without_waiting_again(self):
+        server = load_mcp_server(backend="redis")
+        job_id = uuid.uuid4().hex
+        with patch.object(
+            server,
+            "enqueue_job",
+            AsyncMock(
+                return_value={
+                    "job_id": job_id,
+                    "status": "running",
+                    "coalesced": True,
+                }
+            ),
+        ), patch.object(
+            server,
+            "get_job_status",
+            AsyncMock(return_value={"job_id": job_id, "status": "running"}),
+        ), patch.object(server.asyncio, "sleep", AsyncMock()) as sleep:
+            result = await server._enqueue_and_wait(
+                "research_web",
+                {"query": "same"},
+                "research_web",
+            )
+
+        self.assertEqual(result["job_id"], job_id)
+        self.assertTrue(result["coalesced"])
+        sleep.assert_not_awaited()
 
     async def test_disabled_backend_and_queue_failures_return_stable_errors(self):
         disabled = load_mcp_server(backend="inline")

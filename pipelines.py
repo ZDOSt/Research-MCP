@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import os
 import re
 import time
 import uuid
@@ -51,7 +52,24 @@ URL_TABLE_ROW_LIMIT = 300
 URL_TABLE_ROW_CHAR_LIMIT = 900
 URL_NETWORK_EVIDENCE_LIMIT = 4
 URL_NETWORK_PREVIEW_LIMIT = 500
-MAX_CONCURRENT_CRAWL_INGEST = 2
+
+
+def _validated_source_concurrency(value: Optional[str] = None) -> int:
+    raw_value = (
+        os.getenv("RESEARCH_SOURCE_CONCURRENCY", "2") if value is None else value
+    )
+    try:
+        concurrency = int(raw_value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "RESEARCH_SOURCE_CONCURRENCY must be an integer from 1 to 4"
+        ) from exc
+    if not 1 <= concurrency <= 4:
+        raise ValueError("RESEARCH_SOURCE_CONCURRENCY must be an integer from 1 to 4")
+    return concurrency
+
+
+RESEARCH_SOURCE_CONCURRENCY = _validated_source_concurrency()
 CORROBORATION_STOP_WORDS = {
     "about", "after", "also", "and", "are", "because", "been", "before", "being",
     "between", "both", "but", "can", "could", "does", "each", "for", "from", "had",
@@ -425,6 +443,8 @@ async def explore_url_pipeline(
     labels: Optional[List[str]] = None,
     mode: str = "auto",
     max_chars: int = DEFAULT_MAX_CHARS,
+    initial_crawl_data: Optional[dict] = None,
+    initial_crawl_error: Optional[str] = None,
 ) -> dict:
     start = time.monotonic()
     max_chars = clamp_int(max_chars, 10000, ABSOLUTE_MAX_CHARS)
@@ -442,6 +462,7 @@ async def explore_url_pipeline(
     table_like_rows = []
     best_result = None
     strategy_used = None
+    crawl_low_confidence = False
 
     def build_result(profile: str, content: str, playwright_result: Optional[dict] = None) -> dict:
         retrieval_context = runtime_retrieval_context()
@@ -492,6 +513,7 @@ async def explore_url_pipeline(
         if playwright_result:
             result["playwright_profile"] = playwright_result.get("profile")
 
+        result["extraction_sufficient"] = extraction_sufficient(task, result)
         result["confidence"] = estimate_confidence(result)
         result["answering_instructions"] = [
             _freshness_instruction(),
@@ -517,10 +539,17 @@ async def explore_url_pipeline(
             playwright_result,
         )
 
-    try:
-        crawl_data = await crawl_url_impl(url)
+    crawl_data = initial_crawl_data
+    if crawl_data is None and initial_crawl_error is None:
+        try:
+            crawl_data = await crawl_url_impl(url)
+        except Exception as exc:
+            initial_crawl_error = _safe_error_detail(exc)
+
+    if crawl_data is not None:
+        crawl_low_confidence = crawl_data.get("_direct_low_confidence") is True
         crawl_content = extract_content(crawl_data)
-        if crawl_content:
+        if crawl_content and not crawl_low_confidence:
             text_parts.append(crawl_content)
         title = extract_title(crawl_data)
         crawl_final_url = crawl_data.get("final_url") or crawl_data.get("url")
@@ -532,17 +561,20 @@ async def explore_url_pipeline(
                 "success": bool(crawl_content),
                 "content_chars": len(crawl_content),
                 "method": crawl_data.get("extraction_method"),
+                "low_confidence": crawl_low_confidence,
             }
         )
-    except Exception as exc:
-        detail = _safe_error_detail(exc)
+    elif initial_crawl_error is not None:
+        detail = _safe_error_detail(initial_crawl_error)
         errors.append(f"crawl/direct extraction failed: {detail}")
-        attempts.append({"strategy": "crawl4ai_direct", "success": False, "error": detail})
+        attempts.append(
+            {"strategy": "crawl4ai_direct", "success": False, "error": detail}
+        )
 
     initial_content = "\n\n".join(text_parts)
-    if mode == "targeted":
+    if mode == "targeted" and not crawl_low_confidence:
         initial_result = await build_result_async("crawl4ai_direct", initial_content)
-        if extraction_sufficient(task, initial_result):
+        if initial_result["extraction_sufficient"]:
             return initial_result
 
     if mode == "auto":
@@ -559,7 +591,10 @@ async def explore_url_pipeline(
             if dynamic_content:
                 text_parts.append(dynamic_content)
 
-            title = title or dynamic.get("title")
+            if crawl_low_confidence:
+                title = dynamic.get("title") or title
+            else:
+                title = title or dynamic.get("title")
             final_url = dynamic.get("final_url") or final_url
             clicked = unique_preserve_order(clicked + dynamic.get("clicked", []))
             network_responses = dynamic.get("network_responses", [])
@@ -567,13 +602,16 @@ async def explore_url_pipeline(
             table_like_rows = dynamic.get("table_like_rows", [])
             errors.extend(_safe_error_detail(item) for item in dynamic.get("errors", []))
 
-            combined = "\n\n".join(part for part in text_parts if part)
+            combined_parts = [part for part in text_parts if part]
+            combined = "\n\n".join(combined_parts)
             combined = re.sub(r"\n{4,}", "\n\n\n", combined)
             combined = combined.strip()
 
             candidate = await build_result_async(profile, combined, dynamic)
-            best_result = candidate
+            if not crawl_low_confidence or combined_parts:
+                best_result = candidate
             strategy_used = profile
+            sufficient = candidate["extraction_sufficient"]
 
             attempts.append(
                 {
@@ -583,11 +621,11 @@ async def explore_url_pipeline(
                     "network_response_count": dynamic.get("network_response_count", 0),
                     "scrollable_element_count": dynamic.get("scrollable_element_count", 0),
                     "clicked": dynamic.get("clicked", []),
-                    "sufficient": extraction_sufficient(task, candidate),
+                    "sufficient": sufficient,
                 }
             )
 
-            if extraction_sufficient(task, candidate):
+            if sufficient:
                 return candidate
 
         except Exception as exc:
@@ -595,7 +633,8 @@ async def explore_url_pipeline(
             errors.append(f"playwright {profile} extraction failed: {detail}")
             attempts.append({"strategy": f"playwright_{profile}", "success": False, "error": detail})
 
-    combined = "\n\n".join(part for part in text_parts if part)
+    combined_parts = [part for part in text_parts if part]
+    combined = "\n\n".join(combined_parts)
     combined = re.sub(r"\n{4,}", "\n\n\n", combined)
     combined = combined.strip()
 
@@ -628,6 +667,8 @@ async def crawl_and_ingest(
     method = None
     errors = []
     browser_fallback_used = False
+    crawl_data = None
+    crawl_error = None
 
     try:
         crawl_data = await crawl_url_impl(requested_url)
@@ -638,18 +679,56 @@ async def crawl_and_ingest(
         if crawl_final_url:
             final_url = urljoin(requested_url, str(crawl_final_url))
     except Exception as exc:
-        errors.append(_safe_error_detail(exc))
+        crawl_error = _safe_error_detail(exc)
+        errors.append(crawl_error)
 
-    if use_browser_fallback and (not content or len(content) < 500):
+    crawl_low_confidence = bool(
+        crawl_data and crawl_data.get("_direct_low_confidence") is True
+    )
+    if crawl_low_confidence and not use_browser_fallback:
+        content = ""
+        errors.append(
+            "Direct extraction did not meet the quality threshold and browser "
+            "fallback was disabled"
+        )
+    if use_browser_fallback and (
+        not content or len(content) < 500 or crawl_low_confidence
+    ):
         try:
             explored = await explore_url_pipeline(
                 url=requested_url,
                 task=query,
                 mode="targeted",
                 max_chars=120000,
+                initial_crawl_data=crawl_data,
+                initial_crawl_error=crawl_error,
             )
-            content = explored.get("full_text_preview", "") or content
-            title = title or explored.get("title")
+            explored_content = explored.get("full_text_preview", "")
+            if crawl_low_confidence:
+                content = (
+                    explored_content
+                    if explored.get("extraction_sufficient") is True
+                    else ""
+                )
+                if not content:
+                    errors.append(
+                        "Rendered extraction did not meet the quality threshold"
+                    )
+            else:
+                content = explored_content or content
+            for item in explored.get("errors", []):
+                detail = _safe_error_detail(item)
+                if detail in errors:
+                    continue
+                if crawl_error and crawl_error in errors and detail.endswith(
+                    f": {crawl_error}"
+                ):
+                    continue
+                errors.append(detail)
+            if crawl_low_confidence:
+                title = explored.get("title") or title
+            else:
+                title = title or explored.get("title")
             method = explored.get("extraction_method")
             explored_final_url = explored.get("final_url") or explored.get("url")
             if explored_final_url:
@@ -657,6 +736,8 @@ async def crawl_and_ingest(
             browser_fallback_used = True
         except Exception as exc:
             errors.append(_safe_error_detail(exc))
+            if crawl_low_confidence:
+                content = ""
 
     if not content:
         return {
@@ -940,7 +1021,7 @@ async def research_pipeline(
 
     if selected:
         use_browser_fallback = mode in {"deep", "technical", "academic"} or verify
-        semaphore = asyncio.Semaphore(MAX_CONCURRENT_CRAWL_INGEST)
+        semaphore = asyncio.Semaphore(RESEARCH_SOURCE_CONCURRENCY)
         tasks = [
             crawl_and_ingest_limited(
                 semaphore,

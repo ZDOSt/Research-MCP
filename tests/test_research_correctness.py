@@ -537,6 +537,336 @@ async def test_source_artifact_persistence_can_be_disabled(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_browser_fallback_reuses_initial_crawl(monkeypatch):
+    crawl = AsyncMock(
+        return_value={
+            "url": "https://example.org/article",
+            "content": "Thin initial content",
+            "title": "Initial title",
+            "extraction_method": "direct",
+        }
+    )
+    browser = AsyncMock(
+        return_value={
+            "url": "https://example.org/article",
+            "final_url": "https://example.org/article",
+            "title": "Rendered title",
+            "content": "Rendered content " * 100,
+            "content_chars": 1700,
+            "profile": "targeted",
+            "errors": [],
+        }
+    )
+    captured_request = None
+
+    async def fake_ingest(request):
+        nonlocal captured_request
+        captured_request = request
+        return {"stored": 1, "source_version": "v1", "snapshot_id": "s1"}
+
+    monkeypatch.setattr(pipelines, "crawl_url_impl", crawl)
+    monkeypatch.setattr(pipelines, "playwright_explore_page", browser)
+    monkeypatch.setattr(pipelines, "rag_ingest_impl", fake_ingest)
+
+    result = await pipelines.crawl_and_ingest(
+        {"url": "https://example.org/article", "domain": "example.org"},
+        query="find article details",
+        use_browser_fallback=True,
+    )
+
+    crawl.assert_awaited_once_with("https://example.org/article")
+    browser.assert_awaited_once()
+    assert "Thin initial content" in captured_request.text
+    assert "Rendered content" in captured_request.text
+    assert result["browser_fallback_used"] is True
+
+
+@pytest.mark.asyncio
+async def test_low_confidence_long_direct_result_forces_browser_fallback(monkeypatch):
+    captured_request = None
+    rendered_content = "\n".join(
+        f"Dynamic application content detail {index}"
+        for index in range(12)
+    )
+    crawl = AsyncMock(
+        return_value={
+            "url": "https://example.org/app",
+            "content": "SHELL-CONTENT " * 12_000,
+            "title": "Application shell",
+            "extraction_method": "direct_http_fallback",
+            "_direct_low_confidence": True,
+        }
+    )
+    browser = AsyncMock(
+        return_value={
+            "url": "https://example.org/app",
+            "final_url": "https://example.org/app",
+            "title": "Rendered application",
+            "content": rendered_content,
+            "content_chars": len(rendered_content),
+            "profile": "targeted",
+            "errors": [],
+        }
+    )
+
+    async def fake_ingest(request):
+        nonlocal captured_request
+        captured_request = request
+        return {"stored": 1, "source_version": "v1", "snapshot_id": "s1"}
+
+    monkeypatch.setattr(pipelines, "crawl_url_impl", crawl)
+    monkeypatch.setattr(pipelines, "playwright_explore_page", browser)
+    monkeypatch.setattr(pipelines, "rag_ingest_impl", fake_ingest)
+
+    result = await pipelines.crawl_and_ingest(
+        {"url": "https://example.org/app", "domain": "example.org"},
+        query="find dynamic application content",
+        use_browser_fallback=True,
+    )
+
+    crawl.assert_awaited_once_with("https://example.org/app")
+    browser.assert_awaited_once()
+    assert result["browser_fallback_used"] is True
+    assert captured_request.text == rendered_content
+    assert "SHELL-CONTENT" not in captured_request.text
+    assert result["title"] == "Rendered application"
+
+
+@pytest.mark.asyncio
+async def test_rejected_shell_does_not_inflate_rendered_sufficiency(monkeypatch):
+    shell = "\n".join(
+        f"container error fix irrelevant navigation item {index}"
+        for index in range(20)
+    )
+    browser = AsyncMock(
+        return_value={
+            "url": "https://example.org/app",
+            "final_url": "https://example.org/app",
+            "title": "Rendered application",
+            "content": "Rendered",
+            "content_chars": 8,
+            "profile": "targeted",
+            "errors": [],
+        }
+    )
+
+    monkeypatch.setattr(pipelines, "playwright_explore_page", browser)
+
+    result = await pipelines.explore_url_pipeline(
+        "https://example.org/app",
+        "fix container error",
+        mode="targeted",
+        initial_crawl_data={
+            "url": "https://example.org/app",
+            "content": shell,
+            "title": "Application shell",
+            "extraction_method": "direct_http_fallback",
+            "_direct_low_confidence": True,
+        },
+    )
+
+    browser.assert_awaited_once()
+    assert result["full_text_preview"] == "Rendered"
+    assert result["extraction_sufficient"] is False
+    assert result["strategy_attempts"][-1]["sufficient"] is False
+    assert "irrelevant navigation" not in result["full_text_preview"]
+    assert result["title"] == "Rendered application"
+
+
+@pytest.mark.asyncio
+async def test_insufficient_rendered_content_does_not_replace_rejected_shell(monkeypatch):
+    crawl = AsyncMock(
+        return_value={
+            "url": "https://example.org/app",
+            "content": "Checking your browser. " + ("placeholder " * 400),
+            "title": "Just a moment",
+            "extraction_method": "direct_http_fallback",
+            "_direct_low_confidence": True,
+        }
+    )
+    browser = AsyncMock(
+        return_value={
+            "url": "https://example.org/app",
+            "final_url": "https://example.org/app",
+            "title": "Rendered application",
+            "content": "Rendered",
+            "content_chars": 8,
+            "profile": "targeted",
+            "errors": [],
+        }
+    )
+    ingest = AsyncMock()
+
+    monkeypatch.setattr(pipelines, "crawl_url_impl", crawl)
+    monkeypatch.setattr(pipelines, "playwright_explore_page", browser)
+    monkeypatch.setattr(pipelines, "rag_ingest_impl", ingest)
+
+    result = await pipelines.crawl_and_ingest(
+        {"url": "https://example.org/app", "domain": "example.org"},
+        query="fix container error",
+        use_browser_fallback=True,
+    )
+
+    browser.assert_awaited_once()
+    ingest.assert_not_awaited()
+    assert result["ok"] is False
+    assert "Rendered extraction did not meet the quality threshold" in result["reason"]
+
+
+@pytest.mark.parametrize("mode", ["quick", "balanced", "web_only"])
+@pytest.mark.asyncio
+async def test_default_modes_do_not_ingest_low_confidence_direct_content(
+    monkeypatch,
+    mode,
+):
+    async def fake_plan(query, selected_mode):
+        return {"query": query, "mode": selected_mode, "queries": [query]}
+
+    async def fake_search(query, max_results, mode):
+        return [
+            {
+                "title": "Challenge page",
+                "url": "https://example.org/app",
+                "domain": "example.org",
+                "snippet": query,
+                "score": 1,
+                "score_reasons": [],
+            }
+        ]
+
+    crawl = AsyncMock(
+        return_value={
+            "url": "https://example.org/app",
+            "content": "Checking your browser. " + ("placeholder " * 400),
+            "title": "Just a moment",
+            "extraction_method": "direct_http_fallback",
+            "_direct_low_confidence": True,
+        }
+    )
+    browser = AsyncMock()
+    ingest = AsyncMock()
+
+    monkeypatch.setattr(pipelines, "build_research_plan", fake_plan)
+    monkeypatch.setattr(pipelines, "searxng_search", fake_search)
+    monkeypatch.setattr(pipelines, "crawl_url_impl", crawl)
+    monkeypatch.setattr(pipelines, "playwright_explore_page", browser)
+    monkeypatch.setattr(pipelines, "rag_ingest_impl", ingest)
+    monkeypatch.setattr(
+        pipelines,
+        "rag_query_impl",
+        AsyncMock(return_value={"results": []}),
+    )
+
+    result = await pipelines.research_pipeline(
+        "current container error",
+        mode=mode,
+        max_sources=1,
+        verify=False,
+        persist_source_artifacts=False,
+    )
+
+    browser.assert_not_awaited()
+    ingest.assert_not_awaited()
+    assert result["crawled_sources"] == []
+    assert len(result["failed_sources"]) == 1
+    assert "browser fallback was disabled" in result["failed_sources"][0]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_low_confidence_shell_is_not_ingested_when_browser_fails(monkeypatch):
+    crawl = AsyncMock(
+        return_value={
+            "url": "https://example.org/app",
+            "content": "Navigation and legal links " * 150,
+            "title": "Application shell",
+            "extraction_method": "direct_http_fallback",
+            "_direct_low_confidence": True,
+        }
+    )
+    browser = AsyncMock(side_effect=RuntimeError("rendered browser unavailable"))
+    ingest = AsyncMock()
+
+    monkeypatch.setattr(pipelines, "crawl_url_impl", crawl)
+    monkeypatch.setattr(pipelines, "playwright_explore_page", browser)
+    monkeypatch.setattr(pipelines, "rag_ingest_impl", ingest)
+
+    result = await pipelines.crawl_and_ingest(
+        {"url": "https://example.org/app", "domain": "example.org"},
+        query="find dynamic application content",
+        use_browser_fallback=True,
+    )
+
+    browser.assert_awaited_once()
+    ingest.assert_not_awaited()
+    assert result["ok"] is False
+    assert "rendered browser unavailable" in result["reason"]
+
+
+@pytest.mark.asyncio
+async def test_low_confidence_shell_is_cleared_if_exploration_crashes(monkeypatch):
+    crawl = AsyncMock(
+        return_value={
+            "url": "https://example.org/app",
+            "content": "Navigation and legal links " * 150,
+            "title": "Application shell",
+            "extraction_method": "direct_http_fallback",
+            "_direct_low_confidence": True,
+        }
+    )
+    explore = AsyncMock(side_effect=RuntimeError("exploration pipeline crashed"))
+    ingest = AsyncMock()
+
+    monkeypatch.setattr(pipelines, "crawl_url_impl", crawl)
+    monkeypatch.setattr(pipelines, "explore_url_pipeline", explore)
+    monkeypatch.setattr(pipelines, "rag_ingest_impl", ingest)
+
+    result = await pipelines.crawl_and_ingest(
+        {"url": "https://example.org/app", "domain": "example.org"},
+        query="find dynamic application content",
+        use_browser_fallback=True,
+    )
+
+    explore.assert_awaited_once()
+    ingest.assert_not_awaited()
+    assert result["ok"] is False
+    assert "exploration pipeline crashed" in result["reason"]
+
+
+@pytest.mark.asyncio
+async def test_browser_fallback_does_not_retry_failed_crawl(monkeypatch):
+    crawl = AsyncMock(side_effect=RuntimeError("initial crawl failed"))
+    browser = AsyncMock(
+        return_value={
+            "url": "https://example.org/article",
+            "final_url": "https://example.org/article",
+            "title": "Rendered title",
+            "content": "Rendered content " * 100,
+            "content_chars": 1700,
+            "profile": "targeted",
+            "errors": [],
+        }
+    )
+
+    async def fake_ingest(_request):
+        return {"stored": 1, "source_version": "v1", "snapshot_id": "s1"}
+
+    monkeypatch.setattr(pipelines, "crawl_url_impl", crawl)
+    monkeypatch.setattr(pipelines, "playwright_explore_page", browser)
+    monkeypatch.setattr(pipelines, "rag_ingest_impl", fake_ingest)
+
+    result = await pipelines.crawl_and_ingest(
+        {"url": "https://example.org/article", "domain": "example.org"},
+        query="find article details",
+        use_browser_fallback=True,
+    )
+
+    crawl.assert_awaited_once_with("https://example.org/article")
+    browser.assert_awaited_once()
+    assert result["browser_fallback_used"] is True
+    assert result["errors"] == ["initial crawl failed"]
+
+
+@pytest.mark.asyncio
 async def test_source_artifact_name_is_isolated_by_job_attempt(monkeypatch):
     async def fake_crawl(_url):
         return {

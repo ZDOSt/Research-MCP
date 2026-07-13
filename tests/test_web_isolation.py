@@ -585,6 +585,31 @@ class ComposeIsolationTests(unittest.TestCase):
             "/run/research-web/runner.sock",
         )
 
+    def test_performance_settings_reach_the_services_that_use_them(self):
+        worker_environment = self.services["research-worker"]["environment"]
+        gateway_environment = self.services["mcp-gateway"]["environment"]
+
+        self.assertEqual(
+            worker_environment["DIRECT_FIRST_HEDGE_SECONDS"],
+            "${DIRECT_FIRST_HEDGE_SECONDS:-1.5}",
+        )
+        self.assertEqual(
+            worker_environment["DIRECT_FIRST_MIN_CONTENT_CHARS"],
+            "${DIRECT_FIRST_MIN_CONTENT_CHARS:-2000}",
+        )
+        self.assertEqual(
+            worker_environment["RESEARCH_SOURCE_CONCURRENCY"],
+            "${RESEARCH_SOURCE_CONCURRENCY:-2}",
+        )
+        self.assertEqual(
+            gateway_environment["MCP_JOB_LONG_POLL_SECONDS"],
+            "${MCP_JOB_LONG_POLL_SECONDS:-15}",
+        )
+        self.assertEqual(
+            gateway_environment["MCP_SYNC_JOB_WAIT_SECONDS"],
+            "${MCP_SYNC_JOB_WAIT_SECONDS:-60}",
+        )
+
     def test_runner_has_no_backend_or_application_credentials(self):
         runner_environment = self.services["web-runner"]["environment"]
         forbidden_fragments = (

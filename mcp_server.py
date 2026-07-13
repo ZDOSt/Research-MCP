@@ -85,6 +85,9 @@ mcp = FastMCP(
         "Use ingest_text when the user provides text that should be stored. "
         "Use manage_sources for listing, stats, or deleting ingested sources within a namespace. "
         "Use github_research for repository trees, source files, issues, and code search. "
+        "Never start the same research request again while its durable job is queued or running. "
+        "If a tool returns a running job ID, do not poll it repeatedly in the same assistant turn; "
+        "report the job ID and check it in a later turn. "
         "The server internally handles search, Crawl4AI, Playwright, scrolling, clicking, network capture, Qdrant, and reranking. "
         "Tool outputs include retrieval_context with the server runtime date. "
         "Treat runtime-retrieved evidence as current even when it is newer than the answering model's training cutoff. "
@@ -95,8 +98,12 @@ mcp = FastMCP(
 )
 
 JOB_BACKEND = os.getenv("JOB_BACKEND", "inline").strip().lower()
-MCP_SYNC_JOB_WAIT_SECONDS = float(os.getenv("MCP_SYNC_JOB_WAIT_SECONDS", "240"))
+MCP_SYNC_JOB_WAIT_SECONDS = float(os.getenv("MCP_SYNC_JOB_WAIT_SECONDS", "60"))
 MCP_JOB_POLL_SECONDS = max(0.1, float(os.getenv("MCP_JOB_POLL_SECONDS", "0.5")))
+MCP_JOB_LONG_POLL_SECONDS = max(
+    0.0,
+    min(60.0, float(os.getenv("MCP_JOB_LONG_POLL_SECONDS", "15"))),
+)
 MCP_MAX_QUERY_CHARS = max(100, int(os.getenv("MCP_MAX_QUERY_CHARS", "8000")))
 MCP_MAX_INGEST_CHARS = max(1000, int(os.getenv("MCP_MAX_INGEST_CHARS", "500000")))
 MCP_ALLOW_LEGACY_UNOWNED_JOBS = os.getenv(
@@ -128,6 +135,7 @@ SourceListLimit = Annotated[int, Field(ge=1, le=500)]
 InvestigationCharacterLimit = Annotated[int, Field(ge=10_000, le=750_000)]
 ArtifactCharacterLimit = Annotated[int, Field(ge=1_000, le=250_000)]
 GitHubResultLimit = Annotated[int, Field(ge=1, le=1_000)]
+JobWaitSeconds = Annotated[float, Field(ge=0, le=60)]
 
 
 def _comma_separated_setting(name: str, default: str = "") -> list[str]:
@@ -409,6 +417,51 @@ async def _load_completed_job(job_id: str) -> dict:
     return {"job": job_result, "result": full_result}
 
 
+def _running_job_response(
+    job_id: str,
+    *,
+    tool_name: str,
+    status: str = "running",
+    warning: Optional[str] = None,
+    detail: Optional[str] = None,
+    coalesced: bool = False,
+) -> dict:
+    response = {
+        "status": status if status in {"queued", "running"} else "running",
+        "terminal": False,
+        "job_id": job_id,
+        "tool": tool_name,
+        "coalesced": coalesced,
+        "retry_after_seconds": max(5, round(MCP_JOB_LONG_POLL_SECONDS)),
+        "retrieval_context": runtime_retrieval_context(),
+        "answering_instructions": [
+            "Do not start this research request again; the durable job is queued or running.",
+            "Do not poll repeatedly in the same assistant turn. Report the job ID and check it in a later turn.",
+        ],
+    }
+    if warning:
+        response["warning"] = warning
+    if detail:
+        response["detail"] = detail
+    return response
+
+
+async def _wait_for_terminal_job(job_id: str, wait_seconds: float) -> Optional[dict]:
+    deadline = time.monotonic() + max(0.0, min(60.0, wait_seconds))
+    status = await get_job_status(job_id)
+    while (
+        status
+        and status.get("status") not in {"succeeded", "failed", "cancelled"}
+        and time.monotonic() < deadline
+    ):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        await asyncio.sleep(min(MCP_JOB_POLL_SECONDS, remaining))
+        status = await get_job_status(job_id)
+    return status
+
+
 async def _enqueue_and_wait(kind: str, payload: dict, tool_name: str) -> dict:
     try:
         owner_id = _current_principal_id()
@@ -432,10 +485,33 @@ async def _enqueue_and_wait(kind: str, payload: dict, tool_name: str) -> dict:
             "retryable": True,
         }
 
+    if job.get("coalesced"):
+        try:
+            status = await get_job_status(job["job_id"])
+            if status and status.get("status") in {"succeeded", "failed", "cancelled"}:
+                return await _load_completed_job(job["job_id"])
+        except Exception as exc:
+            return _running_job_response(
+                job["job_id"],
+                tool_name=tool_name,
+                warning="job_status_temporarily_unavailable",
+                detail=_safe_error_detail(exc),
+                coalesced=True,
+            )
+        return _running_job_response(
+            job["job_id"],
+            tool_name=tool_name,
+            status=str((status or {}).get("status") or "running"),
+            coalesced=True,
+        )
+
     deadline = time.monotonic() + max(0.0, MCP_SYNC_JOB_WAIT_SECONDS)
+    last_status = str(job.get("status") or "queued")
     try:
         while time.monotonic() < deadline:
             status = await get_job_status(job["job_id"])
+            if status and status.get("status"):
+                last_status = str(status["status"])
             if status and status.get("status") in {"succeeded", "failed", "cancelled"}:
                 return await _load_completed_job(job["job_id"])
             await asyncio.sleep(MCP_JOB_POLL_SECONDS)
@@ -446,22 +522,20 @@ async def _enqueue_and_wait(kind: str, payload: dict, tool_name: str) -> dict:
             "retryable": True,
         }
     except Exception as exc:
-        return {
-            "status": "running",
-            "job_id": job["job_id"],
-            "tool": tool_name,
-            "warning": "job_status_temporarily_unavailable",
-            "detail": _safe_error_detail(exc),
-            "retrieval_context": runtime_retrieval_context(),
-        }
+        return _running_job_response(
+            job["job_id"],
+            tool_name=tool_name,
+            warning="job_status_temporarily_unavailable",
+            detail=_safe_error_detail(exc),
+            coalesced=bool(job.get("coalesced")),
+        )
 
-    return {
-        "status": "running",
-        "job_id": job["job_id"],
-        "tool": tool_name,
-        "message": "Research is still running. Call research_job(action='result', job_id=...) to retrieve it.",
-        "retrieval_context": runtime_retrieval_context(),
-    }
+    return _running_job_response(
+        job["job_id"],
+        tool_name=tool_name,
+        status=last_status,
+        coalesced=bool(job.get("coalesced")),
+    )
 
 async def run_resilient(coro: Awaitable[dict], tool_name: str) -> dict:
     try:
@@ -497,6 +571,9 @@ async def research_web(
     Qdrant retrieval, and reranking.
 
     Modes: quick, balanced, deep, technical, academic, local_only, web_only.
+    Use balanced for ordinary current-information, documentation, and troubleshooting
+    requests. Reserve deep for explicitly exhaustive or high-stakes investigations.
+    Leave synthesize=False when the calling model will synthesize the returned evidence.
     """
     query = _bounded_text(query, "query", MCP_MAX_QUERY_CHARS)
     namespace = normalize_namespace(namespace)
@@ -804,8 +881,9 @@ async def start_research(
     """Start durable web research and immediately return a job ID.
 
     Prefer this over research_web when the client has a short tool timeout. Use
-    research_job with the returned ID to inspect progress or retrieve the result.
-    Requires JOB_BACKEND=redis.
+    research_job in a later assistant turn to inspect progress or retrieve the
+    result. Do not poll repeatedly or submit the same request again. Requires
+    JOB_BACKEND=redis.
     """
     query = _bounded_text(query, "query", MCP_MAX_QUERY_CHARS)
     namespace = normalize_namespace(namespace)
@@ -845,8 +923,13 @@ async def start_research(
             "detail": _safe_error_detail(exc),
             "retryable": True,
         }
+    job["terminal"] = False
+    job["retry_after_seconds"] = max(5, round(MCP_JOB_LONG_POLL_SECONDS))
     job["retrieval_context"] = runtime_retrieval_context()
-    job["next_action"] = {"tool": "research_job", "action": "result", "job_id": job["job_id"]}
+    job["answering_instructions"] = [
+        "The durable research job has started. Do not start the same request again.",
+        "Do not poll repeatedly in this assistant turn. Report the job ID and check it in a later turn.",
+    ]
     return job
 
 
@@ -855,11 +938,14 @@ async def research_job(
     action: JobAction,
     job_id: str,
     include_full_result: bool = True,
+    wait_seconds: JobWaitSeconds = MCP_JOB_LONG_POLL_SECONDS,
 ) -> dict:
     """Inspect, retrieve, or cancel a durable research job.
 
-    Actions: status, result, cancel. Full results are loaded from the durable
-    artifact store; set include_full_result=False to return only compact metadata.
+    Actions: status, result, cancel. Status and result calls wait briefly for a
+    terminal state to reduce model-driven polling loops. Full results are loaded
+    from the durable artifact store; set include_full_result=False to return only
+    compact metadata.
     """
     if JOB_BACKEND != "redis":
         return {"error": "durable_jobs_disabled"}
@@ -869,19 +955,55 @@ async def research_job(
     action = action.strip().lower()
     try:
         authorization_enabled = _token_authorization_enabled()
-        status_result = await get_job_status(job_id) if action == "status" or authorization_enabled else None
+        status_result = (
+            await get_job_status(job_id)
+            if action in {"status", "result"} or authorization_enabled
+            else None
+        )
         if authorization_enabled:
             owner_failure = _job_owner_failure(status_result)
             if owner_failure:
                 return {**owner_failure, "job_id": job_id}
+        if (
+            action in {"status", "result"}
+            and status_result
+            and status_result.get("status") not in {"succeeded", "failed", "cancelled"}
+            and wait_seconds > 0
+        ):
+            status_result = await _wait_for_terminal_job(job_id, wait_seconds)
         if action == "status":
-            result = status_result
+            if status_result and status_result.get("status") not in {
+                "succeeded",
+                "failed",
+                "cancelled",
+            }:
+                result = {
+                    **status_result,
+                    **_running_job_response(
+                        job_id,
+                        tool_name="research_job",
+                        status=str(status_result.get("status") or "running"),
+                    ),
+                }
+            else:
+                result = status_result
         elif action == "result":
-            result = (
-                await _load_completed_job(job_id)
-                if include_full_result
-                else await get_job_result(job_id)
-            )
+            if status_result and status_result.get("status") not in {
+                "succeeded",
+                "failed",
+                "cancelled",
+            }:
+                result = _running_job_response(
+                    job_id,
+                    tool_name="research_job",
+                    status=str(status_result.get("status") or "running"),
+                )
+            else:
+                result = (
+                    await _load_completed_job(job_id)
+                    if include_full_result
+                    else await get_job_result(job_id)
+                )
         elif action == "cancel":
             result = await request_cancellation(job_id)
         else:

@@ -37,9 +37,11 @@ TERMINAL_STATUSES = {SUCCEEDED, FAILED, CANCELLED}
 _JOB_ID_RE = re.compile(r"^[a-f0-9]{32}$")
 _LEASE_TOKEN_RE = re.compile(r"^[a-f0-9]{32}$")
 _INGESTION_ATTEMPT_ID_RE = re.compile(r"^[a-f0-9]{64}$")
+_COALESCE_FINGERPRINT_RE = re.compile(r"^[a-f0-9]{64}$")
 _KIND_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _MAX_WATCH_RETRIES = 64
 _MAX_ACTIVE_JOB_SCAN = 10_000
+_MIN_ACTIVE_JOB_INDEX_TTL_SECONDS = 2_592_000
 _REGISTER_INGESTION_LUA = """
 if redis.call('HGET', KEYS[1], 'status') ~= ARGV[1]
    or redis.call('HGET', KEYS[1], 'lease_token') ~= ARGV[2] then
@@ -125,6 +127,31 @@ def _validate_owner_id(owner_id: Optional[str]) -> Optional[str]:
     return value
 
 
+def _coalescing_fingerprint(
+    kind: str,
+    payload_json: str,
+    owner_id: Optional[str],
+) -> str:
+    """Hash an unambiguous, versioned job identity without exposing its payload."""
+    digest = hashlib.sha256()
+    components = (
+        b"research-mcp-active-job-v1",
+        b"owned" if owner_id is not None else b"anonymous",
+        (owner_id or "").encode("utf-8"),
+        kind.encode("utf-8"),
+        payload_json.encode("utf-8"),
+    )
+    for component in components:
+        digest.update(len(component).to_bytes(8, "big"))
+        digest.update(component)
+    return digest.hexdigest()
+
+
+def _record_coalescing_fingerprint(record: Mapping[str, Any]) -> Optional[str]:
+    value = str(record.get("coalesce_fingerprint") or "").strip().lower()
+    return value if _COALESCE_FINGERPRINT_RE.fullmatch(value) else None
+
+
 def _parse_timestamp(value: Optional[str]) -> Optional[datetime]:
     try:
         parsed = datetime.fromisoformat(value) if value else None
@@ -186,6 +213,7 @@ class RedisJobStore:
 
         self.processing_key = f"{self.queue_key}:processing"
         self.job_key_prefix = f"{self.queue_key}:job:"
+        self.active_job_key_prefix = f"{self.queue_key}:active:"
         self.worker_heartbeat_key = f"{self.queue_key}:worker:heartbeat"
         self.worker_heartbeat_prefix = f"{self.worker_heartbeat_key}:id:"
         self.worker_host_heartbeat_prefix = f"{self.worker_heartbeat_key}:host:"
@@ -199,6 +227,12 @@ class RedisJobStore:
             _env_int("JOB_RESULT_TTL_SECONDS", 2_592_000)
             if result_ttl_seconds is None
             else max(0, int(result_ttl_seconds))
+        )
+        # Active indexes are disposable coordination metadata. Keep them long
+        # enough for queued work, but never let an orphan survive indefinitely.
+        self.active_job_index_ttl_seconds = max(
+            _MIN_ACTIVE_JOB_INDEX_TTL_SECONDS,
+            self.result_ttl_seconds,
         )
         self.max_payload_bytes = _env_int("JOB_MAX_PAYLOAD_BYTES", 1_048_576, minimum=1024)
         self.max_queued_jobs = _env_int("JOB_MAX_QUEUED", 1000, minimum=0)
@@ -222,6 +256,37 @@ class RedisJobStore:
     def _job_key(self, job_id: str) -> str:
         return f"{self.job_key_prefix}{validate_job_id(job_id)}"
 
+    def _active_job_key(self, fingerprint: str) -> str:
+        value = str(fingerprint or "").strip().lower()
+        if not _COALESCE_FINGERPRINT_RE.fullmatch(value):
+            raise InvalidJobError("coalescing fingerprint is invalid")
+        return f"{self.active_job_key_prefix}{value}"
+
+    async def _matching_active_job_key(
+        self,
+        pipe: Any,
+        record: Mapping[str, Any],
+        job_id: str,
+    ) -> Optional[str]:
+        """Watch and return this job's index key only when it still owns it."""
+        fingerprint = _record_coalescing_fingerprint(record)
+        if fingerprint is None:
+            return None
+        active_key = self._active_job_key(fingerprint)
+        await pipe.watch(active_key)
+        raw_indexed_job_id = await pipe.get(active_key)
+        if raw_indexed_job_id is None:
+            return None
+        try:
+            indexed_job_id = validate_job_id(_decode(raw_indexed_job_id))
+        except InvalidJobError:
+            return None
+        return (
+            active_key
+            if hmac.compare_digest(indexed_job_id, validate_job_id(job_id))
+            else None
+        )
+
     def _worker_key(self, prefix: str, identity: str) -> str:
         digest = hashlib.sha256(str(identity).encode("utf-8")).hexdigest()
         return f"{prefix}{digest}"
@@ -243,6 +308,7 @@ class RedisJobStore:
         *,
         job_id: Optional[str] = None,
         owner_id: Optional[str] = None,
+        coalesce_active: bool = False,
     ) -> dict[str, Any]:
         kind_value = str(kind or "").strip().lower()
         if not _KIND_RE.fullmatch(kind_value):
@@ -258,6 +324,18 @@ class RedisJobStore:
 
         job_id_value = validate_job_id(job_id) if job_id is not None else uuid.uuid4().hex
         owner_id_value = _validate_owner_id(owner_id)
+        if not isinstance(coalesce_active, bool):
+            raise InvalidJobError("coalesce_active must be a boolean")
+        coalesce_fingerprint = (
+            _coalescing_fingerprint(kind_value, payload_json, owner_id_value)
+            if coalesce_active
+            else None
+        )
+        active_key = (
+            self._active_job_key(coalesce_fingerprint)
+            if coalesce_fingerprint is not None
+            else None
+        )
         now = utc_now_iso()
         record = {
             "job_id": job_id_value,
@@ -271,15 +349,62 @@ class RedisJobStore:
         }
         if owner_id_value is not None:
             record["owner_id"] = owner_id_value
+        if coalesce_fingerprint is not None:
+            record["coalesce_fingerprint"] = coalesce_fingerprint
 
         key = self._job_key(job_id_value)
         for _ in range(_MAX_WATCH_RETRIES):
             async with self.redis.pipeline(transaction=True) as pipe:
                 try:
-                    await pipe.watch(key, self.queue_key)
+                    watched_keys = [key, self.queue_key]
+                    if active_key is not None:
+                        watched_keys.append(active_key)
+                    await pipe.watch(*watched_keys)
                     if await pipe.exists(key):
                         await pipe.unwatch()
                         raise InvalidJobError(f"job_id already exists: {job_id_value}")
+
+                    if active_key is not None:
+                        raw_existing_job_id = await pipe.get(active_key)
+                        if raw_existing_job_id is not None:
+                            try:
+                                existing_job_id = validate_job_id(
+                                    _decode(raw_existing_job_id)
+                                )
+                            except InvalidJobError:
+                                existing_job_id = None
+                            if existing_job_id is not None:
+                                existing_key = self._job_key(existing_job_id)
+                                await pipe.watch(existing_key)
+                                raw_existing = await pipe.hgetall(existing_key)
+                                if raw_existing:
+                                    existing = _decode_mapping(raw_existing)
+                                    exact_match = (
+                                        existing.get("coalesce_fingerprint")
+                                        == coalesce_fingerprint
+                                        and existing.get("owner_id") == owner_id_value
+                                        and existing.get("kind") == kind_value
+                                        and existing.get("payload") == payload_json
+                                    )
+                                    reusable = (
+                                        existing.get("status") in {QUEUED, RUNNING}
+                                        and existing.get("cancel_requested") != "1"
+                                    )
+                                    if exact_match and reusable:
+                                        pipe.multi()
+                                        pipe.expire(
+                                            active_key,
+                                            self.active_job_index_ttl_seconds,
+                                        )
+                                        refreshed = await pipe.execute()
+                                        if not refreshed or not refreshed[0]:
+                                            continue
+                                        result = self._public_job(
+                                            existing,
+                                            include_payload=False,
+                                        )
+                                        result["coalesced"] = True
+                                        return result
                     queued_count = int(await pipe.llen(self.queue_key))
                     if self.max_queued_jobs > 0 and queued_count >= self.max_queued_jobs:
                         await pipe.unwatch()
@@ -289,8 +414,17 @@ class RedisJobStore:
                     pipe.multi()
                     pipe.hset(key, mapping=record)
                     pipe.lpush(self.queue_key, job_id_value)
+                    if active_key is not None:
+                        pipe.set(
+                            active_key,
+                            job_id_value,
+                            ex=self.active_job_index_ttl_seconds,
+                        )
                     await pipe.execute()
-                    return self._public_job(record, include_payload=False)
+                    result = self._public_job(record, include_payload=False)
+                    if active_key is not None:
+                        result["coalesced"] = False
+                    return result
                 except WatchError:
                     continue
         raise JobStoreError("could not create job because the queue kept changing")
@@ -376,7 +510,17 @@ class RedisJobStore:
                         return None
                     record = _decode_mapping(raw_record)
                     if record.get("status") in TERMINAL_STATUSES:
-                        await pipe.unwatch()
+                        active_key = await self._matching_active_job_key(
+                            pipe,
+                            record,
+                            job_id_value,
+                        )
+                        if active_key is not None:
+                            pipe.multi()
+                            pipe.delete(active_key)
+                            await pipe.execute()
+                        else:
+                            await pipe.unwatch()
                         return self._public_job(record, include_payload=False)
 
                     now = utc_now_iso()
@@ -385,6 +529,11 @@ class RedisJobStore:
                         "cancel_requested_at": now,
                         "updated_at": now,
                     }
+                    active_key = await self._matching_active_job_key(
+                        pipe,
+                        record,
+                        job_id_value,
+                    )
                     pipe.multi()
                     if record.get("status") == QUEUED:
                         fields.update(
@@ -402,6 +551,8 @@ class RedisJobStore:
                             pipe.expire(key, self.result_ttl_seconds)
                     else:
                         pipe.hset(key, mapping=fields)
+                    if active_key is not None:
+                        pipe.delete(active_key)
                     await pipe.execute()
                     return await self.get_status(job_id_value)
                 except WatchError:
@@ -449,9 +600,16 @@ class RedisJobStore:
                     record = _decode_mapping(raw_record)
                     status = record.get("status")
                     if status in TERMINAL_STATUSES:
+                        active_key = await self._matching_active_job_key(
+                            pipe,
+                            record,
+                            job_id_value,
+                        )
                         pipe.multi()
                         pipe.lrem(self.processing_key, 0, job_id_value)
                         pipe.lrem(self.queue_key, 0, job_id_value)
+                        if active_key is not None:
+                            pipe.delete(active_key)
                         await pipe.execute()
                         return None
                     if status == RUNNING:
@@ -469,6 +627,11 @@ class RedisJobStore:
 
                     now = utc_now_iso()
                     if record.get("cancel_requested") == "1":
+                        active_key = await self._matching_active_job_key(
+                            pipe,
+                            record,
+                            job_id_value,
+                        )
                         pipe.multi()
                         pipe.hset(
                             key,
@@ -484,6 +647,8 @@ class RedisJobStore:
                         pipe.lrem(self.queue_key, 0, job_id_value)
                         if self.result_ttl_seconds > 0:
                             pipe.expire(key, self.result_ttl_seconds)
+                        if active_key is not None:
+                            pipe.delete(active_key)
                         await pipe.execute()
                         return None
 
@@ -491,6 +656,11 @@ class RedisJobStore:
                         attempt = max(0, int(record.get("attempt", "0"))) + 1
                     except (TypeError, ValueError):
                         attempt = 1
+                    active_key = await self._matching_active_job_key(
+                        pipe,
+                        record,
+                        job_id_value,
+                    )
                     pipe.multi()
                     pipe.lrem(self.queue_key, 0, job_id_value)
                     pipe.lrem(self.processing_key, 0, job_id_value)
@@ -508,6 +678,11 @@ class RedisJobStore:
                             "updated_at": now,
                         },
                     )
+                    if active_key is not None:
+                        pipe.expire(
+                            active_key,
+                            self.active_job_index_ttl_seconds,
+                        )
                     await pipe.execute()
                     return await self.get_job(
                         job_id_value,
@@ -537,8 +712,18 @@ class RedisJobStore:
                         await pipe.unwatch()
                         return False
                     now = utc_now_iso()
+                    active_key = await self._matching_active_job_key(
+                        pipe,
+                        record,
+                        job_id_value,
+                    )
                     pipe.multi()
                     pipe.hset(key, mapping={"heartbeat_at": now, "updated_at": now})
+                    if active_key is not None:
+                        pipe.expire(
+                            active_key,
+                            self.active_job_index_ttl_seconds,
+                        )
                     await pipe.execute()
                     return True
                 except WatchError:
@@ -982,6 +1167,11 @@ class RedisJobStore:
 
                     now = utc_now_iso()
                     registered_attempt_id = _registered_ingestion_attempt(record)
+                    active_key = await self._matching_active_job_key(
+                        pipe,
+                        record,
+                        job_id_value,
+                    )
                     pipe.multi()
                     pipe.lrem(self.processing_key, 0, job_id_value)
                     pipe.lrem(self.queue_key, 0, job_id_value)
@@ -997,6 +1187,8 @@ class RedisJobStore:
                         )
                         if self.result_ttl_seconds > 0:
                             pipe.expire(key, self.result_ttl_seconds)
+                        if active_key is not None:
+                            pipe.delete(active_key)
                     else:
                         pipe.lpush(self.queue_key, job_id_value)
                         pipe.hset(
@@ -1008,6 +1200,11 @@ class RedisJobStore:
                                 "requeue_reason": str(reason)[:1000],
                             },
                         )
+                        if active_key is not None:
+                            pipe.expire(
+                                active_key,
+                                self.active_job_index_ttl_seconds,
+                            )
                     if registered_attempt_id is not None:
                         pipe.zadd(
                             self.ingestion_invalidation_due_key,
@@ -1076,9 +1273,16 @@ class RedisJobStore:
                     record = _decode_mapping(raw_record)
                     status = record.get("status")
                     if status in TERMINAL_STATUSES:
+                        active_key = await self._matching_active_job_key(
+                            pipe,
+                            record,
+                            job_id_value,
+                        )
                         pipe.multi()
                         pipe.lrem(self.processing_key, 0, job_id_value)
                         pipe.lrem(self.queue_key, 0, job_id_value)
+                        if active_key is not None:
+                            pipe.delete(active_key)
                         await pipe.execute()
                         return False
                     if status not in {QUEUED, RUNNING}:
@@ -1108,6 +1312,11 @@ class RedisJobStore:
                         attempt = self.max_attempts
                     attempts_exhausted = attempt >= self.max_attempts
                     registered_attempt_id = _registered_ingestion_attempt(record)
+                    active_key = await self._matching_active_job_key(
+                        pipe,
+                        record,
+                        job_id_value,
+                    )
                     pipe.multi()
                     pipe.lrem(self.processing_key, 0, job_id_value)
                     pipe.lrem(self.queue_key, 0, job_id_value)
@@ -1123,6 +1332,8 @@ class RedisJobStore:
                         )
                         if self.result_ttl_seconds > 0:
                             pipe.expire(key, self.result_ttl_seconds)
+                        if active_key is not None:
+                            pipe.delete(active_key)
                     elif attempts_exhausted:
                         pipe.hset(
                             key,
@@ -1143,6 +1354,8 @@ class RedisJobStore:
                         )
                         if self.result_ttl_seconds > 0:
                             pipe.expire(key, self.result_ttl_seconds)
+                        if active_key is not None:
+                            pipe.delete(active_key)
                     else:
                         pipe.lpush(self.queue_key, job_id_value)
                         pipe.hset(
@@ -1154,6 +1367,11 @@ class RedisJobStore:
                                 "requeue_reason": "stale worker lease",
                             },
                         )
+                        if active_key is not None:
+                            pipe.expire(
+                                active_key,
+                                self.active_job_index_ttl_seconds,
+                            )
                     if registered_attempt_id is not None:
                         pipe.zadd(
                             self.ingestion_invalidation_due_key,
@@ -1278,6 +1496,12 @@ class RedisJobStore:
                     if effective_cancel_reason:
                         fields["cancel_reason"] = str(effective_cancel_reason)[:1000]
 
+                    active_key = await self._matching_active_job_key(
+                        pipe,
+                        record,
+                        job_id_value,
+                    )
+
                     pipe.multi()
                     pipe.hset(key, mapping=fields)
                     pipe.hdel(
@@ -1307,6 +1531,8 @@ class RedisJobStore:
                         )
                     pipe.lrem(self.processing_key, 0, job_id_value)
                     pipe.lrem(self.queue_key, 0, job_id_value)
+                    if active_key is not None:
+                        pipe.delete(active_key)
                     if self.result_ttl_seconds > 0:
                         pipe.expire(key, self.result_ttl_seconds)
                     await pipe.execute()
@@ -1369,8 +1595,14 @@ async def create_job(
     payload: Mapping[str, Any],
     *,
     owner_id: Optional[str] = None,
+    coalesce_active: bool = False,
 ) -> dict[str, Any]:
-    return await get_job_store().create_job(kind, payload, owner_id=owner_id)
+    return await get_job_store().create_job(
+        kind,
+        payload,
+        owner_id=owner_id,
+        coalesce_active=coalesce_active,
+    )
 
 
 async def enqueue_job(
@@ -1378,8 +1610,14 @@ async def enqueue_job(
     payload: Mapping[str, Any],
     *,
     owner_id: Optional[str] = None,
+    coalesce_active: bool = True,
 ) -> dict[str, Any]:
-    return await create_job(kind, payload, owner_id=owner_id)
+    return await create_job(
+        kind,
+        payload,
+        owner_id=owner_id,
+        coalesce_active=coalesce_active,
+    )
 
 
 async def get_job_status(job_id: str) -> Optional[dict[str, Any]]:

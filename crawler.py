@@ -3,8 +3,10 @@ import io
 import ipaddress
 import json
 import os
+import re
 import sys
 from contextlib import suppress
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlsplit, urlunsplit
@@ -51,6 +53,64 @@ CRAWL4AI_MAX_RESPONSE_BYTES = max(1024, int(os.getenv("CRAWL4AI_MAX_RESPONSE_BYT
 DIRECT_TOTAL_TIMEOUT_SECONDS = max(1.0, float(os.getenv("DIRECT_TOTAL_TIMEOUT_SECONDS", "75")))
 DIRECT_EXTRACTION_TIMEOUT_SECONDS = max(1.0, float(os.getenv("DIRECT_EXTRACTION_TIMEOUT_SECONDS", "20")))
 CRAWL4AI_TOTAL_TIMEOUT_SECONDS = max(1.0, float(os.getenv("CRAWL4AI_TOTAL_TIMEOUT_SECONDS", "180")))
+DIRECT_FIRST_HEDGE_SECONDS = max(
+    0.0, float(os.getenv("DIRECT_FIRST_HEDGE_SECONDS", "1.5"))
+)
+DIRECT_FIRST_MIN_CONTENT_CHARS = max(
+    200, int(os.getenv("DIRECT_FIRST_MIN_CONTENT_CHARS", "2000"))
+)
+DIRECT_LOW_CONFIDENCE_MARKERS = (
+    "access denied",
+    "checking your browser",
+    "enable javascript",
+    "just a moment",
+    "please verify you are human",
+    "security check required",
+)
+DIRECT_PRIMARY_EXCLUDED_TAGS = {
+    "aside",
+    "footer",
+    "head",
+    "header",
+    "nav",
+    "noscript",
+    "script",
+    "style",
+    "svg",
+    "template",
+    "title",
+}
+DIRECT_PRIMARY_EXCLUDED_HINTS = {
+    "banner",
+    "breadcrumb",
+    "consent",
+    "cookie",
+    "dialog",
+    "footer",
+    "header",
+    "menu",
+    "modal",
+    "nav",
+    "navigation",
+    "sidebar",
+    "social",
+}
+DIRECT_HTML_VOID_TAGS = {
+    "area",
+    "base",
+    "br",
+    "col",
+    "embed",
+    "hr",
+    "img",
+    "input",
+    "link",
+    "meta",
+    "param",
+    "source",
+    "track",
+    "wbr",
+}
 PDF_MAX_RESPONSE_BYTES = max(1024, int(os.getenv("PDF_MAX_RESPONSE_BYTES", str(8 * 1024 * 1024))))
 PDF_MAX_PAGES = max(1, int(os.getenv("PDF_MAX_PAGES", "200")))
 PDF_MAX_EXTRACTED_CHARS = max(1000, int(os.getenv("PDF_MAX_EXTRACTED_CHARS", "1000000")))
@@ -73,6 +133,80 @@ CRAWL4AI_NETWORK_ISOLATED = os.getenv("CRAWL4AI_NETWORK_ISOLATED", "").strip().l
 
 
 UnsafeURLError = DestinationPolicyError
+
+
+class _DirectPrimaryContentParser(HTMLParser):
+    """Count visible page text after excluding common navigation chrome."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self._excluded_depth = 0
+        self._element_stack: list[tuple[str, bool]] = []
+
+    @staticmethod
+    def _is_excluded(tag: str, attrs: list[tuple[str, str | None]]) -> bool:
+        if tag in DIRECT_PRIMARY_EXCLUDED_TAGS:
+            return True
+        attrs_map = {str(key).lower(): value or "" for key, value in attrs}
+        if (
+            "hidden" in attrs_map
+            or "inert" in attrs_map
+            or attrs_map.get("aria-hidden", "").strip().lower() == "true"
+        ):
+            return True
+        style = attrs_map.get("style", "").lower()
+        if re.search(
+            r"(?:^|;)\s*(?:display\s*:\s*none|visibility\s*:\s*hidden|content-visibility\s*:\s*hidden)",
+            style,
+        ):
+            return True
+        role = attrs_map.get("role", "").strip().lower()
+        if role in {"banner", "complementary", "contentinfo", "dialog", "navigation"}:
+            return True
+        hints = re.findall(
+            r"[a-z0-9]+",
+            f"{attrs_map.get('id', '')} {attrs_map.get('class', '')}".lower(),
+        )
+        return any(hint in DIRECT_PRIMARY_EXCLUDED_HINTS for hint in hints)
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag = tag.lower()
+        excluded = self._is_excluded(tag, attrs)
+        if tag not in DIRECT_HTML_VOID_TAGS:
+            self._element_stack.append((tag, excluded))
+            if excluded:
+                self._excluded_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        for index in range(len(self._element_stack) - 1, -1, -1):
+            if self._element_stack[index][0] != tag:
+                continue
+            popped = self._element_stack[index:]
+            self._element_stack = self._element_stack[:index]
+            self._excluded_depth = max(
+                0,
+                self._excluded_depth - sum(1 for _, excluded in popped if excluded),
+            )
+            break
+
+    def handle_data(self, data: str) -> None:
+        if not self._excluded_depth:
+            self.parts.append(data)
+
+    def content_chars(self) -> int:
+        return len(re.sub(r"\s+", " ", " ".join(self.parts)).strip())
+
+
+def _direct_html_primary_content_chars(raw_html: str) -> int:
+    try:
+        parser = _DirectPrimaryContentParser()
+        parser.feed(raw_html or "")
+        parser.close()
+        return parser.content_chars()
+    except Exception:
+        return 0
 
 
 def _safe_error_detail(exc: Exception, max_chars: int = 1000) -> str:
@@ -460,6 +594,27 @@ def extract_direct_response(
     return "", None, "unsupported", f"Unsupported response content type: {media_type or 'unknown'}"
 
 
+def extract_direct_response_details(
+    raw_body: bytes,
+    content_type: str,
+    encoding: str | None = None,
+) -> tuple[str, str | None, str, str | None, dict[str, int]]:
+    text, title, body_format, extraction_error = extract_direct_response(
+        raw_body,
+        content_type,
+        encoding,
+    )
+    metrics: dict[str, int] = {"raw_html_chars": 0}
+    if body_format in {"html", "json", "text", "xml"}:
+        decoded = _decode_response_body(raw_body, encoding)
+        metrics["raw_html_chars"] = len(decoded)
+        if body_format == "html":
+            metrics["primary_content_chars"] = _direct_html_primary_content_chars(
+                decoded
+            )
+    return text, title, body_format, extraction_error, metrics
+
+
 async def crawl4ai_request(payload: dict, timeout: float = 180.0) -> dict:
     urls = payload.get("urls", []) if isinstance(payload, dict) else []
     if isinstance(urls, str):
@@ -633,6 +788,7 @@ async def direct_fetch_url(url: str) -> dict:
                 raise RuntimeError(f"Too many redirects (maximum {MAX_REDIRECTS})")
 
         content_type = response_headers.get("content-type", "")
+        direct_metrics: dict[str, int] = {"raw_html_chars": 0}
         try:
             async with asyncio.timeout(DIRECT_EXTRACTION_TIMEOUT_SECONDS):
                 media_type = content_type.split(";", 1)[0].strip().lower()
@@ -640,8 +796,14 @@ async def direct_fetch_url(url: str) -> dict:
                     text, title, extraction_error = await _extract_pdf_text_sandboxed(raw_body)
                     body_format = "pdf"
                 else:
-                    text, title, body_format, extraction_error = await asyncio.to_thread(
-                        extract_direct_response,
+                    (
+                        text,
+                        title,
+                        body_format,
+                        extraction_error,
+                        direct_metrics,
+                    ) = await asyncio.to_thread(
+                        extract_direct_response_details,
                         raw_body,
                         content_type,
                         response_encoding,
@@ -656,11 +818,7 @@ async def direct_fetch_url(url: str) -> dict:
         "title": title,
         "content": text,
         "markdown": text,
-        "raw_html_chars": (
-            len(_decode_response_body(raw_body, response_encoding))
-            if body_format in {"html", "json", "text", "xml"}
-            else 0
-        ),
+        "raw_html_chars": direct_metrics.get("raw_html_chars", 0),
         "raw_body_bytes": len(raw_body),
         "body_format": body_format,
         "redirect_chain": redirect_chain,
@@ -669,6 +827,11 @@ async def direct_fetch_url(url: str) -> dict:
 
     if extraction_error:
         result["extraction_error"] = extraction_error
+    if body_format == "html":
+        result["_direct_primary_content_chars"] = direct_metrics.get(
+            "primary_content_chars",
+            0,
+        )
 
     return result
 
@@ -682,44 +845,123 @@ def crawl4ai_payload(url: str, crawler_config: dict | None = None) -> dict:
     }
 
 
+def _direct_result_is_sufficient(result: dict) -> bool:
+    content = extract_content(result)
+    if result.get("extraction_error") or len(content) < DIRECT_FIRST_MIN_CONTENT_CHARS:
+        return False
+    preview = content[:20_000].lower()
+    if any(marker in preview for marker in DIRECT_LOW_CONFIDENCE_MARKERS):
+        return False
+    if result.get("body_format") == "html":
+        primary_chars = result.get("_direct_primary_content_chars")
+        if not isinstance(primary_chars, int):
+            return False
+        minimum_primary_chars = max(200, DIRECT_FIRST_MIN_CONTENT_CHARS // 2)
+        if primary_chars < minimum_primary_chars:
+            return False
+    return True
+
+
+async def _cancel_and_drain(task: asyncio.Task | None) -> None:
+    if task is None:
+        return
+    if not task.done():
+        task.cancel()
+    with suppress(asyncio.CancelledError, Exception):
+        await task
+
+
 async def crawl_url_impl(url: str, config: dict | None = None) -> dict:
     await validate_url_safety(url)
-    attempts = [
-        crawl4ai_payload(url, config or {}),
-    ]
-
-    errors = []
-
-    for payload in attempts:
-        try:
-            data = first_crawl4ai_result(await crawl4ai_request(payload))
-            if isinstance(data, dict):
-                for result_url in (data.get("url"), data.get("final_url"), data.get("redirected_url")):
-                    if result_url:
-                        await validate_url_safety(urljoin(url, str(result_url)))
-            content = extract_content(data)
-            if content and len(content) >= 200:
-                data["extraction_method"] = "crawl4ai"
-                return data
-
-            errors.append("Crawl4AI returned too little content")
-        except Exception as exc:
-            errors.append(_safe_error_detail(exc))
+    payload = crawl4ai_payload(url, config or {})
+    crawl4ai_errors: list[str] = []
+    direct_error: str | None = None
+    direct_result: dict | None = None
+    direct_task: asyncio.Task | None = asyncio.create_task(direct_fetch_url(url))
+    crawl4ai_task: asyncio.Task | None = None
 
     try:
-        data = await crawl4ai_markdown_request(url)
-        content = extract_content(data)
-        if content and len(content) >= 200:
-            data["crawl4ai_errors"] = errors
-            return data
-        errors.append("Crawl4AI /md returned too little content")
-    except Exception as exc:
-        errors.append(f"crawl4ai /md failed: {_safe_error_detail(exc)}")
+        done, _ = await asyncio.wait(
+            {direct_task},
+            timeout=DIRECT_FIRST_HEDGE_SECONDS,
+        )
+        if direct_task in done:
+            try:
+                direct_result = await direct_task
+            except Exception as exc:
+                direct_error = f"direct fetch failed: {_safe_error_detail(exc)}"
+            direct_task = None
+            if direct_result is not None:
+                if _direct_result_is_sufficient(direct_result):
+                    return direct_result
+                direct_result["_direct_low_confidence"] = True
 
-    try:
-        fallback = await direct_fetch_url(url)
-        fallback["crawl4ai_errors"] = errors
-        return fallback
-    except Exception as exc:
-        errors.append(f"direct fallback failed: {_safe_error_detail(exc)}")
-        raise RuntimeError("; ".join(errors))
+        crawl4ai_task = asyncio.create_task(crawl4ai_request(payload))
+        while direct_task is not None or crawl4ai_task is not None:
+            active_tasks = {
+                task for task in (direct_task, crawl4ai_task) if task is not None
+            }
+            done, _ = await asyncio.wait(
+                active_tasks,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            # Prefer the richer Crawl4AI result when both hedged requests finish
+            # in the same event-loop turn.
+            if crawl4ai_task is not None and crawl4ai_task in done:
+                try:
+                    data = first_crawl4ai_result(await crawl4ai_task)
+                    if isinstance(data, dict):
+                        for result_url in (
+                            data.get("url"),
+                            data.get("final_url"),
+                            data.get("redirected_url"),
+                        ):
+                            if result_url:
+                                await validate_url_safety(urljoin(url, str(result_url)))
+                    content = extract_content(data)
+                    if content and len(content) >= 200:
+                        data["extraction_method"] = "crawl4ai"
+                        return data
+                    crawl4ai_errors.append("Crawl4AI returned too little content")
+                except Exception as exc:
+                    crawl4ai_errors.append(_safe_error_detail(exc))
+                crawl4ai_task = None
+
+            if direct_task is not None and direct_task in done:
+                try:
+                    direct_result = await direct_task
+                except Exception as exc:
+                    direct_error = f"direct fetch failed: {_safe_error_detail(exc)}"
+                direct_task = None
+                if direct_result is not None:
+                    if _direct_result_is_sufficient(direct_result):
+                        return direct_result
+                    direct_result["_direct_low_confidence"] = True
+
+        # The isolated web runner deliberately rejects /md because that endpoint
+        # cannot be forced through its pinned public-only proxy.
+        if not os.getenv("WEB_RUNNER_SOCKET", "").strip():
+            try:
+                data = await crawl4ai_markdown_request(url)
+                content = extract_content(data)
+                if content and len(content) >= 200:
+                    data["crawl4ai_errors"] = crawl4ai_errors
+                    return data
+                crawl4ai_errors.append("Crawl4AI /md returned too little content")
+            except Exception as exc:
+                crawl4ai_errors.append(
+                    f"crawl4ai /md failed: {_safe_error_detail(exc)}"
+                )
+
+        if direct_result is not None:
+            direct_result["crawl4ai_errors"] = crawl4ai_errors
+            return direct_result
+
+        errors = list(crawl4ai_errors)
+        if direct_error:
+            errors.append(direct_error)
+        raise RuntimeError("; ".join(errors) or "All crawl strategies failed")
+    finally:
+        await _cancel_and_drain(direct_task)
+        await _cancel_and_drain(crawl4ai_task)

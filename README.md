@@ -175,10 +175,10 @@ when a token policy restricts its `namespaces` patterns.
 
 | Tool | Purpose and important behavior |
 | --- | --- |
-| `research_web` | Run open-ended research. Modes are `quick`, `balanced`, `deep`, `technical`, `academic`, `local_only`, and `web_only`. It can request cross-source corroboration, include existing memory, and request planner synthesis. With the Compose Redis backend it queues the work, waits up to `MCP_SYNC_JOB_WAIT_SECONDS`, then returns either the result or a job ID. |
+| `research_web` | Run open-ended research. Modes are `quick`, `balanced`, `deep`, `technical`, `academic`, `local_only`, and `web_only`. It can request cross-source corroboration, include existing memory, and request planner synthesis. With the Compose Redis backend it queues the work, waits up to `MCP_SYNC_JOB_WAIT_SECONDS` (60 seconds by default), then returns either the result or a job ID while longer work continues. An exact same-owner request already queued or running is coalesced and returns that job ID immediately. |
 | `investigate_url` | Investigate one public HTTP(S) URL with crawl, rendered-browser, scrolling, clicking, and network-data fallbacks. Modes are `auto`, `targeted`, `balanced`, and `exhaustive`; optional flags control ingestion, raw text, and diagnostics. |
 | `start_research` | Queue durable `research_web` work and return a job ID immediately. Use this for clients with short tool-call timeouts. It requires `JOB_BACKEND=redis`, which Compose configures. |
-| `research_job` | Operate on a durable job with `action=status`, `result`, or `cancel`. `include_full_result=false` returns compact Redis metadata instead of loading the complete artifact. Cancellation is cooperative and may not be instantaneous. |
+| `research_job` | Operate on a durable job with `action=status`, `result`, or `cancel`. Status and result calls use bounded long polling (`wait_seconds`, default 15) to reduce model/tool polling loops. `include_full_result=false` returns compact Redis metadata instead of loading the complete artifact. Cancellation is cooperative and may not be instantaneous. |
 | `get_research_artifact` | Read a returned relative `artifact_path` as bounded text. `max_chars` is clamped to 1,000-250,000 characters. |
 | `query_memory` | Search Qdrant memory in a namespace, with `top_k` clamped to 1-30, and return reranked evidence. |
 | `ingest_text` | Store supplied text in a namespace. Common credentials and tokens are redacted by default. Under token policies, `redact_secrets=false` requires the separate `memory:write:unredacted` scope. |
@@ -250,16 +250,21 @@ uncertainty visible when evidence is incomplete or conflicts.
 The Compose deployment uses Redis jobs and a shared artifact volume. A typical
 asynchronous client flow is:
 
-1. Call `start_research` and retain its `job_id`.
-2. Call `research_job(action="status", job_id=...)` until the job reaches
-   `succeeded`, `failed`, or `cancelled`.
-3. Call `research_job(action="result", job_id=...)` for the full result, or set
-   `include_full_result=false` for compact metadata.
+1. Call `start_research`, retain its `job_id`, and return control to the user.
+2. In a later assistant turn, call `research_job(action="result", job_id=...)`.
+   The call waits up to `wait_seconds`; if it remains nonterminal, honor
+   `retry_after_seconds` instead of polling again in the same turn.
+3. Set `include_full_result=false` when only compact Redis metadata is needed.
 4. When a result or source includes `artifact_path`, call
    `get_research_artifact` to read a bounded copy later.
 
 `research_web` and `investigate_url` use the same queue under Compose, but wait
-for up to `MCP_SYNC_JOB_WAIT_SECONDS` before returning a running job ID. Workers
+for up to `MCP_SYNC_JOB_WAIT_SECONDS` (60 seconds by default) before returning a
+nonterminal job ID. The worker continues the same full-depth job in the
+background; this timeout only bounds how long the original MCP call stays open.
+Exact active requests are coalesced by authenticated owner, job kind, and
+canonical payload, so a model retry does not create duplicate physical work.
+Workers
 hold random per-attempt leases and heartbeat active jobs. Stale leases are
 recovered both on startup and every `JOB_STALE_RECOVERY_INTERVAL_SECONDS`; only
 the current lease owner may publish a result. Duplicate queue entries therefore
@@ -395,9 +400,9 @@ Configure the client for Streamable HTTP at
 `http://research-mcp:8001/mcp`, or replace the hostname with the value of
 `MCP_CLIENT_ALIAS`. Plain HTTP is appropriate only for a trusted, same-host
 Docker network; use a TLS reverse proxy across hosts or untrusted networks.
-Client tool-call timeouts should exceed
-`MCP_SYNC_JOB_WAIT_SECONDS`, or the client should use `start_research` and poll
-`research_job`.
+Client tool-call timeouts should exceed `MCP_SYNC_JOB_WAIT_SECONDS`. Clients
+with shorter limits should use `start_research`, return the job ID, and call
+`research_job` in a later turn; they should not busy-poll within one model turn.
 
 LibreChat also blocks private MCP destinations by default. Allow the exact
 private socket rather than disabling SSRF protection:
@@ -462,6 +467,19 @@ than they complete:
 ```console
 docker compose up -d --scale research-worker=3
 ```
+
+Each worker processes up to `RESEARCH_SOURCE_CONCURRENCY` sources concurrently.
+The default is `2`; valid values are `1` through `4`. Increase it only when the
+worker has enough CPU and memory for concurrent extraction, embedding, and
+ingestion.
+
+For ordinary static pages, direct extraction receives a short
+`DIRECT_FIRST_HEDGE_SECONDS` head start. Results must pass the conservative
+`DIRECT_FIRST_MIN_CONTENT_CHARS` quality gate; thin, blocked, or dynamic pages
+must also contain enough primary page content after navigation chrome is removed.
+Thin, blocked, boilerplate-only, or dynamic pages still escalate to Crawl4AI and
+the rendered-browser fallback. Research source fallbacks reuse their first crawl
+result instead of fetching the same URL twice.
 
 Workers share one serialized `web-runner`, so worker replicas do not increase
 rendered-browser concurrency. Scale only after budgeting `WORKER_MEMORY_LIMIT`

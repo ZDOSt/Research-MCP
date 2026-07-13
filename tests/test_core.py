@@ -43,6 +43,17 @@ def test_domain_matching_applies_to_subdomains():
     assert owner == "example.com"
 
 
+@pytest.mark.parametrize("value", ["1", "2", "4"])
+def test_source_concurrency_accepts_bounded_values(value):
+    assert pipelines._validated_source_concurrency(value) == int(value)
+
+
+@pytest.mark.parametrize("value", ["0", "5", "many"])
+def test_source_concurrency_rejects_unsafe_values(value):
+    with pytest.raises(ValueError, match="RESEARCH_SOURCE_CONCURRENCY"):
+        pipelines._validated_source_concurrency(value)
+
+
 @pytest.mark.asyncio
 async def test_research_pipeline_deduplicates_queries_and_scopes_retrieval(monkeypatch):
     crawl_kwargs = []
