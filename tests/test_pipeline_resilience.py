@@ -1,9 +1,11 @@
 import asyncio
+import time
 from unittest.mock import AsyncMock
 
 import pytest
 
 import pipelines
+from artifact_store import ArtifactStore
 from searching import SearchResults
 
 
@@ -963,3 +965,195 @@ async def test_inline_cancellation_waits_for_attempt_invalidation(monkeypatch):
     with pytest.raises(asyncio.CancelledError):
         await task
     assert invalidation_finished.is_set()
+
+
+@pytest.mark.asyncio
+async def test_deferred_research_returns_fresh_evidence_without_qdrant_round_trip(
+    monkeypatch,
+    tmp_path,
+):
+    candidate = {
+        "title": "Current installation guide",
+        "url": "https://docs.example/install",
+        "domain": "docs.example",
+        "snippet": "Current installation instructions",
+        "score": 10,
+        "score_reasons": [],
+    }
+
+    async def plan(query, mode):
+        return {"query": query, "mode": mode, "queries": [query]}
+
+    async def search(**_kwargs):
+        return [candidate]
+
+    async def crawl(_semaphore, source, **_kwargs):
+        return {
+            "ok": True,
+            "title": source["title"],
+            "url": source["url"],
+            "requested_url": source["url"],
+            "domain": source["domain"],
+            "evidence_text": "Run the supported installer, then verify the service health.",
+            "_content": "Run the supported installer, then verify the service health. " * 20,
+        }
+
+    store = ArtifactStore(tmp_path)
+    rag_query = AsyncMock(return_value={"results": []})
+    monkeypatch.setitem(
+        pipelines.RESEARCH_MODE_CONFIG,
+        "balanced",
+        {
+            "max_urls": 1,
+            "search_results": 1,
+            "top_k": 4,
+            "planner_budget": 0.2,
+            "search_budget": 0.2,
+            "crawl_budget": 0.5,
+            "total_budget": 1.0,
+        },
+    )
+    monkeypatch.setattr(pipelines, "build_research_plan", plan)
+    monkeypatch.setattr(pipelines, "searxng_search", search)
+    monkeypatch.setattr(pipelines, "crawl_source_limited", crawl)
+    monkeypatch.setattr(pipelines, "get_artifact_store", lambda: store)
+    monkeypatch.setattr(pipelines, "rag_query_impl", rag_query)
+
+    parent_id = "a" * 32
+    result = await pipelines.research_pipeline(
+        "install the current release",
+        max_sources=1,
+        verify=False,
+        research_run_id=parent_id,
+        defer_persistence=True,
+        ingestion_attempt_id="b" * 64,
+    )
+
+    rag_query.assert_not_awaited()
+    assert result["evidence"][0]["evidence_type"] == "extracted_page_content"
+    assert result["results"] == []
+    assert result["memory_results"] == []
+    assert "_content" not in result["crawled_sources"][0]
+    manifest = result["_deferred_persistence"]["sources"][0]
+    assert manifest["job_id"] != parent_id
+    assert manifest["artifact_owner_id"] == manifest["job_id"]
+    assert manifest["artifact_path"].startswith(f"{manifest['job_id']}/")
+    assert await store.exists(manifest["artifact_path"])
+    assert result["persistence"] == {
+        "mode": "deferred",
+        "status": "prepared",
+        "source_count": 1,
+    }
+    assert any(
+        "answer now from evidence" in instruction
+        for instruction in result["answering_instructions"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_discovery_reranker_reorders_candidates_and_falls_back_on_timeout(
+    monkeypatch,
+):
+    candidates = [
+        {"title": "First", "snippet": "one", "score": 10},
+        {"title": "Second", "snippet": "two", "score": 5},
+    ]
+
+    async def rerank(_query, docs, _top_k):
+        return [
+            {**docs[1], "rerank_score": 0.9},
+            {**docs[0], "rerank_score": 0.1},
+        ]
+
+    monkeypatch.setattr(pipelines, "SEARCH_RERANKER_ENABLED", True)
+    monkeypatch.setattr(pipelines, "SEARCH_RERANKER_TIMEOUT_SECONDS", 0.1)
+    monkeypatch.setattr(pipelines, "rerank_docs", rerank)
+
+    ranked, diagnostics = await pipelines._rerank_search_candidates(
+        "query",
+        candidates,
+        timeout_seconds=0.1,
+    )
+    assert [item["title"] for item in ranked] == ["Second", "First"]
+    assert diagnostics["status"] == "applied"
+
+    cancellation_seen = asyncio.Event()
+
+    async def slow_rerank(_query, _docs, _top_k):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancellation_seen.set()
+
+    monkeypatch.setattr(pipelines, "SEARCH_RERANKER_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(pipelines, "rerank_docs", slow_rerank)
+    fallback, diagnostics = await pipelines._rerank_search_candidates(
+        "query",
+        candidates,
+        timeout_seconds=0.02,
+    )
+    assert fallback == candidates
+    assert diagnostics["status"] == "timed_out"
+    assert cancellation_seen.is_set()
+
+
+@pytest.mark.asyncio
+async def test_interactive_deadline_returns_snippet_evidence_instead_of_hanging(
+    monkeypatch,
+):
+    candidate = {
+        "title": "Current release notes",
+        "url": "https://vendor.example/releases/current",
+        "domain": "vendor.example",
+        "snippet": "Version 9 is the currently supported release.",
+        "score": 10,
+        "score_reasons": [],
+    }
+
+    async def slow_plan(_query, _mode):
+        await asyncio.Event().wait()
+
+    async def search(**_kwargs):
+        return [candidate]
+
+    crawl_cancelled = asyncio.Event()
+
+    async def slow_crawl(_semaphore, _source, **_kwargs):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            crawl_cancelled.set()
+
+    monkeypatch.setitem(
+        pipelines.RESEARCH_MODE_CONFIG,
+        "balanced",
+        {
+            "max_urls": 1,
+            "search_results": 1,
+            "top_k": 0,
+            "planner_budget": 0.01,
+            "search_budget": 0.03,
+            "crawl_budget": 0.03,
+            "total_budget": 0.08,
+        },
+    )
+    monkeypatch.setattr(pipelines, "build_research_plan", slow_plan)
+    monkeypatch.setattr(pipelines, "searxng_search", search)
+    monkeypatch.setattr(pipelines, "crawl_source_limited", slow_crawl)
+    monkeypatch.setattr(pipelines, "CRAWL_CANCEL_GRACE_SECONDS", 0.005)
+
+    started = time.monotonic()
+    result = await pipelines.research_pipeline(
+        "what is the current supported release?",
+        max_sources=1,
+        verify=False,
+        persist_source_artifacts=False,
+        defer_persistence=True,
+    )
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.3
+    assert crawl_cancelled.is_set()
+    assert result["completion"]["status"] == "partial"
+    assert result["evidence"][0]["evidence_type"] == "search_result_snippet"
+    assert result["evidence"][0]["url"] == candidate["url"]

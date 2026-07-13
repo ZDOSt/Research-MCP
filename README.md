@@ -4,16 +4,18 @@ Research MCP gives any Streamable HTTP MCP client a private set of high-level
 tools for web research, focused URL investigation, read-only GitHub research,
 and persistent semantic memory. The gateway authenticates and queues work;
 separate workers perform search, bounded page extraction, browser automation,
-ingestion, retrieval, and reranking.
+background ingestion, retrieval, and optional reranking.
 
 ## Run with Docker Compose
 
 Requirements: Docker Engine with Compose v2.24.4 or newer, a 64-bit Linux host,
 and outbound internet access for search and page retrieval. The configured
-memory ceilings total about 15 GB for the base stack, so a 16 GB VPS is the
-practical default; each optional Crawl4AI or reranker profile adds up to 4 GB.
-The first build downloads Chromium and the first research request downloads the
-configured embedding model.
+memory ceilings total about 16.5 GB for the base stack after including the
+separate persistence worker. These are hard ceilings rather than reservations,
+so a 16 GB VPS can run the default stack, but it has little worst-case headroom;
+lower the worker limits or provide swap if other services share the host. Each
+optional Crawl4AI or reranker profile adds up to 4 GB. The first build downloads
+Chromium and the first indexing job downloads the configured embedding model.
 
 All settings have runnable defaults, so the base stack starts with one command:
 
@@ -102,7 +104,7 @@ Review the resource limits, and then start:
 docker compose config --quiet
 docker compose up -d --build --wait
 docker compose ps
-docker compose logs --tail=100 mcp-gateway research-worker
+docker compose logs --tail=100 mcp-gateway research-worker persistence-worker
 ```
 
 Do not publish port 8001 directly to the internet. Put Caddy, Nginx, Traefik,
@@ -132,16 +134,18 @@ maintenance. `docker compose down` preserves them; `docker compose down
 ## Architecture
 
 ```text
-MCP client -> mcp-gateway -> Redis queue -> research-worker
-                                      |-> SearXNG -> public web
-                                      |-> direct bounded fetch -> public web
-                                      |-> Unix socket -> isolated PDF parser (no network)
-                                      |-> Unix socket -> isolated web-runner
-                                      |                    |-> safe-egress -> public web
-                                      |                    `-> isolated Crawl4AI (optional)
-                                      |                                      `-> safe-egress
-                                      |-> Qdrant + FastEmbed
-                                      `-> job artifacts volume
+MCP client -> mcp-gateway -> Redis primary queue -> research-worker
+                                              |-> SearXNG -> public web
+                                              |-> direct bounded fetch -> public web
+                                              |-> Unix socket -> isolated PDF parser (no network)
+                                              |-> Unix socket -> isolated web-runner
+                                              |                    |-> safe-egress -> public web
+                                              |                    `-> isolated Crawl4AI (optional)
+                                              |                                      `-> safe-egress
+                                              `-> current evidence + source artifacts
+                                                   |
+                                                   `-> Redis persistence queue
+                                                        `-> persistence-worker -> Qdrant + FastEmbed
 ```
 
 The default stack includes:
@@ -149,23 +153,31 @@ The default stack includes:
 | Service | Role | Host exposure |
 | --- | --- | --- |
 | `mcp-gateway` | MCP protocol, validation, queue submission, result polling | `127.0.0.1:8001` |
-| `research-worker` | Search, crawl, extraction, browser automation, RAG | None |
-| `redis` | Durable job queue and result state | None |
+| `research-worker` | Search, crawl, extraction, browser automation, and current evidence | None |
+| `persistence-worker` | Independently index one extracted source per durable child job | None |
+| `redis` | Durable primary/persistence queues and result state | None |
 | `qdrant` | Persistent vector memory | None |
 | `searxng` | Private metasearch with JSON output enabled | None |
 | `pdf-runner` | Resource-bounded PDF parsing in a network-less container | None |
 | `web-runner` | Network-isolated Playwright/Crawl4AI control process | None |
 | `safe-egress` | DNS-pinned, public-only SOCKS5 broker for the browser sandbox | None |
 
-Redis, Qdrant, and the optional reranker join only the internal backend network.
-SearXNG performs search on a separate control network. The worker reaches the
-browser and PDF parser only through separate Unix sockets. The PDF parser has no
-network interface. Playwright and optional Crawl4AI run only on an internal
+Redis and Qdrant join only the internal backend network. The persistence worker
+and optional reranker also join the outbound network so an empty model cache can
+download its configured Hugging Face model; neither publishes a host port or
+joins the external MCP client network. SearXNG performs search on a separate
+control network. The worker reaches the browser and PDF parser only through
+separate Unix sockets. The PDF parser has no network interface. Playwright and
+optional Crawl4AI run only on an internal
 sandbox network and reach public targets through `safe-egress`, which rejects
 private, loopback, link-local, and metadata destinations after DNS resolution.
 SearXNG uses a file-backed settings mount so its root filesystem remains
 read-only across Compose implementations; `SEARXNG_SECRET` overrides the
-checked-in placeholder at runtime.
+checked-in placeholder at runtime. Its pinned configuration keeps a deliberately
+small set of broad, news, technical, and academic engines rather than querying
+every upstream provider. Keyless engines can still rate-limit VPS addresses;
+inspect SearXNG diagnostics when discovery is empty, and revalidate exact engine
+names whenever the pinned SearXNG image is upgraded.
 The gateway joins a separate edge network for its published port. Named volumes
 retain Redis state, Qdrant vectors and snapshots, embedding models, and research
 artifacts across replacement.
@@ -178,10 +190,10 @@ when a token policy restricts its `namespaces` patterns.
 
 | Tool | Purpose and important behavior |
 | --- | --- |
-| `research_web` | Run open-ended research. Pass the complete research task; server-side planning derives compact, complementary search queries while retaining exact errors, versions, URLs, products, and date constraints. Modes are `quick`, `balanced`, `deep`, `technical`, `academic`, `local_only`, and `web_only`. It can request cross-source corroboration, include existing memory, and request planner synthesis. With the Compose Redis backend it queues the work, waits up to `MCP_SYNC_JOB_WAIT_SECONDS` (60 seconds by default), then returns either the result or a job ID while longer work continues. An exact same-owner request already queued or running is coalesced and returns that job ID immediately. |
+| `research_web` | Run open-ended research. Pass the complete task; server-side planning derives compact complementary searches while retaining exact errors, versions, URLs, products, and dates. Modes are `quick` (12-second target), `balanced` (30), `web_only` (25), `technical` (45), `academic` (50), `deep` (180/background-oriented), and `local_only`. Search queries and source extraction run under one bounded latency budget and return the best available evidence at expiry. `evidence` is the authoritative fresh result; `results` and `memory_results` are optional vector-memory matches and may be empty. Source indexing continues independently after the response. With Redis, same-owner duplicate active requests are coalesced and wait for the existing result rather than launching duplicate work. |
 | `investigate_url` | Investigate one public HTTP(S) URL with crawl, rendered-browser, scrolling, clicking, and network-data fallbacks. Modes are `auto`, `targeted`, `balanced`, and `exhaustive`; optional flags control ingestion, raw text, and diagnostics. |
-| `start_research` | Queue durable `research_web` work and return a job ID immediately. Use this for clients with short tool-call timeouts. It requires `JOB_BACKEND=redis`, which Compose configures. |
-| `research_job` | Operate on a durable job with `action=status`, `result`, or `cancel`. Status and result calls use bounded long polling (`wait_seconds`, default 15) to reduce model/tool polling loops. `include_full_result=false` returns compact Redis metadata instead of loading the complete artifact. Cancellation is cooperative and may not be instantaneous. |
+| `start_research` | Queue explicitly deep durable `research_web` work and return a job ID immediately. Ordinary work should use `research_web`. A model may follow with one bounded `research_job` call itself; users should not be asked to run job-control commands. It requires `JOB_BACKEND=redis`, which Compose configures. |
+| `research_job` | Operate on a durable job with `action=status`, `result`, or `cancel`. Status and result use bounded long polling (`wait_seconds`, default 15) to avoid busy loops. `include_full_result=false` returns compact Redis metadata, including persistence acceptance, instead of loading the complete artifact. Cancellation is cooperative and may not be instantaneous. |
 | `get_research_artifact` | Read a returned source artifact, or a job-result path obtained through compact job metadata, as bounded text. Completed full results omit their duplicate job-result path because the payload is already present. `max_chars` is clamped to 1,000-250,000 characters. |
 | `query_memory` | Search Qdrant memory in a namespace, with `top_k` clamped to 1-30, and return reranked evidence. |
 | `ingest_text` | Store supplied text in a namespace. Common credentials and tokens are redacted by default. Under token policies, `redact_secrets=false` requires the separate `memory:write:unredacted` scope. |
@@ -250,40 +262,52 @@ uncertainty visible when evidence is incomplete or conflicts.
 
 ## Durable jobs and artifacts
 
-The Compose deployment uses Redis jobs and a shared artifact volume. A typical
-asynchronous client flow is:
+The Compose deployment uses a primary Redis queue, a separate persistence
+queue, and a shared artifact volume. Ordinary `research_web` calls wait for a
+bounded best-evidence result. A typical explicitly durable/deep flow is:
 
-1. Call `start_research`, retain its `job_id`, and return control to the user.
-2. In a later assistant turn, call `research_job(action="result", job_id=...)`.
-   The call waits up to `wait_seconds`; if it remains nonterminal, honor
-   `retry_after_seconds` instead of polling again in the same turn.
+1. Call `start_research` and retain its `job_id`.
+2. The assistant may call `research_job(action="result", job_id=...)` once with
+   a bounded `wait_seconds`. It must not busy-poll or ask the user to run a
+   tool-control command.
 3. Set `include_full_result=false` when only compact Redis metadata is needed.
 4. When a result or source includes `artifact_path`, call
    `get_research_artifact` to read a bounded copy later.
 
-`research_web` and `investigate_url` use the same queue under Compose, but wait
-for up to `MCP_SYNC_JOB_WAIT_SECONDS` (60 seconds by default) before returning a
-nonterminal job ID. The worker continues the same full-depth job in the
-background; this timeout only bounds how long the original MCP call stays open.
+`research_web` and `investigate_url` use the primary queue under Compose and wait
+for up to `MCP_SYNC_JOB_WAIT_SECONDS` (60 seconds by default). Quick, balanced,
+web-only, technical, and academic work all have shorter internal best-evidence
+deadlines. Deep mode is the intentionally long-running option.
 Exact active requests are coalesced by authenticated owner, job kind, and
-canonical payload, so a model retry does not create duplicate physical work.
-Workers
-hold random per-attempt leases and heartbeat active jobs. Stale leases are
+canonical payload, so a model retry waits for the existing physical job instead
+of creating duplicate work. Workers hold random per-attempt leases and heartbeat
+active jobs. Stale leases are
 recovered both on startup and every `JOB_STALE_RECOVERY_INTERVAL_SECONDS`; only
 the current lease owner may publish a result. Duplicate queue entries therefore
 cannot execute the same lease concurrently. Queue payloads are capped by
 `JOB_MAX_PAYLOAD_BYTES`, and queue admission is capped by `JOB_MAX_QUEUED` (`0`
 disables the admission cap). A job that repeatedly loses a stale lease is
 terminally failed after `JOB_MAX_ATTEMPTS` claims instead of retrying forever.
-Before an ingesting attempt can dispatch, its compensation record is written to
-Redis and confirmed on the local AOF with `WAITAOF`. The worker fails closed if
-that confirmation does not arrive within
+Open-web acquisition does not write to Qdrant on its response path. After source
+text is extracted, it is staged as an immutable artifact under a unique future
+persistence-job ID. Parent completion and all child enqueues occur in one
+lease-checked Redis transaction, and cancellation wins that transaction without
+enqueuing children. Each child indexes exactly one source, so one failing source
+does not revoke successful siblings and slow embeddings do not block another
+interactive request. The returned `persistence.status=accepted` is an enqueue
+acknowledgement, not a live indexing status; current `evidence` is usable
+immediately and must not wait for vector memory.
+
+Before an ingesting child (or explicitly synchronous ingestion) can dispatch,
+its compensation record is written to Redis and confirmed on the local AOF with
+`WAITAOF`. The worker fails closed if that confirmation does not arrive within
 `JOB_INGESTION_WAITAOF_TIMEOUT_MS` (default 5000 ms). Setting the timeout to `0`
 disables the fsync confirmation and weakens recovery from a Redis host crash.
 
 Each successful attempt writes its full JSON result atomically under
-`ARTIFACT_DIR/<job_id>/result-<lease-prefix>.json`; source snapshots may be
-stored beside it. A worker that loses its lease cannot attach that artifact to
+`ARTIFACT_DIR/<job_id>/result-<lease-prefix>.json`; deferred source snapshots are
+owned by their individual persistence child IDs. A worker that loses its lease
+cannot attach the result artifact to
 the job result, preventing an obsolete attempt from overwriting a newer one.
 Compose fixes `ARTIFACT_DIR` to `/data/artifacts` and mounts the `artifacts`
 named volume into both gateway and workers. Paths returned to clients are
@@ -294,7 +318,8 @@ Redis job metadata expires `JOB_RESULT_TTL_SECONDS` after a terminal state
 pruned when their newest file is older than `ARTIFACT_RETENTION_SECONDS`
 (default 30 days), with scans every `ARTIFACT_CLEANUP_INTERVAL_SECONDS` (default
 one hour). A retention value of `0` disables worker pruning. Queued and running
-job directories are protected from cleanup. Unless metadata expiry is disabled,
+artifact owners are protected across both Redis queues, including referenced
+parent owners. Unless metadata expiry is disabled,
 `JOB_RESULT_TTL_SECONDS` must be at least `ARTIFACT_RETENTION_SECONDS` so an
 authenticated client never retains a path after its ownership record expires.
 Qdrant memory has a separate lifecycle and is not removed by artifact cleanup.
@@ -404,8 +429,9 @@ Configure the client for Streamable HTTP at
 `MCP_CLIENT_ALIAS`. Plain HTTP is appropriate only for a trusted, same-host
 Docker network; use a TLS reverse proxy across hosts or untrusted networks.
 Client tool-call timeouts should exceed `MCP_SYNC_JOB_WAIT_SECONDS`. Clients
-with shorter limits should use `start_research`, return the job ID, and call
-`research_job` in a later turn; they should not busy-poll within one model turn.
+with shorter limits can use `start_research`; the assistant may make one bounded
+`research_job` continuation itself and should never ask the user to issue a
+tool-control command or busy-poll within one model turn.
 
 LibreChat also blocks private MCP destinations by default. Allow the exact
 private socket rather than disabling SSRF protection:
@@ -427,9 +453,11 @@ clients should use a TLS reverse proxy instead of a shared Docker network. Leave
 
 ## Optional profiles
 
-Crawl4AI improves structured extraction. The reranker improves final evidence
-ordering. Both are optional because Playwright/direct HTTP and Qdrant vector
-order are built-in fallbacks.
+Crawl4AI is a fallback for difficult dynamic pages. The reranker can improve
+which discovery candidates are crawled before the expensive extraction stage.
+Both are optional because direct HTTP, Playwright, deterministic source scoring,
+and Qdrant ordering remain available. Neither optional service can create search
+results when SearXNG discovery itself is empty.
 
 The Crawl4AI image requires its separate `CRAWL4AI_API_TOKEN` in order to bind
 beyond its own loopback interface. Compose passes that token only to Crawl4AI
@@ -453,7 +481,11 @@ docker compose --profile crawl4ai --profile reranker up -d --wait
 The reranker profile downloads `RERANKER_MODEL` on first start and can require
 several gigabytes of memory and disk. The default CPU image is amd64-only; leave
 this profile disabled on arm64 hosts unless you configure a compatible image or
-external reranking service.
+external reranking service. Before starting it, set
+`SEARCH_RERANKER_ENABLED=true` in `.env`; merely starting the profile does not
+activate pre-crawl candidate reranking. The call is capped by
+`SEARCH_RERANKER_TIMEOUT_SECONDS`, and failures fall back to deterministic
+ranking without failing research.
 
 ## Operations
 
@@ -461,20 +493,21 @@ Inspect readiness and logs:
 
 ```console
 docker compose ps
-docker compose logs -f mcp-gateway research-worker
+docker compose logs -f mcp-gateway research-worker persistence-worker searxng
 ```
 
-Scale workers when direct crawling, embedding, or ingestion jobs queue faster
-than they complete:
+Scale acquisition and persistence independently. Add acquisition workers when
+search/crawl jobs queue, and persistence workers when embedding/indexing lags:
 
 ```console
 docker compose up -d --scale research-worker=3
+docker compose up -d --scale persistence-worker=2
 ```
 
 Each worker processes up to `RESEARCH_SOURCE_CONCURRENCY` sources concurrently.
-The default is `2`; valid values are `1` through `4`. Increase it only when the
-worker has enough CPU and memory for concurrent extraction, embedding, and
-ingestion.
+The default is `3`; valid values are `1` through `4`. It controls acquisition
+source concurrency; each persistence job indexes one source. Increase it only
+when the worker has enough CPU and memory for concurrent extraction.
 
 For ordinary static pages, direct extraction receives a short
 `DIRECT_FIRST_HEDGE_SECONDS` head start. Results must pass the conservative
@@ -520,6 +553,14 @@ Important invariants:
   network.
 - Redis uses `noeviction` so queued work is never silently evicted. Monitor its
   volume and memory, especially with long result TTLs.
+- `RESEARCH_PERSISTENCE_QUEUE` must differ from `RESEARCH_QUEUE`. The supplied
+  `persistence-worker` consumes only the former. With
+  `RESEARCH_DEFER_PERSISTENCE=true`, current evidence returns before vector
+  indexing; `false` is a safe but slower synchronous compatibility mode.
+- SearXNG is the mandatory discovery layer. Its `keep_only` list intentionally
+  limits broad web, news, technical, and academic providers to reduce latency
+  and failure noise. Inspect `unresponsive_engines` diagnostics before adding
+  providers, and revalidate names against the pinned image during upgrades.
 - Keep `RESEARCH_BROWSER_DISABLE_SANDBOX=false` and
   `RESEARCH_BROWSER_IGNORE_HTTPS_ERRORS=false` unless a controlled environment
   has a documented compatibility requirement.

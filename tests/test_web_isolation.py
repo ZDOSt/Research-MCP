@@ -575,6 +575,58 @@ class ComposeIsolationTests(unittest.TestCase):
             settings["server"]["secret_key"],
             "ultrasecretkey",
         )
+        keep_only = settings["use_default_settings"]["engines"]["keep_only"]
+        self.assertEqual(
+            keep_only,
+            [
+                "startpage",
+                "bing",
+                "mojeek",
+                "qwant",
+                "bing news",
+                "mojeek news",
+                "qwant news",
+                "reuters",
+                "docker hub",
+                "github",
+                "mdn",
+                "stackoverflow",
+                "askubuntu",
+                "arxiv",
+                "pubmed",
+                "semantic scholar",
+                "openalex",
+                "crossref",
+            ],
+        )
+        self.assertFalse(
+            {
+                "brave",
+                "brave.news",
+                "duckduckgo",
+                "duckduckgo news",
+                "google cse",
+            }
+            & set(keep_only)
+        )
+        engine_overrides = settings["engines"]
+        override_names = {item["name"] for item in engine_overrides}
+        self.assertEqual(
+            override_names,
+            {
+                "bing",
+                "mojeek",
+                "qwant",
+                "mojeek news",
+                "qwant news",
+                "openalex",
+                "crossref",
+            },
+        )
+        self.assertTrue(override_names.issubset(set(keep_only)))
+        self.assertTrue(all(item.get("disabled") is False for item in engine_overrides))
+        crossref = next(item for item in engine_overrides if item["name"] == "crossref")
+        self.assertEqual(crossref["timeout"], 10.0)
 
     def test_worker_uses_socket_and_is_not_on_sandbox_network(self):
         self.assertNotIn("web-sandbox", self.services["research-worker"]["networks"])
@@ -599,7 +651,7 @@ class ComposeIsolationTests(unittest.TestCase):
         )
         self.assertEqual(
             worker_environment["RESEARCH_SOURCE_CONCURRENCY"],
-            "${RESEARCH_SOURCE_CONCURRENCY:-2}",
+            "${RESEARCH_SOURCE_CONCURRENCY:-3}",
         )
         self.assertEqual(
             gateway_environment["MCP_JOB_LONG_POLL_SECONDS"],
@@ -609,6 +661,58 @@ class ComposeIsolationTests(unittest.TestCase):
             gateway_environment["MCP_SYNC_JOB_WAIT_SECONDS"],
             "${MCP_SYNC_JOB_WAIT_SECONDS:-60}",
         )
+
+    def test_persistence_worker_uses_its_own_queue_and_can_bootstrap_model(self):
+        service = self.services["persistence-worker"]
+        environment = service["environment"]
+
+        self.assertEqual(set(service["networks"]), {"backend", "egress"})
+        self.assertFalse(
+            {"web-sandbox", "search-control"}
+            & set(service["networks"])
+        )
+        self.assertFalse(
+            {
+                "pdf-runner-control:/run/research-pdf:ro",
+                "web-runner-control:/run/research-web:ro",
+            }
+            & set(service.get("volumes", []))
+        )
+        self.assertEqual(environment["RESEARCH_DEFER_PERSISTENCE"], "false")
+        self.assertEqual(
+            environment["RESEARCH_PRIMARY_QUEUE"],
+            "${RESEARCH_QUEUE:-research:jobs}",
+        )
+        self.assertEqual(
+            environment["RESEARCH_QUEUE"],
+            "${RESEARCH_PERSISTENCE_QUEUE:-research:persistence}",
+        )
+        self.assertEqual(
+            environment["RESEARCH_SOURCE_CONCURRENCY"],
+            "${RESEARCH_SOURCE_CONCURRENCY:-3}",
+        )
+        self.assertEqual(
+            service["depends_on"],
+            {
+                "qdrant": {"condition": "service_healthy"},
+                "redis": {"condition": "service_healthy"},
+            },
+        )
+        self.assertEqual(service["cpus"], "${PERSISTENCE_WORKER_CPUS:-1.5}")
+        self.assertEqual(
+            service["mem_limit"],
+            "${PERSISTENCE_WORKER_MEMORY_LIMIT:-2g}",
+        )
+        self.assertEqual(
+            service["pids_limit"],
+            "${PERSISTENCE_WORKER_PIDS_LIMIT:-256}",
+        )
+
+    def test_reranker_can_bootstrap_model_without_host_exposure(self):
+        service = self.services["reranker"]
+        self.assertEqual(set(service["networks"]), {"backend", "egress"})
+        self.assertNotIn("ports", service)
+        self.assertNotIn("expose", service)
 
     def test_runner_has_no_backend_or_application_credentials(self):
         runner_environment = self.services["web-runner"]["environment"]

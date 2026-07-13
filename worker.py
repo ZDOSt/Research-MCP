@@ -18,7 +18,14 @@ from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Mapping, Optional
 
 from artifact_store import ArtifactStore, get_artifact_store
-from job_store import JobLeaseLostError, RedisJobStore, get_job_store
+from job_store import (
+    InvalidJobError,
+    JobLeaseLostError,
+    JobQueueFullError,
+    RedisJobStore,
+    get_job_store,
+    validate_job_id,
+)
 from redaction import redact_sensitive_text
 
 
@@ -26,8 +33,13 @@ logger = logging.getLogger(__name__)
 Dispatcher = Callable[[str, Mapping[str, Any]], Awaitable[Any]]
 _INTERNAL_ATTEMPT_ID = "_research_job_attempt_id"
 _INTERNAL_ATTEMPT_ORDER_NS = "_research_job_attempt_order_ns"
+_INTERNAL_JOB_ID = "_research_job_id"
 _MAX_QDRANT_ORDER = 2**63 - 1
-_INGESTING_JOB_KINDS = {"research_web", "investigate_url", "ingest_text"}
+_INGESTING_JOB_KINDS = {
+    "investigate_url",
+    "ingest_text",
+    "persist_research_source",
+}
 
 
 def _env_float(name: str, default: float, minimum: float = 0.05) -> float:
@@ -42,6 +54,29 @@ def _env_int(name: str, default: int, minimum: int = 1) -> int:
         return max(minimum, int(os.getenv(name, str(default))))
     except (TypeError, ValueError):
         return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _safe_background_error(value: object) -> str:
+    try:
+        redacted, _ = redact_sensitive_text(str(value or ""))
+    except Exception:
+        return "background queue operation failed"
+    return redacted[:500]
+
+
+def _job_may_ingest(kind: str, payload: Mapping[str, Any]) -> bool:
+    if kind == "research_web":
+        return not _env_bool("RESEARCH_DEFER_PERSISTENCE", True)
+    if kind == "investigate_url":
+        return _optional_bool(payload, "auto_ingest", True)
+    return kind in _INGESTING_JOB_KINDS
 
 
 def _required_string(payload: Mapping[str, Any], key: str) -> str:
@@ -142,6 +177,29 @@ def _claimed_attempt_context(
     return attempt_id, attempt_order_ns
 
 
+async def _validate_parent_research_result(
+    parent_job_id: str,
+    expected_artifact_id: str,
+) -> tuple[bool, str]:
+    """Ensure deferred indexing belongs to the attempt completed atomically."""
+    parent_id = validate_job_id(parent_job_id)
+    primary_queue = os.getenv("RESEARCH_PRIMARY_QUEUE", "research:jobs")
+    store = RedisJobStore(queue_name=primary_queue)
+    try:
+        record = await store.get_result(parent_id)
+        if record is None:
+            return False, "parent research job was not found"
+        status = str(record.get("status") or "")
+        if status != "succeeded":
+            return False, f"parent research job is {status or 'not ready'}"
+        metadata = record.get("result") or {}
+        if metadata.get("artifact_id") != expected_artifact_id:
+            return False, "parent research attempt was superseded"
+        return True, "parent research job succeeded"
+    finally:
+        await store.close()
+
+
 async def dispatch_job(kind: str, payload: Mapping[str, Any]) -> Any:
     """Dispatch without importing mcp_server or initializing services at import time."""
     if not isinstance(payload, Mapping):
@@ -169,12 +227,79 @@ async def dispatch_job(kind: str, payload: Mapping[str, Any]) -> Any:
             include_memory=_optional_bool(payload, "include_memory", False),
             synthesize=_optional_bool(payload, "synthesize", False),
             research_run_id=_optional_string(payload, "research_run_id"),
+            defer_persistence=_env_bool("RESEARCH_DEFER_PERSISTENCE", True),
             ingestion_attempt_id=ingestion_attempt_id,
             ingestion_order_ns=ingestion_order_ns,
         )
 
+    if kind == "persist_research_source":
+        from pipelines import persist_crawled_source
+        from shared import DEFAULT_NAMESPACE, normalize_namespace
+
+        persistence_job_id = validate_job_id(
+            _required_string(payload, _INTERNAL_JOB_ID)
+        )
+        parent_job_id = _required_string(payload, "parent_job_id")
+        expected_artifact_id = _required_string(payload, "expected_artifact_id")
+        parent_ready, parent_reason = await _validate_parent_research_result(
+            parent_job_id,
+            expected_artifact_id,
+        )
+        if not parent_ready:
+            return {
+                "status": "skipped",
+                "reason": parent_reason,
+                "parent_job_id": parent_job_id,
+                "stored_chunks": 0,
+            }
+
+        raw_source = payload.get("source")
+        if not isinstance(raw_source, Mapping):
+            raise ValueError("source must contain source metadata")
+        query = _required_string(payload, "query")
+        namespace = normalize_namespace(
+            _optional_string(payload, "namespace", DEFAULT_NAMESPACE)
+        )
+        research_run_id = _optional_string(payload, "research_run_id", parent_job_id)
+        max_ingest_chars = _env_int("RAG_MAX_INGEST_CHARS", 1_000_000, minimum=1000)
+        artifacts = get_artifact_store()
+        artifact_path = artifacts.canonical_relative_path(
+            _required_string(payload, "artifact_path")
+        )
+        if not artifact_path.startswith(f"{persistence_job_id}/"):
+            raise ValueError("deferred artifact is outside its persistence job")
+        if _required_string(payload, "artifact_owner_id") != persistence_job_id:
+            raise ValueError("deferred artifact owner does not match its job")
+        source_artifact_path = str(raw_source.get("artifact_path") or "")
+        if source_artifact_path != artifact_path:
+            raise ValueError("deferred source artifact metadata does not match its path")
+        content = await artifacts.read_text(
+            artifact_path,
+            max_chars=max_ingest_chars + 1,
+        )
+        if len(content) > max_ingest_chars:
+            raise ValueError("deferred source exceeds RAG_MAX_INGEST_CHARS")
+        source = dict(raw_source)
+        source["_content"] = content
+        outcome = await persist_crawled_source(
+            source,
+            query=query,
+            namespace=namespace,
+            research_run_id=research_run_id,
+            persist_source_artifacts=False,
+            strict=True,
+            ingestion_attempt_id=ingestion_attempt_id,
+            ingestion_order_ns=ingestion_order_ns,
+        )
+        stored_chunks = max(0, int(outcome.get("stored_chunks", 0) or 0))
+        return {
+            "status": "succeeded",
+            "parent_job_id": parent_job_id,
+            "stored_chunks": stored_chunks,
+            "source": outcome,
+        }
+
     if kind == "investigate_url":
-        from artifact_store import get_artifact_store
         from browser import DEFAULT_MAX_CHARS
         from pipelines import compact_investigation_result, explore_url_pipeline
         from searching import normalize_domain
@@ -386,6 +511,12 @@ def compact_result_metadata(result: Any, artifact: Mapping[str, Any]) -> dict[st
         value = result.get(key)
         if isinstance(value, (list, tuple)):
             metadata[f"{key}_count"] = len(value)
+    persistence = result.get("persistence")
+    if isinstance(persistence, Mapping):
+        for key in ("mode", "status", "source_count"):
+            value = persistence.get(key)
+            if value is not None and isinstance(value, (str, int, float, bool)):
+                metadata[f"persistence_{key}"] = value
     return metadata
 
 
@@ -393,12 +524,56 @@ class JobWorker:
     def __init__(
         self,
         store: Optional[RedisJobStore] = None,
+        persistence_store: Optional[RedisJobStore] = None,
         artifacts: Optional[ArtifactStore] = None,
         dispatcher: Dispatcher = dispatch_job,
         worker_id: Optional[str] = None,
         poll_interval: Optional[float] = None,
     ) -> None:
         self.store = store or get_job_store()
+        self.primary_queue_name = os.getenv(
+            "RESEARCH_PRIMARY_QUEUE", "research:jobs"
+        )
+        self.persistence_queue_name = os.getenv(
+            "RESEARCH_PERSISTENCE_QUEUE", "research:persistence"
+        )
+        if self.primary_queue_name == self.persistence_queue_name:
+            raise ValueError(
+                "RESEARCH_PERSISTENCE_QUEUE must differ from RESEARCH_PRIMARY_QUEUE"
+            )
+        self.persistence_store = persistence_store
+        if (
+            self.persistence_store is None
+            and isinstance(self.store, RedisJobStore)
+        ):
+            if self.persistence_queue_name != self.store.queue_key:
+                self.persistence_store = RedisJobStore(
+                    redis_url=self.store.redis_url,
+                    queue_name=self.persistence_queue_name,
+                    result_ttl_seconds=self.store.result_ttl_seconds,
+                    ingestion_waitaof_timeout_ms=self.store.ingestion_waitaof_timeout_ms,
+                    redis_client=self.store.redis,
+                )
+        self._artifact_protection_stores = [self.store]
+        if self.persistence_store is not None and self.persistence_store is not self.store:
+            self._artifact_protection_stores.append(self.persistence_store)
+        if isinstance(self.store, RedisJobStore):
+            known_queues = {
+                getattr(item, "queue_key", None)
+                for item in self._artifact_protection_stores
+            }
+            for queue_name in (self.primary_queue_name, self.persistence_queue_name):
+                if queue_name in known_queues:
+                    continue
+                peer = RedisJobStore(
+                    redis_url=self.store.redis_url,
+                    queue_name=queue_name,
+                    result_ttl_seconds=self.store.result_ttl_seconds,
+                    ingestion_waitaof_timeout_ms=self.store.ingestion_waitaof_timeout_ms,
+                    redis_client=self.store.redis,
+                )
+                self._artifact_protection_stores.append(peer)
+                known_queues.add(queue_name)
         self.artifacts = artifacts or get_artifact_store()
         self.dispatcher = dispatcher
         self.host_id = socket.gethostname()
@@ -466,6 +641,34 @@ class JobWorker:
         self._last_qdrant_lifecycle_repair = 0.0
         self._qdrant_lifecycle_cursor = None
         self._qdrant_history_cursor = None
+
+    @staticmethod
+    def _mark_deferred_persistence(
+        result: dict,
+        *,
+        status: str,
+        detail: Optional[str] = None,
+    ) -> None:
+        persistence = dict(result.get("persistence") or {})
+        persistence.update({"mode": "deferred", "status": status})
+        if detail:
+            persistence["detail"] = detail
+        result["persistence"] = persistence
+        memory_state = {
+            "accepted": "background_indexing_accepted",
+            "queue_failed": "background_queue_failed",
+            "unavailable": "background_queue_unavailable",
+        }.get(status, "pending_background_indexing")
+        for source in result.get("crawled_sources") or []:
+            if not isinstance(source, dict):
+                continue
+            if source.get("memory_index_state") != "pending_background_indexing":
+                continue
+            source["memory_index_state"] = memory_state
+            if detail and status != "accepted":
+                errors = list(source.get("errors") or [])
+                errors.append(detail)
+                source["errors"] = errors
 
     def stop(self) -> None:
         self._stopping.set()
@@ -574,10 +777,19 @@ class JobWorker:
             return
         self._last_artifact_cleanup = now
         try:
-            active_job_ids = getattr(self.store, "active_job_ids", None)
-            protected_owner_ids = (
-                await active_job_ids() if callable(active_job_ids) else set()
-            )
+            protected_owner_ids: set[str] = set()
+            for store in self._artifact_protection_stores:
+                active_owner_ids = getattr(
+                    store,
+                    "active_artifact_owner_ids",
+                    None,
+                )
+                if callable(active_owner_ids):
+                    protected_owner_ids.update(await active_owner_ids())
+                    continue
+                active_job_ids = getattr(store, "active_job_ids", None)
+                if callable(active_job_ids):
+                    protected_owner_ids.update(await active_job_ids())
             deleted = await self.artifacts.prune_older_than(
                 self.artifact_retention_seconds,
                 protected_owner_ids=protected_owner_ids,
@@ -726,11 +938,13 @@ class JobWorker:
         payload = dict(job.get("payload") or {})
         payload.pop("ingestion_attempt_id", None)
         payload.pop("ingestion_order_ns", None)
+        payload.pop(_INTERNAL_JOB_ID, None)
+        payload[_INTERNAL_JOB_ID] = job_id
         payload[_INTERNAL_ATTEMPT_ID] = ingestion_attempt_id
         payload[_INTERNAL_ATTEMPT_ORDER_NS] = ingestion_order_ns
         if kind in {"research_web", "investigate_url"}:
             payload["research_run_id"] = job_id
-        may_have_ingested = kind in _INGESTING_JOB_KINDS
+        may_have_ingested = _job_may_ingest(kind, payload)
         owner_id = str(job.get("owner_id") or "").strip()
         if owner_id:
             bind_owner_principal = getattr(self.artifacts, "bind_owner_principal", None)
@@ -880,6 +1094,78 @@ class JobWorker:
                     "Discarded result for job %s after losing its worker lease", job_id
                 )
                 return
+
+            deferred_children: list[dict[str, Any]] = []
+            if isinstance(result, dict):
+                raw_deferred = result.pop("_deferred_persistence", None)
+                if isinstance(raw_deferred, Mapping) and raw_deferred.get("sources"):
+                    expected_artifact_id = (
+                        f"{job_id}:result-{ingestion_attempt_id[:16]}"
+                    )
+                    raw_sources = raw_deferred.get("sources")
+                    if not isinstance(raw_sources, list) or len(raw_sources) > 16:
+                        self._mark_deferred_persistence(
+                            result,
+                            status="queue_failed",
+                            detail="background indexing manifest was invalid",
+                        )
+                    else:
+                        try:
+                            for raw_source in raw_sources:
+                                if not isinstance(raw_source, Mapping):
+                                    raise InvalidJobError(
+                                        "deferred source manifest must be a mapping"
+                                    )
+                                child_id = validate_job_id(
+                                    str(raw_source.get("job_id") or "")
+                                )
+                                artifact_owner_id = validate_job_id(
+                                    str(raw_source.get("artifact_owner_id") or "")
+                                )
+                                if child_id != artifact_owner_id:
+                                    raise InvalidJobError(
+                                        "deferred artifact owner must match its child job"
+                                    )
+                                if owner_id:
+                                    await self.artifacts.bind_owner_principal(
+                                        child_id,
+                                        owner_id,
+                                    )
+                                child_payload = dict(raw_source)
+                                child_payload.pop("job_id", None)
+                                child_payload.update(
+                                    {
+                                        "parent_job_id": job_id,
+                                        "expected_artifact_id": expected_artifact_id,
+                                    }
+                                )
+                                deferred_children.append(
+                                    {
+                                        "job_id": child_id,
+                                        "kind": "persist_research_source",
+                                        "payload": child_payload,
+                                        "owner_id": owner_id or None,
+                                    }
+                                )
+                        except Exception as exc:
+                            detail = _safe_background_error(exc)
+                            self._mark_deferred_persistence(
+                                result,
+                                status="queue_failed",
+                                detail=f"background indexing was not prepared: {detail}",
+                            )
+                            logger.error(
+                                "Could not prepare deferred persistence for job %s: %s",
+                                job_id,
+                                detail,
+                            )
+                            deferred_children = []
+                        else:
+                            if deferred_children:
+                                self._mark_deferred_persistence(
+                                    result,
+                                    status="accepted",
+                                )
             artifact = await self.artifacts.write_json(
                 job_id,
                 result,
@@ -901,6 +1187,8 @@ class JobWorker:
                     )
                     return
                 await self.artifacts.delete_job_artifacts(job_id)
+                for child in deferred_children:
+                    await self.artifacts.delete_job_artifacts(child["job_id"])
                 await self.store.mark_cancelled(
                     job_id,
                     reason="cancellation requested",
@@ -913,6 +1201,57 @@ class JobWorker:
                         reason="job_cancelled",
                     )
                 return
+            compact_metadata = compact_result_metadata(result, artifact)
+            complete_with_children = getattr(
+                self.store,
+                "complete_job_with_children",
+                None,
+            )
+            if deferred_children and callable(complete_with_children):
+                try:
+                    completion = await complete_with_children(
+                        job_id,
+                        compact_metadata,
+                        lease_token=lease_token,
+                        child_queue_name=self.persistence_queue_name,
+                        child_jobs=deferred_children,
+                    )
+                except (InvalidJobError, JobQueueFullError) as exc:
+                    detail = _safe_background_error(exc)
+                    self._mark_deferred_persistence(
+                        result,
+                        status="queue_failed",
+                        detail=f"background indexing was not accepted: {detail}",
+                    )
+                    artifact = await self.artifacts.write_json(
+                        job_id,
+                        result,
+                        name=f"result-{ingestion_attempt_id[:16]}",
+                    )
+                    await self.store.complete_job(
+                        job_id,
+                        compact_result_metadata(result, artifact),
+                        lease_token=lease_token,
+                    )
+                else:
+                    if completion.get("status") == "cancelled":
+                        await self.artifacts.delete_job_artifacts(job_id)
+                        for child in deferred_children:
+                            await self.artifacts.delete_job_artifacts(
+                                child["job_id"]
+                            )
+                return
+            if deferred_children:
+                self._mark_deferred_persistence(
+                    result,
+                    status="unavailable",
+                    detail="atomic background persistence queue is unavailable",
+                )
+                artifact = await self.artifacts.write_json(
+                    job_id,
+                    result,
+                    name=f"result-{ingestion_attempt_id[:16]}",
+                )
             await self.store.complete_job(
                 job_id,
                 compact_result_metadata(result, artifact),

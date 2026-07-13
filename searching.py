@@ -24,17 +24,75 @@ SEARXNG_MAX_RESPONSE_BYTES = max(
 )
 SEARXNG_TIMEOUT_SECONDS = max(
     1.0,
-    float(os.getenv("SEARXNG_TIMEOUT_SECONDS", "30")),
+    float(os.getenv("SEARXNG_TIMEOUT_SECONDS", "12")),
 )
 
 RESEARCH_MODE_CONFIG = {
-    "quick": {"max_urls": 2, "search_results": 6, "top_k": 4, "crawl_budget": 45},
-    "balanced": {"max_urls": 4, "search_results": 10, "top_k": 6, "crawl_budget": 90},
-    "deep": {"max_urls": 8, "search_results": 16, "top_k": 10, "crawl_budget": 180},
-    "technical": {"max_urls": 6, "search_results": 14, "top_k": 8, "crawl_budget": 120},
-    "academic": {"max_urls": 6, "search_results": 14, "top_k": 8, "crawl_budget": 120},
-    "local_only": {"max_urls": 0, "search_results": 0, "top_k": 8, "crawl_budget": 0},
-    "web_only": {"max_urls": 5, "search_results": 12, "top_k": 0, "crawl_budget": 90},
+    # Interactive modes have an end-to-end latency target in addition to their
+    # crawl budget. Deep mode is deliberately the durable/background option.
+    "quick": {
+        "max_urls": 2,
+        "search_results": 6,
+        "top_k": 4,
+        "planner_budget": 1,
+        "search_budget": 5,
+        "crawl_budget": 10,
+        "total_budget": 12,
+    },
+    "balanced": {
+        "max_urls": 4,
+        "search_results": 10,
+        "top_k": 6,
+        "planner_budget": 2,
+        "search_budget": 8,
+        "crawl_budget": 22,
+        "total_budget": 30,
+    },
+    "deep": {
+        "max_urls": 8,
+        "search_results": 16,
+        "top_k": 10,
+        "planner_budget": 15,
+        "search_budget": 25,
+        "crawl_budget": 150,
+        "total_budget": 180,
+    },
+    "technical": {
+        "max_urls": 6,
+        "search_results": 14,
+        "top_k": 8,
+        "planner_budget": 3,
+        "search_budget": 10,
+        "crawl_budget": 34,
+        "total_budget": 45,
+    },
+    "academic": {
+        "max_urls": 6,
+        "search_results": 14,
+        "top_k": 8,
+        "planner_budget": 4,
+        "search_budget": 12,
+        "crawl_budget": 38,
+        "total_budget": 50,
+    },
+    "local_only": {
+        "max_urls": 0,
+        "search_results": 0,
+        "top_k": 8,
+        "planner_budget": 0,
+        "search_budget": 0,
+        "crawl_budget": 0,
+        "total_budget": 15,
+    },
+    "web_only": {
+        "max_urls": 5,
+        "search_results": 12,
+        "top_k": 0,
+        "planner_budget": 2,
+        "search_budget": 7,
+        "crawl_budget": 18,
+        "total_budget": 25,
+    },
 }
 
 

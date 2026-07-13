@@ -90,8 +90,11 @@ mcp = FastMCP(
         "Use manage_sources for listing, stats, or deleting ingested sources within a namespace. "
         "Use github_research for repository trees, source files, issues, and code search. "
         "Never start the same research request again while its durable job is queued or running. "
-        "If a tool returns a running job ID, do not poll it repeatedly in the same assistant turn; "
-        "report the job ID and check it in a later turn. "
+        "Ordinary quick and balanced research waits for a complete best-evidence response. "
+        "If an explicitly deep durable job is still running, call research_job yourself at most once with a bounded wait; "
+        "never ask the user to issue a job-control command and never poll repeatedly. "
+        "In completed research, evidence is authoritative current-run output. results and memory_results are optional "
+        "vector-memory matches and may be empty even when research succeeded. Background indexing is eventual and must not delay the answer. "
         "A completed research_web response or full research_job result already contains the complete result payload, "
         "so its duplicate job-result artifact path is intentionally omitted. Use get_research_artifact only for a "
         "specifically needed source artifact or for a job-result path returned by explicitly requested compact metadata. "
@@ -308,7 +311,24 @@ def _complete_research_result(result: dict) -> dict:
         return result
 
     output = dict(result)
+    output.pop("_deferred_persistence", None)
     instructions = list(output.get("answering_instructions") or [])
+    evidence = output.get("evidence")
+    if isinstance(evidence, list) and evidence:
+        evidence_instruction = (
+            "The evidence array is the authoritative current-run research result. Answer from it now; "
+            "do not rerun research merely because results or memory_results is empty."
+        )
+        if evidence_instruction not in instructions:
+            instructions.append(evidence_instruction)
+    persistence = output.get("persistence")
+    if isinstance(persistence, dict) and persistence.get("mode") == "deferred":
+        persistence_instruction = (
+            "Vector-memory persistence is eventual background work and does not affect the usability "
+            "of the evidence already returned. Do not poll or delay the answer for indexing."
+        )
+        if persistence_instruction not in instructions:
+            instructions.append(persistence_instruction)
     artifact_instruction = (
         "This response already contains the complete result payload. Its duplicate job-result "
         "artifact path is intentionally omitted. Do not call get_research_artifact to reread this "
@@ -489,8 +509,16 @@ def _running_job_response(
         "retrieval_context": runtime_retrieval_context(),
         "answering_instructions": [
             "Do not start this research request again; the durable job is queued or running.",
-            "Do not poll repeatedly in the same assistant turn. Report the job ID and check it in a later turn.",
+            "For explicitly deep research, call research_job yourself at most once with a bounded wait. Never ask the user to run a tool-control command.",
+            "If that single continuation is still running, state that the durable research is still processing and retain the job ID without repeated polling.",
         ],
+        "automatic_continuation": {
+            "tool": "research_job",
+            "action": "result",
+            "job_id": job_id,
+            "wait_seconds": MCP_JOB_LONG_POLL_SECONDS,
+            "maximum_calls": 1,
+        },
     }
     if warning:
         response["warning"] = warning
@@ -538,26 +566,6 @@ async def _enqueue_and_wait(kind: str, payload: dict, tool_name: str) -> dict:
             "retryable": True,
         }
 
-    if job.get("coalesced"):
-        try:
-            status = await get_job_status(job["job_id"])
-            if status and status.get("status") in {"succeeded", "failed", "cancelled"}:
-                return await _load_completed_job(job["job_id"])
-        except Exception as exc:
-            return _running_job_response(
-                job["job_id"],
-                tool_name=tool_name,
-                warning="job_status_temporarily_unavailable",
-                detail=_safe_error_detail(exc),
-                coalesced=True,
-            )
-        return _running_job_response(
-            job["job_id"],
-            tool_name=tool_name,
-            status=str((status or {}).get("status") or "running"),
-            coalesced=True,
-        )
-
     deadline = time.monotonic() + max(0.0, MCP_SYNC_JOB_WAIT_SECONDS)
     last_status = str(job.get("status") or "queued")
     try:
@@ -567,7 +575,9 @@ async def _enqueue_and_wait(kind: str, payload: dict, tool_name: str) -> dict:
                 last_status = str(status["status"])
             if status and status.get("status") in {"succeeded", "failed", "cancelled"}:
                 return await _load_completed_job(job["job_id"])
-            await asyncio.sleep(MCP_JOB_POLL_SECONDS)
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                await asyncio.sleep(min(MCP_JOB_POLL_SECONDS, remaining))
     except JobQueueFullError as exc:
         return {
             "error": "job_queue_full",
@@ -624,8 +634,9 @@ async def research_web(
     questions without calling this tool. Use this for open-ended research without a specific URL.
     Pass the user's complete research question or task, including relevant constraints and desired
     output; the server converts instruction-style requests into effective search queries internally.
-    Internally uses SearXNG search, source scoring, Crawl4AI, optional Playwright fallback, Qdrant ingestion,
-    Qdrant retrieval, and reranking.
+    Internally uses SearXNG search, source scoring, direct extraction, optional Crawl4AI/Playwright
+    fallbacks, and optional pre-crawl reranking. Fresh extracted evidence is returned immediately;
+    durable Qdrant indexing may continue asynchronously. The evidence array is authoritative.
 
     Modes: quick, balanced, deep, technical, academic, local_only, web_only.
     Use balanced for ordinary current-information, documentation, and troubleshooting
@@ -936,12 +947,13 @@ async def start_research(
     include_memory: bool = False,
     synthesize: bool = False,
 ) -> dict:
-    """Start durable web research and immediately return a job ID.
+    """Start explicitly durable web research and immediately return a job ID.
 
-    Prefer this over research_web when the client has a short tool timeout. Use
-    research_job in a later assistant turn to inspect progress or retrieve the
-    result. Pass the complete research task; server-side planning derives the
-    search queries. Do not poll repeatedly or submit the same request again.
+    Prefer research_web for ordinary work. Use this for explicitly deep work or
+    clients with short tool timeouts, then call research_job yourself at most once
+    with a bounded wait. Never ask the user to issue a job-control command. Pass
+    the complete research task; server-side planning derives the search queries.
+    Do not poll repeatedly or submit the same request again.
     Requires JOB_BACKEND=redis.
     """
     query = _bounded_text(query, "query", MCP_MAX_QUERY_CHARS)
@@ -987,7 +999,8 @@ async def start_research(
     job["retrieval_context"] = runtime_retrieval_context()
     job["answering_instructions"] = [
         "The durable research job has started. Do not start the same request again.",
-        "Do not poll repeatedly in this assistant turn. Report the job ID and check it in a later turn.",
+        "Call research_job yourself at most once with a bounded wait; never ask the user to run a job-control command.",
+        "If the bounded continuation remains active, retain the job ID and report that processing continues without repeated polling.",
     ]
     return job
 

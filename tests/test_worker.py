@@ -1,14 +1,16 @@
 import asyncio
+import os
 import tempfile
 import unittest
 import uuid
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from artifact_store import ArtifactStore
 import shared
 from worker import (
     _INTERNAL_ATTEMPT_ID,
     _INTERNAL_ATTEMPT_ORDER_NS,
+    _INTERNAL_JOB_ID,
     _claimed_attempt_context,
     dispatch_job,
     JobWorker,
@@ -127,9 +129,7 @@ class FakeWorkerStore:
         ingestion_attempt_id,
         delay_seconds,
     ):
-        self.deferred_invalidations.append(
-            (ingestion_attempt_id, delay_seconds)
-        )
+        self.deferred_invalidations.append((ingestion_attempt_id, delay_seconds))
         record = self.registered_invalidations.get(ingestion_attempt_id)
         if record is not None:
             self.due_invalidations = [
@@ -191,9 +191,33 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(full["results"][0]["text"], "full evidence")
         self.assertEqual(dispatched_payload["research_run_id"], job_id)
         self.assertEqual(lease_token, store.heartbeat_calls[-1][2])
-        self.assertIsNotNone(store.successful_ingestion_attempt_id)
+        self.assertIsNone(store.successful_ingestion_attempt_id)
         self.assertEqual(store.registered_invalidations, {})
         self.assertIsNone(store.failed)
+
+    async def test_default_research_acquisition_skips_ingestion_compensation(self):
+        job_id = uuid.uuid4().hex
+        store = FakeWorkerStore(
+            {"job_id": job_id, "kind": "research_web", "payload": {"query": "q"}}
+        )
+        store.registration_error = OSError("compensation store unavailable")
+        dispatch = AsyncMock(return_value={"query": "q", "results": []})
+        worker = JobWorker(
+            store=store,
+            artifacts=self.artifacts,
+            dispatcher=dispatch,
+            worker_id="test-worker",
+            poll_interval=0.01,
+        )
+
+        with patch.dict(os.environ, {"RESEARCH_DEFER_PERSISTENCE": "true"}):
+            self.assertTrue(await worker.run_once(timeout=0.01))
+
+        dispatch.assert_awaited_once()
+        self.assertIsNotNone(store.completed)
+        self.assertIsNone(store.failed)
+        self.assertEqual(store.registered_invalidations, {})
+        self.assertIsNone(store.successful_ingestion_attempt_id)
 
     async def test_attempt_context_is_authoritative_and_does_not_expose_lease(self):
         job_id = uuid.uuid4().hex
@@ -385,7 +409,7 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
     async def test_dispatch_never_starts_when_compensation_registration_fails(self):
         job_id = uuid.uuid4().hex
         store = FakeWorkerStore(
-            {"job_id": job_id, "kind": "research_web", "payload": {"query": "q"}}
+            {"job_id": job_id, "kind": "ingest_text", "payload": {"text": "q"}}
         )
         store.registration_error = OSError("redis unavailable")
         dispatch = AsyncMock()
@@ -401,6 +425,93 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
 
         dispatch.assert_not_awaited()
         self.assertEqual(store.failed[1]["type"], "IngestionCompensationError")
+
+    async def test_deferred_persistence_dispatch_is_strict_and_child_owned(self):
+        child_id = uuid.uuid4().hex
+        parent_id = uuid.uuid4().hex
+        artifact_path = f"{child_id}/source.txt"
+        artifacts = Mock()
+        artifacts.canonical_relative_path.return_value = artifact_path
+        artifacts.read_text = AsyncMock(return_value="isolated source text")
+        persist = AsyncMock(
+            return_value={"stored_chunks": 2, "url": "https://example.com/docs"}
+        )
+        payload = {
+            _INTERNAL_JOB_ID: child_id,
+            _INTERNAL_ATTEMPT_ID: "a" * 64,
+            _INTERNAL_ATTEMPT_ORDER_NS: 123,
+            "parent_job_id": parent_id,
+            "expected_artifact_id": f"{parent_id}:result",
+            "artifact_owner_id": child_id,
+            "artifact_path": artifact_path,
+            "query": "install package",
+            "namespace": "default",
+            "research_run_id": parent_id,
+            "source": {
+                "url": "https://example.com/docs",
+                "artifact_path": artifact_path,
+            },
+        }
+
+        with (
+            patch(
+                "worker._validate_parent_research_result",
+                AsyncMock(return_value=(True, "ready")),
+            ),
+            patch("worker.get_artifact_store", return_value=artifacts),
+            patch("pipelines.persist_crawled_source", persist),
+        ):
+            result = await dispatch_job("persist_research_source", payload)
+
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["stored_chunks"], 2)
+        artifacts.read_text.assert_awaited_once_with(
+            artifact_path,
+            max_chars=1_000_001,
+        )
+        persist.assert_awaited_once()
+        source = persist.await_args.args[0]
+        self.assertEqual(source["_content"], "isolated source text")
+        self.assertEqual(source["artifact_path"], artifact_path)
+        self.assertTrue(persist.await_args.kwargs["strict"])
+        self.assertFalse(persist.await_args.kwargs["persist_source_artifacts"])
+
+    async def test_deferred_persistence_rejects_another_child_artifact(self):
+        child_id = uuid.uuid4().hex
+        other_owner_id = uuid.uuid4().hex
+        artifact_path = f"{other_owner_id}/source.txt"
+        artifacts = Mock()
+        artifacts.canonical_relative_path.return_value = artifact_path
+        artifacts.read_text = AsyncMock(return_value="must not be read")
+        persist = AsyncMock()
+        payload = {
+            _INTERNAL_JOB_ID: child_id,
+            _INTERNAL_ATTEMPT_ID: "b" * 64,
+            _INTERNAL_ATTEMPT_ORDER_NS: 456,
+            "parent_job_id": uuid.uuid4().hex,
+            "expected_artifact_id": "parent:result",
+            "artifact_owner_id": child_id,
+            "artifact_path": artifact_path,
+            "query": "q",
+            "source": {
+                "url": "https://example.com/docs",
+                "artifact_path": artifact_path,
+            },
+        }
+
+        with (
+            patch(
+                "worker._validate_parent_research_result",
+                AsyncMock(return_value=(True, "ready")),
+            ),
+            patch("worker.get_artifact_store", return_value=artifacts),
+            patch("pipelines.persist_crawled_source", persist),
+        ):
+            with self.assertRaisesRegex(ValueError, "outside its persistence job"):
+                await dispatch_job("persist_research_source", payload)
+
+        artifacts.read_text.assert_not_awaited()
+        persist.assert_not_awaited()
 
     async def test_failed_invalidation_is_replayed_and_acknowledged_later(self):
         job_id = uuid.uuid4().hex
@@ -444,7 +555,7 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
     async def test_cancellation_polling_cancels_active_dispatch(self):
         job_id = uuid.uuid4().hex
         store = FakeWorkerStore(
-            {"job_id": job_id, "kind": "research_web", "payload": {"query": "q"}},
+            {"job_id": job_id, "kind": "ingest_text", "payload": {"text": "q"}},
             cancel_after_checks=1,
         )
 
@@ -470,7 +581,7 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
     async def test_remote_rag_cancellation_invalidates_entire_attempt_remotely(self):
         job_id = uuid.uuid4().hex
         store = FakeWorkerStore(
-            {"job_id": job_id, "kind": "research_web", "payload": {"query": "q"}},
+            {"job_id": job_id, "kind": "ingest_text", "payload": {"text": "q"}},
             cancel_after_checks=1,
         )
 
@@ -506,7 +617,7 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
     async def test_dispatch_failure_is_recorded_without_crashing_worker(self):
         job_id = uuid.uuid4().hex
         store = FakeWorkerStore(
-            {"job_id": job_id, "kind": "research_web", "payload": {"query": "q"}}
+            {"job_id": job_id, "kind": "ingest_text", "payload": {"text": "q"}}
         )
 
         async def dispatch(kind, payload):
@@ -641,7 +752,7 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
     async def test_lease_loss_cancels_dispatch_without_terminal_write(self):
         job_id = uuid.uuid4().hex
         store = FakeWorkerStore(
-            {"job_id": job_id, "kind": "research_web", "payload": {"query": "q"}}
+            {"job_id": job_id, "kind": "ingest_text", "payload": {"text": "q"}}
         )
         store.lease_valid = False
         dispatch_cancelled = asyncio.Event()

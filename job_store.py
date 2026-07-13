@@ -497,6 +497,47 @@ class RedisJobStore:
                 continue
         return active
 
+    async def active_artifact_owner_ids(
+        self,
+        limit: int = _MAX_ACTIVE_JOB_SCAN,
+    ) -> set[str]:
+        """Return active job IDs plus artifact owners referenced by their payloads.
+
+        Deferred jobs may read an artifact owned by another durable job. Artifact
+        cleanup is shared by all workers, so the dependency must remain protected
+        for as long as the consuming job is queued or running.
+        """
+        active = await self.active_job_ids(limit=limit)
+        if not active:
+            return set()
+
+        pipe = self.redis.pipeline(transaction=True)
+        ordered_ids = sorted(active)
+        for job_id in ordered_ids:
+            pipe.hget(self._job_key(job_id), "payload")
+        payloads = await pipe.execute()
+
+        protected = set(active)
+        for raw_payload in payloads:
+            payload = _json_loads(raw_payload, default={})
+            if not isinstance(payload, Mapping):
+                continue
+            candidates = [
+                payload.get("artifact_owner_id"),
+                payload.get("parent_job_id"),
+            ]
+            raw_many = payload.get("artifact_owner_ids")
+            if isinstance(raw_many, list):
+                candidates.extend(raw_many)
+            for candidate in candidates:
+                if not isinstance(candidate, str):
+                    continue
+                try:
+                    protected.add(validate_job_id(candidate))
+                except InvalidJobError:
+                    continue
+        return protected
+
     async def request_cancellation(self, job_id: str) -> Optional[dict[str, Any]]:
         job_id_value = validate_job_id(job_id)
         key = self._job_key(job_id_value)
@@ -1107,6 +1148,189 @@ class RedisJobStore:
             result=dict(result_metadata),
             lease_token=lease_token,
             successful_ingestion_attempt_id=successful_ingestion_attempt_id,
+        )
+
+    async def complete_job_with_children(
+        self,
+        job_id: str,
+        result_metadata: Mapping[str, Any],
+        *,
+        lease_token: str,
+        child_queue_name: str,
+        child_jobs: list[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        """Atomically complete an acquisition job and enqueue persistence children.
+
+        This operation is intentionally limited to parents that did not register
+        an ingestion attempt. Each child must already have a unique artifact owner
+        so a failed source can be retried or invalidated independently.
+        """
+        if not isinstance(result_metadata, Mapping):
+            raise InvalidJobError("result_metadata must be a mapping")
+        result_json = _json_dumps(dict(result_metadata))
+        queue_value = str(child_queue_name or "").strip()
+        if not queue_value or any(char.isspace() for char in queue_value):
+            raise InvalidJobError(
+                "child_queue_name must be a non-empty Redis key without whitespace"
+            )
+        if not isinstance(child_jobs, list) or len(child_jobs) > 32:
+            raise InvalidJobError("child_jobs must be a list with at most 32 items")
+
+        now = utc_now_iso()
+        prepared_children: list[tuple[str, str, dict[str, str]]] = []
+        seen_child_ids: set[str] = set()
+        for spec in child_jobs:
+            if not isinstance(spec, Mapping):
+                raise InvalidJobError("each child job must be a mapping")
+            child_id = validate_job_id(str(spec.get("job_id") or ""))
+            if child_id in seen_child_ids:
+                raise InvalidJobError("child job IDs must be unique")
+            seen_child_ids.add(child_id)
+            kind = str(spec.get("kind") or "").strip().lower()
+            if not _KIND_RE.fullmatch(kind):
+                raise InvalidJobError(
+                    "child kind must use lowercase letters, digits, and underscores"
+                )
+            payload = spec.get("payload")
+            if not isinstance(payload, Mapping):
+                raise InvalidJobError("child payload must be a mapping")
+            payload_json = _json_dumps(dict(payload))
+            if len(payload_json.encode("utf-8")) > self.max_payload_bytes:
+                raise InvalidJobError(
+                    f"child payload exceeds JOB_MAX_PAYLOAD_BYTES ({self.max_payload_bytes} bytes)"
+                )
+            owner_id = _validate_owner_id(spec.get("owner_id"))
+            record = {
+                "job_id": child_id,
+                "kind": kind,
+                "payload": payload_json,
+                "status": QUEUED,
+                "cancel_requested": "0",
+                "created_at": now,
+                "updated_at": now,
+                "enqueued_at": now,
+            }
+            if owner_id is not None:
+                record["owner_id"] = owner_id
+            child_key = f"{queue_value}:job:{child_id}"
+            prepared_children.append((child_id, child_key, record))
+
+        parent_id = validate_job_id(job_id)
+        parent_key = self._job_key(parent_id)
+        lease_token_value = _validate_lease_token(lease_token)
+        child_keys = [key for _child_id, key, _record in prepared_children]
+
+        for _ in range(_MAX_WATCH_RETRIES):
+            async with self.redis.pipeline(transaction=True) as pipe:
+                try:
+                    watched_keys = list(
+                        dict.fromkeys(
+                            [
+                                parent_key,
+                                self.queue_key,
+                                self.processing_key,
+                                queue_value,
+                                *child_keys,
+                            ]
+                        )
+                    )
+                    await pipe.watch(*watched_keys)
+                    parent = _decode_mapping(await pipe.hgetall(parent_key))
+                    if not parent:
+                        await pipe.unwatch()
+                        raise JobNotFoundError(f"unknown job: {parent_id}")
+                    if parent.get("status") in TERMINAL_STATUSES:
+                        await pipe.unwatch()
+                        raise JobLeaseLostError(
+                            f"worker lease lost for job: {parent_id}"
+                        )
+                    owns_lease = (
+                        parent.get("status") == RUNNING
+                        and hmac.compare_digest(
+                            parent.get("lease_token", ""), lease_token_value
+                        )
+                    )
+                    if not owns_lease:
+                        await pipe.unwatch()
+                        raise JobLeaseLostError(
+                            f"worker lease lost for job: {parent_id}"
+                        )
+                    if _registered_ingestion_attempt(parent) is not None:
+                        await pipe.unwatch()
+                        raise JobStoreError(
+                            "atomic child enqueue requires an acquisition-only parent"
+                        )
+
+                    cancellation_wins = parent.get("cancel_requested") == "1"
+                    if not cancellation_wins and prepared_children:
+                        queued_count = int(await pipe.llen(queue_value))
+                        if (
+                            self.max_queued_jobs > 0
+                            and queued_count + len(prepared_children)
+                            > self.max_queued_jobs
+                        ):
+                            await pipe.unwatch()
+                            raise JobQueueFullError(
+                                f"child queue has reached JOB_MAX_QUEUED ({self.max_queued_jobs})"
+                            )
+                        for child_id, child_key, _record in prepared_children:
+                            if await pipe.exists(child_key):
+                                await pipe.unwatch()
+                                raise InvalidJobError(
+                                    f"child job_id already exists: {child_id}"
+                                )
+
+                    active_key = await self._matching_active_job_key(
+                        pipe,
+                        parent,
+                        parent_id,
+                    )
+                    terminal_status = CANCELLED if cancellation_wins else SUCCEEDED
+                    fields = {
+                        "status": terminal_status,
+                        "updated_at": now,
+                        "completed_at": now,
+                    }
+                    if cancellation_wins:
+                        fields["cancel_reason"] = "cancellation requested"
+                    else:
+                        fields["result"] = result_json
+
+                    pipe.multi()
+                    pipe.hset(parent_key, mapping=fields)
+                    pipe.hdel(
+                        parent_key,
+                        "lease_token",
+                        "heartbeat_at",
+                        "attempt_started_at",
+                        "ingestion_attempt_id",
+                    )
+                    pipe.lrem(self.processing_key, 0, parent_id)
+                    pipe.lrem(self.queue_key, 0, parent_id)
+                    if active_key is not None:
+                        pipe.delete(active_key)
+                    if self.result_ttl_seconds > 0:
+                        pipe.expire(parent_key, self.result_ttl_seconds)
+                    if not cancellation_wins:
+                        for child_id, child_key, child_record in prepared_children:
+                            pipe.hset(child_key, mapping=child_record)
+                            pipe.lpush(queue_value, child_id)
+                    await pipe.execute()
+                    return {
+                        "status": terminal_status,
+                        "children": (
+                            [
+                                self._public_job(record, include_payload=False)
+                                for _child_id, _child_key, record in prepared_children
+                            ]
+                            if not cancellation_wins
+                            else []
+                        ),
+                    }
+                except WatchError:
+                    continue
+        raise JobStoreError(
+            "could not complete job with children because state kept changing"
         )
 
     async def fail_job(

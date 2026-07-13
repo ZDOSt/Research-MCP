@@ -136,7 +136,11 @@ class MCPJobIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["job_id"], job_id)
         self.assertFalse(result["terminal"])
         self.assertGreaterEqual(result["retry_after_seconds"], 5)
-        self.assertIn("Do not poll repeatedly", " ".join(result["answering_instructions"]))
+        instructions = " ".join(result["answering_instructions"])
+        self.assertIn("never ask the user", instructions.lower())
+        self.assertIn("at most once", instructions.lower())
+        self.assertNotIn("report the job ID and check it later", instructions)
+        self.assertNotIn("ask the user to call research_job", instructions.lower())
         self.assertIn("retrieval_context", result)
 
     async def test_research_job_routes_status_metadata_full_result_and_cancel(self):
@@ -227,7 +231,21 @@ class MCPJobIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "running")
         self.assertFalse(result["terminal"])
         self.assertEqual(result["job_id"], job_id)
-        self.assertIn("Do not poll repeatedly", " ".join(result["answering_instructions"]))
+        instructions = " ".join(result["answering_instructions"])
+        self.assertIn("never ask the user", instructions.lower())
+        self.assertIn("at most once", instructions.lower())
+        self.assertNotIn("report the job ID and check it later", instructions)
+        self.assertNotIn("ask the user to call research_job", instructions.lower())
+        self.assertEqual(
+            result["automatic_continuation"],
+            {
+                "tool": "research_job",
+                "action": "result",
+                "job_id": job_id,
+                "wait_seconds": server.MCP_JOB_LONG_POLL_SECONDS,
+                "maximum_calls": 1,
+            },
+        )
 
     async def test_research_job_preserves_queued_status(self):
         server = load_mcp_server()
@@ -313,6 +331,57 @@ class MCPJobIntegrationTests(unittest.IsolatedAsyncioTestCase):
             result["evidence"][0]["artifact_reference"]["artifact_path"],
             source_path,
         )
+
+    async def test_completed_result_keeps_evidence_authoritative_and_hides_deferred_manifest(self):
+        server = load_mcp_server()
+        evidence = [
+            {
+                "title": "Current source",
+                "url": "https://example.com/current",
+                "content": "Fresh current-run evidence",
+            }
+        ]
+        result = server._complete_research_result(
+            {
+                "query": "current information",
+                "evidence": evidence,
+                "results": [],
+                "memory_results": [],
+                "persistence": {
+                    "mode": "deferred",
+                    "status": "queued",
+                    "source_count": 1,
+                },
+                "_deferred_persistence": {
+                    "namespace": "private-project",
+                    "sources": [
+                        {
+                            "artifact_path": "job/private-source.txt",
+                            "content": "private staging data",
+                        }
+                    ],
+                },
+            }
+        )
+
+        self.assertEqual(result["evidence"], evidence)
+        self.assertEqual(result["results"], [])
+        self.assertEqual(result["memory_results"], [])
+        self.assertNotIn("_deferred_persistence", result)
+        self.assertEqual(
+            result["persistence"],
+            {
+                "mode": "deferred",
+                "status": "queued",
+                "source_count": 1,
+            },
+        )
+        instructions = " ".join(result["answering_instructions"]).lower()
+        self.assertIn("evidence array is the authoritative", instructions)
+        self.assertIn("do not rerun research", instructions)
+        self.assertIn("do not poll or delay", instructions)
+        self.assertNotIn("private staging data", str(result))
+        self.assertNotIn("job/private-source.txt", str(result))
 
     async def test_sync_research_tool_uses_queue_when_backend_is_redis(self):
         server = load_mcp_server(backend="redis")
@@ -413,9 +482,13 @@ class MCPJobIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["job_id"], job_id)
         self.assertEqual(result["warning"], "job_status_temporarily_unavailable")
 
-    async def test_coalesced_sync_request_returns_without_waiting_again(self):
+    async def test_coalesced_sync_request_continues_waiting_for_completed_result(self):
         server = load_mcp_server(backend="redis")
         job_id = uuid.uuid4().hex
+        completed = {
+            "query": "same",
+            "evidence": [{"url": "https://example.com/result"}],
+        }
         with patch.object(
             server,
             "enqueue_job",
@@ -429,17 +502,27 @@ class MCPJobIntegrationTests(unittest.IsolatedAsyncioTestCase):
         ), patch.object(
             server,
             "get_job_status",
-            AsyncMock(return_value={"job_id": job_id, "status": "running"}),
-        ), patch.object(server.asyncio, "sleep", AsyncMock()) as sleep:
+            AsyncMock(
+                side_effect=[
+                    {"job_id": job_id, "status": "running"},
+                    {"job_id": job_id, "status": "succeeded"},
+                ]
+            ),
+        ) as status, patch.object(
+            server,
+            "_load_completed_job",
+            AsyncMock(return_value=completed),
+        ) as load, patch.object(server.asyncio, "sleep", AsyncMock()) as sleep:
             result = await server._enqueue_and_wait(
                 "research_web",
                 {"query": "same"},
                 "research_web",
             )
 
-        self.assertEqual(result["job_id"], job_id)
-        self.assertTrue(result["coalesced"])
-        sleep.assert_not_awaited()
+        self.assertEqual(result, completed)
+        self.assertEqual(status.await_count, 2)
+        sleep.assert_awaited_once()
+        load.assert_awaited_once_with(job_id)
 
     async def test_disabled_backend_and_queue_failures_return_stable_errors(self):
         disabled = load_mcp_server(backend="inline")

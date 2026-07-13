@@ -1,5 +1,6 @@
 import asyncio
 import unittest
+import uuid
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
 
@@ -54,7 +55,9 @@ class RedisJobStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status["status"], SUCCEEDED)
         self.assertNotIn("result", status)
         self.assertEqual(result["result"], metadata)
-        self.assertGreater(await self.redis.ttl(self.store._job_key(created["job_id"])), 0)
+        self.assertGreater(
+            await self.redis.ttl(self.store._job_key(created["job_id"])), 0
+        )
         self.assertEqual(await self.redis.lrange(self.store.processing_key, 0, -1), [])
 
     async def test_active_coalescing_is_opt_in_and_canonical(self):
@@ -234,7 +237,9 @@ class RedisJobStoreTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotEqual(stale_replacement["job_id"], stale["job_id"])
 
-    async def test_stale_or_malformed_active_index_self_heals_without_leaking_metadata(self):
+    async def test_stale_or_malformed_active_index_self_heals_without_leaking_metadata(
+        self,
+    ):
         first = await self.store.create_job(
             "research_web",
             {"query": "private search"},
@@ -263,7 +268,9 @@ class RedisJobStoreTests(unittest.IsolatedAsyncioTestCase):
             await self.store.get_status(replacement["job_id"]),
         )
 
-    async def test_missing_job_hash_leaves_only_a_bounded_self_healing_active_index(self):
+    async def test_missing_job_hash_leaves_only_a_bounded_self_healing_active_index(
+        self,
+    ):
         payload = {"query": "recover missing hash"}
         first = await self.store.create_job(
             "research_web",
@@ -408,7 +415,9 @@ class RedisJobStoreTests(unittest.IsolatedAsyncioTestCase):
             lease_token=claimed["lease_token"],
         )
         self.assertFalse(requeued)
-        self.assertEqual((await self.store.get_status(created["job_id"]))["status"], CANCELLED)
+        self.assertEqual(
+            (await self.store.get_status(created["job_id"]))["status"], CANCELLED
+        )
         self.assertEqual(await self.redis.lrange(self.store.queue_key, 0, -1), [])
 
     async def test_cancellation_wins_atomic_race_with_worker_failure(self):
@@ -550,7 +559,9 @@ class RedisJobStoreTests(unittest.IsolatedAsyncioTestCase):
             datetime.now(timezone.utc).timestamp(),
         )
 
-    async def test_active_compensation_claim_defers_instead_of_invalidating_success(self):
+    async def test_active_compensation_claim_defers_instead_of_invalidating_success(
+        self,
+    ):
         created = await self.store.create_job("research_web", {"query": "race"})
         claimed = await self.store.claim_job(worker_id="worker-1")
         attempt_id = "e" * 64
@@ -633,7 +644,9 @@ class RedisJobStoreTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(await self.store.requeue_stale_jobs(60), 1)
         pending = await self.store.claim_due_ingestion_invalidations()
-        self.assertEqual([item["ingestion_attempt_id"] for item in pending], [attempt_id])
+        self.assertEqual(
+            [item["ingestion_attempt_id"] for item in pending], [attempt_id]
+        )
         record = await self.redis.hgetall(self.store._job_key(created["job_id"]))
         self.assertNotIn("ingestion_attempt_id", record)
 
@@ -663,11 +676,15 @@ class RedisJobStoreTests(unittest.IsolatedAsyncioTestCase):
         created = await self.store.create_job("research_web", {"query": "stale"})
         await self.store.claim_job(worker_id="dead-worker")
         old = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
-        await self.redis.hset(self.store._job_key(created["job_id"]), mapping={"heartbeat_at": old})
+        await self.redis.hset(
+            self.store._job_key(created["job_id"]), mapping={"heartbeat_at": old}
+        )
 
         count = await self.store.requeue_stale_jobs(stale_after_seconds=60)
         self.assertEqual(count, 1)
-        self.assertEqual((await self.store.get_status(created["job_id"]))["status"], "queued")
+        self.assertEqual(
+            (await self.store.get_status(created["job_id"]))["status"], "queued"
+        )
 
     async def test_stale_job_fails_after_max_attempts(self):
         self.store.max_attempts = 2
@@ -675,11 +692,15 @@ class RedisJobStoreTests(unittest.IsolatedAsyncioTestCase):
         old = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
 
         await self.store.claim_job(worker_id="worker-1")
-        await self.redis.hset(self.store._job_key(created["job_id"]), "heartbeat_at", old)
+        await self.redis.hset(
+            self.store._job_key(created["job_id"]), "heartbeat_at", old
+        )
         self.assertEqual(await self.store.requeue_stale_jobs(stale_after_seconds=60), 1)
 
         await self.store.claim_job(worker_id="worker-2")
-        await self.redis.hset(self.store._job_key(created["job_id"]), "heartbeat_at", old)
+        await self.redis.hset(
+            self.store._job_key(created["job_id"]), "heartbeat_at", old
+        )
         self.assertEqual(await self.store.requeue_stale_jobs(stale_after_seconds=60), 0)
 
         result = await self.store.get_result(created["job_id"])
@@ -689,7 +710,9 @@ class RedisJobStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(len(result["error"]["message"]), 1000)
         self.assertEqual(await self.redis.lrange(self.store.queue_key, 0, -1), [])
         self.assertEqual(await self.redis.lrange(self.store.processing_key, 0, -1), [])
-        self.assertGreater(await self.redis.ttl(self.store._job_key(created["job_id"])), 0)
+        self.assertGreater(
+            await self.redis.ttl(self.store._job_key(created["job_id"])), 0
+        )
 
     async def test_max_attempts_is_loaded_from_environment_with_safe_minimum(self):
         with patch.dict("job_store.os.environ", {"JOB_MAX_ATTEMPTS": "7"}):
@@ -706,7 +729,9 @@ class RedisJobStoreTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(clamped.max_attempts, 1)
 
-    async def test_active_job_ids_snapshots_queue_and_processing_with_safety_bound(self):
+    async def test_active_job_ids_snapshots_queue_and_processing_with_safety_bound(
+        self,
+    ):
         first = await self.store.create_job("research_web", {"query": "running"})
         second = await self.store.create_job("research_web", {"query": "queued"})
         await self.store.claim_job(worker_id="worker-1")
@@ -718,11 +743,177 @@ class RedisJobStoreTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(JobStoreError):
             await self.store.active_job_ids(limit=1)
 
+    async def test_active_artifact_owner_ids_include_cross_job_payload_dependencies(
+        self,
+    ):
+        parent_id = uuid.uuid4().hex
+        artifact_owner_id = uuid.uuid4().hex
+        additional_owner_id = uuid.uuid4().hex
+        child = await self.store.create_job(
+            "persist_research_source",
+            {
+                "parent_job_id": parent_id,
+                "artifact_owner_id": artifact_owner_id,
+                "artifact_owner_ids": [additional_owner_id, "not-a-job-id"],
+            },
+        )
+
+        self.assertEqual(
+            await self.store.active_artifact_owner_ids(),
+            {
+                child["job_id"],
+                parent_id,
+                artifact_owner_id,
+                additional_owner_id,
+            },
+        )
+
+    async def test_complete_job_with_children_atomically_succeeds(self):
+        parent = await self.store.create_job("research_web", {"query": "evidence"})
+        claimed = await self.store.claim_job(worker_id="worker-1")
+        child_ids = [uuid.uuid4().hex, uuid.uuid4().hex]
+        child_queue = "test:persistence"
+
+        completion = await self.store.complete_job_with_children(
+            parent["job_id"],
+            {"artifact_id": f"{parent['job_id']}:result"},
+            lease_token=claimed["lease_token"],
+            child_queue_name=child_queue,
+            child_jobs=[
+                {
+                    "job_id": child_id,
+                    "kind": "persist_research_source",
+                    "payload": {
+                        "parent_job_id": parent["job_id"],
+                        "artifact_owner_id": child_id,
+                    },
+                    "owner_id": "client-a",
+                }
+                for child_id in child_ids
+            ],
+        )
+
+        self.assertEqual(completion["status"], SUCCEEDED)
+        self.assertEqual(
+            {child["job_id"] for child in completion["children"]},
+            set(child_ids),
+        )
+        self.assertEqual(
+            (await self.store.get_result(parent["job_id"]))["result"],
+            {"artifact_id": f"{parent['job_id']}:result"},
+        )
+        self.assertEqual(await self.redis.lrange(self.store.processing_key, 0, -1), [])
+        self.assertEqual(
+            set(await self.redis.lrange(child_queue, 0, -1)),
+            set(child_ids),
+        )
+        child_store = RedisJobStore(
+            redis_client=self.redis,
+            queue_name=child_queue,
+            ingestion_waitaof_timeout_ms=0,
+        )
+        child_statuses = [
+            await child_store.get_status(child_id) for child_id in child_ids
+        ]
+        self.assertTrue(all(status["status"] == "queued" for status in child_statuses))
+        self.assertTrue(
+            all(status["owner_id"] == "client-a" for status in child_statuses)
+        )
+
+    async def test_complete_job_with_children_cancellation_wins(self):
+        parent = await self.store.create_job("research_web", {"query": "cancel"})
+        claimed = await self.store.claim_job(worker_id="worker-1")
+        await self.store.request_cancellation(parent["job_id"])
+        child_id = uuid.uuid4().hex
+        child_queue = "test:persistence"
+
+        completion = await self.store.complete_job_with_children(
+            parent["job_id"],
+            {"artifact_id": f"{parent['job_id']}:result"},
+            lease_token=claimed["lease_token"],
+            child_queue_name=child_queue,
+            child_jobs=[
+                {
+                    "job_id": child_id,
+                    "kind": "persist_research_source",
+                    "payload": {"artifact_owner_id": child_id},
+                }
+            ],
+        )
+
+        self.assertEqual(completion, {"status": CANCELLED, "children": []})
+        self.assertEqual(
+            (await self.store.get_result(parent["job_id"]))["status"],
+            CANCELLED,
+        )
+        self.assertEqual(await self.redis.lrange(child_queue, 0, -1), [])
+        self.assertFalse(await self.redis.exists(f"{child_queue}:job:{child_id}"))
+
+    async def test_complete_job_with_children_rejects_stale_lease(self):
+        parent = await self.store.create_job("research_web", {"query": "lease"})
+        await self.store.claim_job(worker_id="worker-1")
+        child_id = uuid.uuid4().hex
+        child_queue = "test:persistence"
+
+        with self.assertRaises(JobLeaseLostError):
+            await self.store.complete_job_with_children(
+                parent["job_id"],
+                {"artifact_id": f"{parent['job_id']}:result"},
+                lease_token="f" * 32,
+                child_queue_name=child_queue,
+                child_jobs=[
+                    {
+                        "job_id": child_id,
+                        "kind": "persist_research_source",
+                        "payload": {"artifact_owner_id": child_id},
+                    }
+                ],
+            )
+
+        self.assertEqual(
+            (await self.store.get_status(parent["job_id"]))["status"],
+            RUNNING,
+        )
+        self.assertEqual(await self.redis.lrange(child_queue, 0, -1), [])
+        self.assertFalse(await self.redis.exists(f"{child_queue}:job:{child_id}"))
+
+    async def test_complete_job_with_children_queue_full_leaves_parent_running(self):
+        self.store.max_queued_jobs = 1
+        parent = await self.store.create_job("research_web", {"query": "capacity"})
+        claimed = await self.store.claim_job(worker_id="worker-1")
+        child_id = uuid.uuid4().hex
+        child_queue = "test:persistence"
+        await self.redis.lpush(child_queue, uuid.uuid4().hex)
+
+        with self.assertRaises(JobQueueFullError):
+            await self.store.complete_job_with_children(
+                parent["job_id"],
+                {"artifact_id": f"{parent['job_id']}:result"},
+                lease_token=claimed["lease_token"],
+                child_queue_name=child_queue,
+                child_jobs=[
+                    {
+                        "job_id": child_id,
+                        "kind": "persist_research_source",
+                        "payload": {"artifact_owner_id": child_id},
+                    }
+                ],
+            )
+
+        self.assertEqual(
+            (await self.store.get_status(parent["job_id"]))["status"],
+            RUNNING,
+        )
+        self.assertEqual(await self.redis.llen(child_queue), 1)
+        self.assertFalse(await self.redis.exists(f"{child_queue}:job:{child_id}"))
+
     async def test_concurrent_stale_recovery_enqueues_exactly_once(self):
         created = await self.store.create_job("research_web", {"query": "stale"})
         await self.store.claim_job(worker_id="dead-worker")
         old = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
-        await self.redis.hset(self.store._job_key(created["job_id"]), mapping={"heartbeat_at": old})
+        await self.redis.hset(
+            self.store._job_key(created["job_id"]), mapping={"heartbeat_at": old}
+        )
 
         counts = await asyncio.gather(
             self.store.requeue_stale_jobs(stale_after_seconds=60),
@@ -736,19 +927,27 @@ class RedisJobStoreTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_restart_before_stale_eventually_recovers_prelease_move(self):
         created = await self.store.create_job("research_web", {"query": "orphaned"})
-        await self.redis.brpoplpush(self.store.queue_key, self.store.processing_key, timeout=1)
+        await self.redis.brpoplpush(
+            self.store.queue_key, self.store.processing_key, timeout=1
+        )
 
         self.assertEqual(await self.store.requeue_stale_jobs(stale_after_seconds=60), 0)
         old = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
-        await self.redis.hset(self.store._job_key(created["job_id"]), mapping={"updated_at": old})
+        await self.redis.hset(
+            self.store._job_key(created["job_id"]), mapping={"updated_at": old}
+        )
         self.assertEqual(await self.store.requeue_stale_jobs(stale_after_seconds=60), 1)
-        self.assertEqual((await self.store.get_status(created["job_id"]))["status"], "queued")
+        self.assertEqual(
+            (await self.store.get_status(created["job_id"]))["status"], "queued"
+        )
 
     async def test_stale_worker_cannot_heartbeat_or_finish_new_attempt(self):
         created = await self.store.create_job("research_web", {"query": "lease"})
         first = await self.store.claim_job(worker_id="worker-1")
         old = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
-        await self.redis.hset(self.store._job_key(created["job_id"]), mapping={"heartbeat_at": old})
+        await self.redis.hset(
+            self.store._job_key(created["job_id"]), mapping={"heartbeat_at": old}
+        )
         await self.store.requeue_stale_jobs(stale_after_seconds=60)
         second = await self.store.claim_job(worker_id="worker-2")
 
@@ -771,7 +970,9 @@ class RedisJobStoreTests(unittest.IsolatedAsyncioTestCase):
             {"attempt": 2},
             lease_token=second["lease_token"],
         )
-        self.assertEqual((await self.store.get_result(created["job_id"]))["result"], {"attempt": 2})
+        self.assertEqual(
+            (await self.store.get_result(created["job_id"]))["result"], {"attempt": 2}
+        )
 
     async def test_duplicate_queue_entries_produce_only_one_claim(self):
         created = await self.store.create_job("research_web", {"query": "once"})
@@ -785,7 +986,9 @@ class RedisJobStoreTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(claimed), 1)
         self.assertEqual(await self.redis.lrange(self.store.queue_key, 0, -1), [])
-        self.assertEqual(len(await self.redis.lrange(self.store.processing_key, 0, -1)), 1)
+        self.assertEqual(
+            len(await self.redis.lrange(self.store.processing_key, 0, -1)), 1
+        )
 
     async def test_owner_id_is_exposed_but_lease_is_not(self):
         created = await self.store.create_job(
@@ -809,12 +1012,16 @@ class RedisJobStoreTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(sum(isinstance(result, dict) for result in results), 1)
-        self.assertEqual(sum(isinstance(result, JobQueueFullError) for result in results), 1)
+        self.assertEqual(
+            sum(isinstance(result, JobQueueFullError) for result in results), 1
+        )
         self.assertEqual(await self.redis.llen(self.store.queue_key), 1)
 
     async def test_worker_heartbeats_are_isolated_by_worker_and_host(self):
         await self.store.record_worker_heartbeat("worker-a", host_id="host-a")
-        await self.store.record_worker_heartbeat("worker-b", state="busy", host_id="host-b")
+        await self.store.record_worker_heartbeat(
+            "worker-b", state="busy", host_id="host-b"
+        )
 
         worker_a = await self.store.get_worker_heartbeat(worker_id="worker-a")
         host_a = await self.store.get_worker_heartbeat(host_id="host-a")

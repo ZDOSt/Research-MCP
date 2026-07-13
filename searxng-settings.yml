@@ -1,4 +1,29 @@
-use_default_settings: true
+use_default_settings:
+  engines:
+    keep_only:
+      # Broad web discovery. Redundancy matters because keyless providers can
+      # rate-limit datacenter IPs independently.
+      - startpage
+      - bing
+      - mojeek
+      - qwant
+      # Current events.
+      - bing news
+      - mojeek news
+      - qwant news
+      - reuters
+      # Technical and software research.
+      - docker hub
+      - github
+      - mdn
+      - stackoverflow
+      - askubuntu
+      # Academic and primary research.
+      - arxiv
+      - pubmed
+      - semantic scholar
+      - openalex
+      - crossref
 
 general:
   instance_name: "Research MCP Search"
@@ -18,5 +43,26 @@ server:
   image_proxy: false
 
 outgoing:
-  request_timeout: 10.0
-  max_request_timeout: 30.0
+  request_timeout: 6.0
+  max_request_timeout: 12.0
+
+# These engines are disabled in the pinned upstream defaults. They are
+# explicitly activated here after keep_only has removed every unselected
+# provider. Do not add disabled overrides for omitted engines: SearXNG would
+# treat them as incomplete new engine definitions.
+engines:
+  - name: bing
+    disabled: false
+  - name: mojeek
+    disabled: false
+  - name: qwant
+    disabled: false
+  - name: mojeek news
+    disabled: false
+  - name: qwant news
+    disabled: false
+  - name: openalex
+    disabled: false
+  - name: crossref
+    disabled: false
+    timeout: 10.0
