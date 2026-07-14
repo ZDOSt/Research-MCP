@@ -658,6 +658,14 @@ class ComposeIsolationTests(unittest.TestCase):
             "${SEARCH_QUERY_CONCURRENCY:-2}",
         )
         self.assertEqual(
+            worker_environment["SEARCH_RELEVANCE_MIN_SCORE"],
+            "${SEARCH_RELEVANCE_MIN_SCORE:-0.28}",
+        )
+        self.assertEqual(
+            worker_environment["SEARCH_STAGE_MIN_RELEVANT_RATIO"],
+            "${SEARCH_STAGE_MIN_RELEVANT_RATIO:-0.75}",
+        )
+        self.assertEqual(
             worker_environment["SEARCH_CACHE_TTL_SECONDS"],
             "${SEARCH_CACHE_TTL_SECONDS:-600}",
         )

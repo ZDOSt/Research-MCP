@@ -116,9 +116,17 @@ SEARCH_DEEP_MAX_ENGINE_STAGES = max(
     SEARCH_MAX_ENGINE_STAGES,
     min(5, int(os.getenv("SEARCH_DEEP_MAX_ENGINE_STAGES", "4"))),
 )
+SEARCH_RELEVANCE_MIN_SCORE = max(
+    0.05,
+    min(0.95, float(os.getenv("SEARCH_RELEVANCE_MIN_SCORE", "0.28"))),
+)
+SEARCH_STAGE_MIN_RELEVANT_RATIO = max(
+    0.25,
+    min(1.0, float(os.getenv("SEARCH_STAGE_MIN_RELEVANT_RATIO", "0.75"))),
+)
 
-_SEARCH_CACHE_VERSION = 1
-_SEARCH_CACHE_PREFIX = "research:search-cache:v1:"
+_SEARCH_CACHE_VERSION = 2
+_SEARCH_CACHE_PREFIX = "research:search-cache:v2:"
 _SEARCH_ENGINE_CIRCUIT_PREFIX = "research:search-engine-circuit:v1:"
 _SEARCH_ENGINE_COOLDOWN_ZSET = f"{_SEARCH_ENGINE_CIRCUIT_PREFIX}cooldowns"
 _SEARX_SERVICE_CIRCUIT = "__searxng_service__"
@@ -369,6 +377,8 @@ def _search_cache_key(
         "policy": policy.to_dict(),
         "engine_stages": _engine_stages(policy, mode),
         "stage_min_results": SEARCH_STAGE_MIN_RESULTS,
+        "relevance_min_score": SEARCH_RELEVANCE_MIN_SCORE,
+        "stage_min_relevant_ratio": SEARCH_STAGE_MIN_RELEVANT_RATIO,
     }
     encoded = json.dumps(
         identity,
@@ -836,6 +846,15 @@ def _coverage_sufficient(results: SearchResults, max_results: int) -> bool:
     needed = min(max(0, max_results), SEARCH_STAGE_MIN_RESULTS)
     if needed <= 0 or len(results) < needed:
         return needed <= 0
+    relevance = results.diagnostics.get("topical_relevance")
+    if isinstance(relevance, dict):
+        relevant_needed = max(1, math.ceil(needed * SEARCH_STAGE_MIN_RELEVANT_RATIO))
+        relevant_count = int(relevance.get("relevant_count") or 0)
+        relevant_owners = int(relevance.get("distinct_relevant_owners") or 0)
+        return (
+            relevant_count >= relevant_needed
+            and relevant_owners >= min(2, relevant_needed)
+        )
     owners = {
         estimate_source_owner_domain(str(item.get("domain") or ""))
         for item in results
@@ -902,6 +921,104 @@ _EXPLICIT_LANGUAGE_RE = re.compile(
     r"\b(?:lang(?:uage)?):([a-z]{2,3}(?:-[a-z]{2})?)\b",
     re.I,
 )
+_ENGLISH_FUNCTION_WORDS = frozenset(
+    {
+        "about",
+        "and",
+        "are",
+        "can",
+        "could",
+        "did",
+        "do",
+        "does",
+        "for",
+        "from",
+        "how",
+        "into",
+        "is",
+        "my",
+        "not",
+        "out",
+        "should",
+        "than",
+        "that",
+        "the",
+        "their",
+        "there",
+        "these",
+        "this",
+        "those",
+        "what",
+        "when",
+        "where",
+        "which",
+        "who",
+        "why",
+        "with",
+        "without",
+        "would",
+        "your",
+    }
+)
+_ENGLISH_SEARCH_WORDS = frozenset(
+    {
+        "alternative",
+        "alternatives",
+        "benchmark",
+        "benchmarks",
+        "best",
+        "compare",
+        "comparison",
+        "configure",
+        "current",
+        "debug",
+        "deploy",
+        "documentation",
+        "docs",
+        "error",
+        "fix",
+        "guide",
+        "install",
+        "installation",
+        "latest",
+        "news",
+        "newest",
+        "powerful",
+        "release",
+        "releases",
+        "repository",
+        "review",
+        "reviews",
+        "setup",
+        "today",
+        "troubleshoot",
+        "versus",
+    }
+)
+_STRONG_ENGLISH_SEARCH_WORDS = frozenset(
+    {
+        "debug",
+        "docs",
+        "fix",
+        "install",
+        "latest",
+        "news",
+        "newest",
+        "powerful",
+        "repository",
+        "today",
+        "troubleshoot",
+        "weather",
+    }
+)
+_NON_ENGLISH_FUNCTION_WORD_GROUPS = (
+    frozenset({"der", "die", "das", "den", "dem", "des", "ein", "eine", "ist", "und", "oder", "wie"}),
+    frozenset({"le", "la", "les", "des", "une", "est", "et", "ou", "avec", "comment", "quel"}),
+    frozenset({"el", "la", "los", "las", "una", "es", "y", "con", "como", "cual", "que"}),
+    frozenset({"il", "lo", "la", "gli", "una", "con", "come", "quale", "che", "per"}),
+    frozenset({"o", "a", "os", "as", "uma", "com", "como", "qual", "que", "para"}),
+)
+_VALID_SEARCH_LANGUAGE_RE = re.compile(r"[a-z]{2,3}(?:-[a-z]{2})?", re.I)
 _MONTH_NAMES = (
     "January|February|March|April|May|June|July|August|September|October|"
     "November|December|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec"
@@ -912,6 +1029,9 @@ _DATE_EXPRESSION_PATTERN = (
     rf"(?:{_MONTH_NAMES})\s+\d{{1,2}}(?:st|nd|rd|th)?(?:,?\s+)(?:19|20)\d{{2}}|"
     rf"(?:{_MONTH_NAMES})\s+(?:19|20)\d{{2}}|"
     r"(?:19|20)\d{2}"
+)
+_MONTH_DAY_EXPRESSION_PATTERN = (
+    rf"(?:{_MONTH_NAMES})\s+\d{{1,2}}(?:st|nd|rd|th)?"
 )
 _AS_OF_DATE_RE = re.compile(
     rf"\bas\s+of\s+(?P<date>{_DATE_EXPRESSION_PATTERN})(?![\w/-])",
@@ -941,6 +1061,12 @@ _RANGE_DATE_RE = re.compile(
 _BETWEEN_DATE_RE = re.compile(
     rf"\bbetween\s+(?P<start>{_DATE_EXPRESSION_PATTERN})\s+and\s+"
     rf"(?P<end>{_DATE_EXPRESSION_PATTERN})(?![\w/-])",
+    re.I,
+)
+_SHARED_YEAR_RANGE_RE = re.compile(
+    rf"\bfrom\s+(?P<start>{_MONTH_DAY_EXPRESSION_PATTERN})\s+"
+    rf"(?:to|through|until|-)\s+(?P<end>{_MONTH_DAY_EXPRESSION_PATTERN})"
+    rf"(?:,?\s+)(?P<year>(?:19|20)\d{{2}})(?![\w/-])",
     re.I,
 )
 _IN_DATE_RE = re.compile(
@@ -1034,6 +1160,23 @@ def _matched_date_span(match: re.Match[str] | None, group: str = "date") -> tupl
     return _parse_date_span(match.group(group))
 
 
+def _matched_date_range_span(query: str) -> tuple[date, date] | None:
+    match = _RANGE_DATE_RE.search(query) or _BETWEEN_DATE_RE.search(query)
+    if match is not None:
+        start = _matched_date_span(match, "start")
+        end = _matched_date_span(match, "end")
+    else:
+        match = _SHARED_YEAR_RANGE_RE.search(query)
+        if match is None:
+            return None
+        year = match.group("year")
+        start = _parse_date_span(f'{match.group("start")} {year}')
+        end = _parse_date_span(f'{match.group("end")} {year}')
+    if start and end and start[0] <= end[1]:
+        return start[0], end[1]
+    return None
+
+
 def _publication_date_scope(query: str, news_intent: bool) -> bool:
     return news_intent or bool(_PUBLICATION_DATE_RE.search(query))
 
@@ -1077,6 +1220,68 @@ def _requested_max_age_days(query: str) -> int | None:
     return None
 
 
+def _normalized_search_language(language: object) -> str:
+    value = str(language or "auto").strip().replace("_", "-")
+    if value.casefold() in {"auto", "all"}:
+        return value.casefold()
+    if not _VALID_SEARCH_LANGUAGE_RE.fullmatch(value):
+        return "auto"
+    parts = value.split("-", 1)
+    return parts[0].lower() + (f"-{parts[1].upper()}" if len(parts) == 2 else "")
+
+
+def _query_is_clearly_english(query: str) -> bool:
+    """Conservatively identify English search prose without a language model."""
+
+    words = [
+        word.casefold()
+        for word in re.findall(r"[^\W\d_]+", unicodedata.normalize("NFKC", query))
+        if len(word) > 1
+    ]
+    if not words:
+        return False
+
+    letters = [character for character in query if character.isalpha()]
+    latin_letters = sum(
+        1
+        for character in letters
+        if "LATIN" in unicodedata.name(character, "")
+    )
+    if letters and latin_letters / len(letters) < 0.9:
+        return False
+
+    word_set = set(words)
+    if any(len(word_set & group) >= 2 for group in _NON_ENGLISH_FUNCTION_WORD_GROUPS):
+        return False
+
+    function_matches = len(word_set & _ENGLISH_FUNCTION_WORDS)
+    search_matches = len(word_set & _ENGLISH_SEARCH_WORDS)
+    strong_search_matches = len(word_set & _STRONG_ENGLISH_SEARCH_WORDS)
+    return (
+        function_matches >= 2
+        or (function_matches >= 1 and search_matches >= 1)
+        or strong_search_matches >= 1
+        or ("current" in word_set and search_matches >= 2)
+        or bool(re.search(r"\bmost\s+(?:powerful|recent|reliable|popular)\b", query, re.I))
+    )
+
+
+def _infer_query_language(query: str) -> str:
+    return "en" if _query_is_clearly_english(query) else "auto"
+
+
+def _accept_language_header(language: object) -> str:
+    normalized = _normalized_search_language(language)
+    if normalized in {"auto", "all"}:
+        return "*"
+    base = normalized.split("-", 1)[0]
+    if normalized == "en":
+        return "en-US,en;q=0.9,*;q=0.5"
+    if "-" in normalized:
+        return f"{normalized},{base};q=0.9,*;q=0.5"
+    return f"{normalized},*;q=0.5"
+
+
 def infer_search_policy(
     query: str,
     mode: str = "balanced",
@@ -1088,7 +1293,9 @@ def infer_search_policy(
     query = str(query or "")
     reference_date = _coerce_date(current_date)
     language_match = _EXPLICIT_LANGUAGE_RE.search(query)
-    language = language_match.group(1) if language_match else "auto"
+    language = _normalized_search_language(
+        language_match.group(1) if language_match else _infer_query_language(query)
+    )
     policy_timezone = _coerce_timezone_name(timezone_name)
 
     today = bool(_STRICT_TODAY_RE.search(query))
@@ -1098,7 +1305,6 @@ def infer_search_policy(
     since_match = _SINCE_DATE_RE.search(query)
     after_match = _AFTER_DATE_RE.search(query)
     before_match = _BEFORE_DATE_RE.search(query)
-    range_match = _RANGE_DATE_RE.search(query) or _BETWEEN_DATE_RE.search(query)
     in_date_match = _IN_DATE_RE.search(query)
     current = bool(_CURRENT_RE.search(query)) and as_of_match is None
     recent = bool(_RECENT_RE.search(query))
@@ -1150,12 +1356,7 @@ def infer_search_policy(
     after_span = _matched_date_span(after_match)
     before_span = _matched_date_span(before_match)
     in_date_span = _matched_date_span(in_date_match)
-    range_span = None
-    if range_match:
-        range_start = _matched_date_span(range_match, "start")
-        range_end = _matched_date_span(range_match, "end")
-        if range_start and range_end and range_start[0] <= range_end[1]:
-            range_span = (range_start[0], range_end[1])
+    range_span = _matched_date_range_span(query)
 
     this_year = bool(re.search(r"\bthis\s+year\b", query, re.I))
     last_year = bool(re.search(r"\blast\s+year\b", query, re.I))
@@ -1435,6 +1636,641 @@ def estimate_source_owner_domain(domain: str) -> str:
 
 def strip_text(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
+
+
+_TOPIC_TOKEN_RE = re.compile(r"[^\W_]+(?:[-.][^\W_]+)*", re.UNICODE)
+_TOPIC_STOP_WORDS = frozenset(
+    {
+        "a",
+        "about",
+        "after",
+        "all",
+        "also",
+        "an",
+        "and",
+        "answer",
+        "any",
+        "are",
+        "article",
+        "articles",
+        "as",
+        "at",
+        "authoritative",
+        "be",
+        "before",
+        "best",
+        "better",
+        "between",
+        "but",
+        "by",
+        "can",
+        "clear",
+        "concise",
+        "could",
+        "current",
+        "currently",
+        "did",
+        "do",
+        "does",
+        "each",
+        "find",
+        "for",
+        "from",
+        "give",
+        "good",
+        "how",
+        "i",
+        "identify",
+        "important",
+        "in",
+        "information",
+        "into",
+        "is",
+        "it",
+        "its",
+        "lang",
+        "language",
+        "latest",
+        "less",
+        "look",
+        "looking",
+        "me",
+        "more",
+        "most",
+        "my",
+        "need",
+        "new",
+        "newest",
+        "not",
+        "of",
+        "official",
+        "on",
+        "one",
+        "or",
+        "out",
+        "please",
+        "powerful",
+        "provide",
+        "rank",
+        "recent",
+        "recently",
+        "research",
+        "search",
+        "should",
+        "source",
+        "sources",
+        "summary",
+        "tell",
+        "than",
+        "that",
+        "the",
+        "their",
+        "them",
+        "there",
+        "these",
+        "thing",
+        "things",
+        "this",
+        "those",
+        "through",
+        "to",
+        "today",
+        "top",
+        "up",
+        "us",
+        "using",
+        "want",
+        "was",
+        "way",
+        "were",
+        "what",
+        "when",
+        "where",
+        "which",
+        "who",
+        "why",
+        "will",
+        "with",
+        "without",
+        "would",
+        "you",
+        "your",
+    }
+)
+_TOPIC_SYNONYM_ROOTS = {
+    "advanced": "advanced",
+    "applications": "app",
+    "application": "app",
+    "cats": "cat",
+    "canine": "dog",
+    "cordless": "wireless",
+    "corded": "wired",
+    "configure": "guidance",
+    "configured": "guidance",
+    "configuration": "guidance",
+    "configuring": "guidance",
+    "deploy": "guidance",
+    "deployment": "guidance",
+    "docs": "guidance",
+    "documentation": "guidance",
+    "guide": "guidance",
+    "install": "guidance",
+    "installation": "guidance",
+    "installed": "guidance",
+    "installing": "guidance",
+    "manual": "guidance",
+    "setup": "guidance",
+    "tutorial": "guidance",
+    "dogs": "dog",
+    "expert": "advanced",
+    "feline": "cat",
+    "gratis": "free",
+    "introductory": "beginner",
+    "novice": "beginner",
+    "no-cost": "free",
+    "plant-based": "vegan",
+    "plantbased": "vegan",
+    "premium": "paid",
+    "alternative": "comparison",
+    "alternatives": "comparison",
+    "benchmark": "comparison",
+    "benchmarks": "comparison",
+    "compare": "comparison",
+    "compared": "comparison",
+    "comparing": "comparison",
+    "review": "comparison",
+    "reviews": "comparison",
+    "versus": "comparison",
+}
+
+# A broad lexical match is not sufficient when the result explicitly substitutes
+# an opposing audience, product type, or hard qualifier. These groups are kept
+# deliberately small: they reject observed query drift without trying to model
+# arbitrary semantic entailment.
+_TOPIC_CONTRAST_GROUPS = (
+    (
+        frozenset(),
+        (frozenset({"vegan"}), frozenset({"chicken", "meat"})),
+    ),
+    (frozenset(), (frozenset({"wireless"}), frozenset({"wired"}))),
+    (frozenset(), (frozenset({"free"}), frozenset({"paid"}))),
+    (frozenset(), (frozenset({"indoor"}), frozenset({"outdoor"}))),
+    (frozenset(), (frozenset({"beginner"}), frozenset({"advanced"}))),
+    (frozenset(), (frozenset({"cat"}), frozenset({"dog"}))),
+    (
+        frozenset({"android", "tv"}),
+        (
+            frozenset({"box", "device", "hardware", "streamer"}),
+            frozenset({"app", "remote"}),
+        ),
+    ),
+)
+_GENERIC_TOPIC_ROOTS = frozenset(
+    {
+        "comparison",
+        "guidance",
+        "happening",
+        "headline",
+        "new",  # ``news`` after the deliberately small inflection normalizer.
+        "note",
+        "paper",
+        "post",
+        "publication",
+        "publish",
+        "release",
+        "report",
+        "source",
+        "study",
+    }
+)
+
+
+def _normalized_topic_token(token: str) -> str:
+    return unicodedata.normalize("NFKC", token).casefold().strip("-.")
+
+
+def _topic_script_group(character: str) -> str:
+    if not character.isalpha():
+        return ""
+    if character.isascii():
+        return "latin"
+    name = unicodedata.name(character, "")
+    if name == "KATAKANA-HIRAGANA PROLONGED SOUND MARK":
+        return ""
+    for marker, group in (
+        ("LATIN", "latin"),
+        ("HIRAGANA", "hiragana"),
+        ("KATAKANA", "katakana"),
+        ("CJK", "han"),
+        ("IDEOGRAPH", "han"),
+        ("HANGUL", "hangul"),
+    ):
+        if marker in name:
+            return group
+    return "other"
+
+
+def _split_topic_token(token: str) -> list[str]:
+    """Split mixed-script words while preserving model identifiers and punctuation."""
+
+    parts: list[str] = []
+    current: list[str] = []
+    current_group = ""
+    for character in token:
+        group = _topic_script_group(character)
+        if group and current_group and group != current_group:
+            parts.append("".join(current))
+            current = []
+        current.append(character)
+        if group:
+            current_group = group
+    if current:
+        parts.append("".join(current))
+    return parts
+
+
+_CJK_TOPIC_GROUPS = frozenset({"han", "hiragana", "katakana", "hangul"})
+_CJK_BIGRAM_MIN_COVERAGE = 0.30
+
+
+def _cjk_topic_bigrams(text: object, *, limit: int) -> list[str]:
+    """Extract bounded bigrams without crossing CJK script or text boundaries."""
+
+    normalized = unicodedata.normalize("NFKC", str(text or "")).casefold()
+    output: list[str] = []
+    seen: set[str] = set()
+    current: list[str] = []
+    current_group = ""
+
+    def flush() -> None:
+        nonlocal current
+        for index in range(max(0, len(current) - 1)):
+            bigram = "".join(current[index : index + 2])
+            if bigram in seen:
+                continue
+            seen.add(bigram)
+            output.append(bigram)
+            if len(output) >= limit:
+                break
+        current = []
+
+    for character in normalized:
+        group = _topic_script_group(character)
+        if group not in _CJK_TOPIC_GROUPS:
+            flush()
+            current_group = ""
+            if len(output) >= limit:
+                break
+            continue
+        if current_group and group != current_group:
+            flush()
+            if len(output) >= limit:
+                break
+        current.append(character)
+        current_group = group
+    if len(output) < limit:
+        flush()
+    return output[:limit]
+
+
+def _topic_term_root(term: str) -> str:
+    synonym = _TOPIC_SYNONYM_ROOTS.get(term)
+    if synonym:
+        return synonym
+    if len(term) < 4 or (any(char.isdigit() for char in term) and any(char.isalpha() for char in term)):
+        return term
+    if term.endswith("ies") and len(term) > 5:
+        return f"{term[:-3]}y"
+    if term.endswith(("ches", "shes", "sses", "xes", "zes")) and len(term) >= 5:
+        return term[:-2]
+    if term.endswith("ed") and len(term) > 5:
+        return term[:-1] if term[-3] == "e" else term[:-2]
+    if term.endswith("s") and not term.endswith(("ss", "us", "is")):
+        root = term[:-1]
+        return _TOPIC_SYNONYM_ROOTS.get(root, root)
+    return _TOPIC_SYNONYM_ROOTS.get(term, term)
+
+
+def _conflicting_topic_qualifiers(
+    query_roots: set[str],
+    document_roots: set[str],
+) -> list[dict[str, list[str]]]:
+    """Identify explicit substitutions while allowing comparisons and mixed uses."""
+
+    conflicts = []
+    for required_context, variants in _TOPIC_CONTRAST_GROUPS:
+        if not required_context <= query_roots:
+            continue
+        requested_variants = [variant for variant in variants if query_roots & variant]
+        # A query mentioning both sides is normally a comparison or a compound
+        # concept (for example, "vegan chicken"), so neither side is exclusive.
+        if len(requested_variants) != 1:
+            continue
+        requested = requested_variants[0]
+        if document_roots & requested:
+            continue
+        opposing = set().union(*(variant for variant in variants if variant != requested))
+        substituted = document_roots & opposing
+        if substituted:
+            conflicts.append(
+                {
+                    "requested": sorted(query_roots & requested),
+                    "substituted": sorted(substituted),
+                }
+            )
+    return conflicts
+
+
+def _semantically_matched_query_roots(
+    query_roots: set[str],
+    document_roots: set[str],
+) -> set[str]:
+    """Include same-variant qualifier aliases without equating opposing variants."""
+
+    matched = query_roots & document_roots
+    for required_context, variants in _TOPIC_CONTRAST_GROUPS:
+        if not required_context <= query_roots or not required_context <= document_roots:
+            continue
+        for variant in variants:
+            if query_roots & variant and document_roots & variant:
+                matched.update(query_roots & variant)
+    return matched
+
+
+def _topic_terms(text: object, *, query: bool = False) -> list[str]:
+    normalized = unicodedata.normalize("NFKC", str(text or ""))
+    output: list[str] = []
+    seen: set[str] = set()
+    raw_terms = (
+        part
+        for raw in _TOPIC_TOKEN_RE.findall(normalized)
+        for part in _split_topic_token(raw)
+    )
+    for raw in raw_terms:
+        term = _normalized_topic_token(raw)
+        if (
+            not term
+            or term in _TOPIC_STOP_WORDS
+            or term.isdigit()
+            or (
+                len(term) == 1
+                and (
+                    not term.isalpha()
+                    or "LATIN" in unicodedata.name(term, "")
+                )
+            )
+        ):
+            continue
+        root = _topic_term_root(term)
+        if root in seen:
+            continue
+        seen.add(root)
+        output.append(term)
+    if query and len(output) > 32:
+        ranked = sorted(
+            enumerate(output),
+            key=lambda item: (-_topic_term_weight(item[1]), item[0]),
+        )[:32]
+        output = [term for _, term in sorted(ranked)]
+    return output
+
+
+def _topic_term_weight(term: str) -> float:
+    has_alpha = any(character.isalpha() for character in term)
+    has_digit = any(character.isdigit() for character in term)
+    if has_alpha and has_digit:
+        return 2.2
+    if len(term) >= 10:
+        return 1.6
+    if len(term) >= 7:
+        return 1.35
+    if len(term) <= 2:
+        return 1.25
+    return 1.0
+
+
+def _distinctive_topic_terms(terms: list[str]) -> list[str]:
+    """Exclude research-form and intent words that cannot identify a subject."""
+
+    return [
+        term
+        for term in terms
+        if _topic_term_root(term) not in _GENERIC_TOPIC_ROOTS
+    ]
+
+
+def _result_topic_text(result: dict[str, Any]) -> str:
+    title = result.get("title") or ""
+    snippet = result.get("snippet") or result.get("content") or ""
+    raw_url = str(result.get("url") or "")
+    parsed = urlsplit(raw_url)
+    url_text = f"{parsed.hostname or ''} {parsed.path.replace('/', ' ')}"
+    return f"{title} {snippet} {url_text}"
+
+
+def search_result_relevance(
+    result: dict[str, Any],
+    query: str,
+    *,
+    threshold: float | None = None,
+) -> dict[str, Any]:
+    """Return bounded lexical topical relevance for a raw or compact result."""
+
+    resolved_threshold = (
+        SEARCH_RELEVANCE_MIN_SCORE if threshold is None else max(0.0, min(1.0, float(threshold)))
+    )
+    query_terms = _topic_terms(query, query=True)
+    if not query_terms:
+        return {
+            "score": 1.0,
+            "is_relevant": True,
+            "matched_terms": [],
+            "query_terms": [],
+            "distinctive_query_terms": [],
+            "matched_distinctive_terms": [],
+            "matched_phrases": [],
+            "threshold": round(resolved_threshold, 3),
+            "reason": "no_usable_query_terms",
+        }
+
+    document_terms = _topic_terms(_result_topic_text(result))
+    document_roots = {_topic_term_root(term) for term in document_terms}
+    query_roots = [_topic_term_root(term) for term in query_terms]
+    matched_terms = [
+        term
+        for term, root in zip(query_terms, query_roots, strict=True)
+        if root in document_roots
+    ]
+    matched_roots = {_topic_term_root(term) for term in matched_terms}
+    semantic_matched_roots = _semantically_matched_query_roots(
+        set(query_roots),
+        document_roots,
+    )
+    distinctive_query_terms = _distinctive_topic_terms(query_terms)
+    matched_distinctive_terms = [
+        term
+        for term in distinctive_query_terms
+        if _topic_term_root(term) in semantic_matched_roots
+    ]
+
+    query_phrases = [
+        (query_roots[index], query_roots[index + 1])
+        for index in range(len(query_roots) - 1)
+    ]
+    document_root_sequence = [_topic_term_root(term) for term in document_terms]
+    document_phrases = set(zip(document_root_sequence, document_root_sequence[1:]))
+    matched_phrase_roots = [phrase for phrase in query_phrases if phrase in document_phrases]
+    matched_phrases = [" ".join(phrase) for phrase in matched_phrase_roots[:10]]
+
+    total_weight = sum(_topic_term_weight(term) for term in query_terms)
+    matched_weight = sum(
+        _topic_term_weight(term)
+        for term in query_terms
+        if _topic_term_root(term) in matched_roots
+    )
+    coverage = matched_weight / total_weight if total_weight else 0.0
+    breadth = len(matched_terms) / min(3, len(query_terms))
+    phrase_score = min(1.0, len(matched_phrase_roots) / min(2, len(query_phrases))) if query_phrases else 0.0
+    identifier_match = any(
+        any(character.isalpha() for character in term)
+        and any(character.isdigit() for character in term)
+        for term in matched_terms
+    )
+    score = min(
+        1.0,
+        (coverage * 0.6)
+        + (breadth * 0.3)
+        + (phrase_score * 0.1)
+        + (0.12 if identifier_match else 0.0),
+    )
+    minimum_matches = 2 if len(query_terms) >= 4 and not identifier_match else 1
+    generic_only_overlap = bool(
+        matched_terms
+        and distinctive_query_terms
+        and not matched_distinctive_terms
+    )
+    topic_conflicts = _conflicting_topic_qualifiers(
+        set(query_roots),
+        document_roots,
+    )
+    is_relevant = (
+        score >= resolved_threshold
+        and len(matched_terms) >= minimum_matches
+        and not generic_only_overlap
+        and not topic_conflicts
+    )
+    cjk_overlap = None
+    cjk_rescue = False
+    if not is_relevant and not topic_conflicts:
+        query_cjk_bigrams = _cjk_topic_bigrams(query, limit=64)
+        if query_cjk_bigrams:
+            document_cjk_bigrams = set(
+                _cjk_topic_bigrams(_result_topic_text(result), limit=256)
+            )
+            matched_cjk_bigrams = [
+                bigram
+                for bigram in query_cjk_bigrams
+                if bigram in document_cjk_bigrams
+            ]
+            required_matches = min(2, len(query_cjk_bigrams))
+            cjk_coverage = len(matched_cjk_bigrams) / len(query_cjk_bigrams)
+            cjk_score = min(
+                1.0,
+                (cjk_coverage * 0.75)
+                + (min(1.0, len(matched_cjk_bigrams) / 4) * 0.25),
+            )
+            cjk_rescue = (
+                len(matched_cjk_bigrams) >= required_matches
+                and cjk_coverage >= _CJK_BIGRAM_MIN_COVERAGE
+                and cjk_score >= resolved_threshold
+            )
+            cjk_overlap = {
+                "query_bigram_count": len(query_cjk_bigrams),
+                "matched_bigram_count": len(matched_cjk_bigrams),
+                "matched_bigrams": matched_cjk_bigrams[:16],
+                "coverage": round(cjk_coverage, 3),
+                "score": round(cjk_score, 3),
+                "minimum_matches": required_matches,
+                "minimum_coverage": _CJK_BIGRAM_MIN_COVERAGE,
+                "used": cjk_rescue,
+            }
+            if cjk_rescue:
+                score = max(score, cjk_score)
+                is_relevant = True
+    reason = (
+        "conflicting_topic_qualifier"
+        if topic_conflicts
+        else "relevant_cjk_bigram_overlap"
+        if cjk_rescue
+        else "relevant_topic_overlap"
+        if is_relevant
+        else "generic_only_topic_overlap"
+        if generic_only_overlap
+        else "insufficient_topic_overlap"
+    )
+    analysis = {
+        "score": round(score, 3),
+        "is_relevant": is_relevant,
+        "matched_terms": matched_terms,
+        "query_terms": query_terms,
+        "distinctive_query_terms": distinctive_query_terms,
+        "matched_distinctive_terms": matched_distinctive_terms,
+        "matched_phrases": matched_phrases,
+        "threshold": round(resolved_threshold, 3),
+        "reason": reason,
+    }
+    if cjk_overlap is not None:
+        analysis["cjk_overlap"] = cjk_overlap
+    if topic_conflicts:
+        analysis["topic_conflicts"] = topic_conflicts
+    return analysis
+
+
+def topical_relevance_summary(
+    results,
+    query: str,
+    *,
+    threshold: float | None = None,
+) -> dict[str, Any]:
+    """Summarize relevance and owner diversity without discarding diagnostics."""
+
+    indexed_analyses = [
+        (index, search_result_relevance(result, query, threshold=threshold))
+        for index, result in enumerate(results)
+        if isinstance(result, dict)
+    ]
+    analyses = [analysis for _, analysis in indexed_analyses]
+    relevant_indexes = [
+        index for index, analysis in indexed_analyses if analysis["is_relevant"]
+    ]
+    relevant_owners = {
+        estimate_source_owner_domain(
+            str(results[index].get("domain") or get_domain(results[index].get("url") or ""))
+        )
+        for index in relevant_indexes
+    }
+    relevant_owners.discard("")
+    relevant_count = len(relevant_indexes)
+    result_count = len(analyses)
+    return {
+        "result_count": result_count,
+        "relevant_count": relevant_count,
+        "relevant_ratio": round(relevant_count / result_count, 3) if result_count else 0.0,
+        "distinct_relevant_owners": len(relevant_owners),
+        "relevant_indexes": relevant_indexes,
+        "scores": [analysis["score"] for analysis in analyses],
+        "threshold": round(
+            SEARCH_RELEVANCE_MIN_SCORE if threshold is None else max(0.0, min(1.0, float(threshold))),
+            3,
+        ),
+        "status": (
+            "no_results"
+            if not analyses
+            else "relevant"
+            if relevant_count
+            else "low_relevance"
+        ),
+    }
 
 
 def domain_matches(domain: str, candidate: str) -> bool:
@@ -1769,6 +2605,7 @@ def compact_search_results(
         if raw_published_at is not None and published is None:
             result["published_at_raw"] = strip_text(str(raw_published_at))[:200]
 
+        result["topical_relevance"] = search_result_relevance(result, query)
         result = score_search_result(result, query=query, mode=mode, policy=policy)
         existing = results_by_url.get(url)
         freshness_priority = {
@@ -1778,26 +2615,44 @@ def compact_search_results(
             "undated": 1,
             "outside_window": 0,
         }
+        relevance = result["topical_relevance"]
         result_key = (
+            bool(relevance.get("is_relevant")),
             freshness_priority.get(result.get("freshness_status"), 1),
             result.get("score", 0),
+            float(relevance.get("score") or 0.0),
         )
-        existing_key = (
-            freshness_priority.get(existing.get("freshness_status"), 1),
-            existing.get("score", 0),
-        ) if existing else (-1, float("-inf"))
+        if existing:
+            existing_relevance = existing.get("topical_relevance") or {}
+            existing_key = (
+                bool(existing_relevance.get("is_relevant")),
+                freshness_priority.get(existing.get("freshness_status"), 1),
+                existing.get("score", 0),
+                float(existing_relevance.get("score") or 0.0),
+            )
+        else:
+            existing_key = (False, -1.0, -1, float("-inf"))
         if result_key > existing_key:
             results_by_url[url] = result
 
     results = list(results_by_url.values())
-    results.sort(key=lambda item: item.get("score", 0), reverse=True)
+    results.sort(
+        key=lambda item: (
+            bool((item.get("topical_relevance") or {}).get("is_relevant")),
+            float(item.get("score", 0) or 0.0),
+            float((item.get("topical_relevance") or {}).get("score") or 0.0),
+        ),
+        reverse=True,
+    )
     limited = results[: max(0, max_results)]
     counts["eligible_results"] = len(results)
     counts["returned_results"] = len(limited)
     counts["accepted_results"] = len(limited)
+    relevance = topical_relevance_summary(limited, query)
     diagnostics = {
         "search_policy": policy.to_dict(),
         "counts": counts,
+        "topical_relevance": relevance,
     }
     return SearchResults(limited, diagnostics=diagnostics, policy=policy)
 
@@ -2145,7 +3000,14 @@ async def _staged_searxng_search(
                 mode=mode,
                 policy=policy,
             )
-            if _coverage_sufficient(interim, max_results):
+            stage_diagnostic["topical_relevance"] = copy.deepcopy(
+                interim.diagnostics["topical_relevance"]
+            )
+            stage_diagnostic["coverage_sufficient"] = _coverage_sufficient(
+                interim,
+                max_results,
+            )
+            if stage_diagnostic["coverage_sufficient"]:
                 break
 
     results = compact_search_results(
@@ -2204,7 +3066,7 @@ async def _searxng_stage_request(
     params = {
         "q": query,
         "format": "json",
-        "language": policy.language,
+        "language": _normalized_search_language(policy.language),
         "engines": ",".join(validated_engines),
     }
     if policy.time_range:
@@ -2214,6 +3076,7 @@ async def _searxng_stage_request(
         "GET",
         f"{base_url}/search",
         params=params,
+        headers={"Accept-Language": _accept_language_header(policy.language)},
     ) as response:
         try:
             response.raise_for_status()

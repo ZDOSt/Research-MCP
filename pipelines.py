@@ -1,10 +1,12 @@
 import asyncio
 import hashlib
+import math
 import os
 import re
 import time
 import uuid
 from dataclasses import replace
+from statistics import median
 from typing import Dict, List, Optional
 from urllib.parse import urljoin
 
@@ -28,7 +30,9 @@ from searching import (
     infer_search_policy,
     normalize_domain,
     normalize_search_url,
+    search_result_relevance,
     searxng_search,
+    topical_relevance_summary,
 )
 from planner import (
     build_research_plan,
@@ -36,6 +40,7 @@ from planner import (
     fallback_search_query,
     synthesize_report,
 )
+from query_hints import normalize_proposed_queries
 from redaction import redact_sensitive_text
 from shared import (
     DEFAULT_NAMESPACE,
@@ -77,9 +82,7 @@ SEARCH_RERANKER_MAX_CANDIDATES = max(
 
 
 def _validated_search_query_concurrency(value: Optional[str] = None) -> int:
-    raw_value = (
-        os.getenv("SEARCH_QUERY_CONCURRENCY", "2") if value is None else value
-    )
+    raw_value = os.getenv("SEARCH_QUERY_CONCURRENCY", "2") if value is None else value
     try:
         concurrency = int(raw_value)
     except (TypeError, ValueError) as exc:
@@ -109,12 +112,64 @@ def _validated_source_concurrency(value: Optional[str] = None) -> int:
 SEARCH_QUERY_CONCURRENCY = _validated_search_query_concurrency()
 RESEARCH_SOURCE_CONCURRENCY = _validated_source_concurrency()
 CORROBORATION_STOP_WORDS = {
-    "about", "after", "also", "and", "are", "because", "been", "before", "being",
-    "between", "both", "but", "can", "could", "does", "each", "for", "from", "had",
-    "has", "have", "into", "its", "more", "most", "not", "only", "other", "our", "over",
-    "same", "should", "some", "such", "than", "that", "the", "their", "there", "these",
-    "they", "this", "those", "through", "under", "using", "was", "were", "what", "when",
-    "where", "which", "while", "will", "with", "would", "you", "your",
+    "about",
+    "after",
+    "also",
+    "and",
+    "are",
+    "because",
+    "been",
+    "before",
+    "being",
+    "between",
+    "both",
+    "but",
+    "can",
+    "could",
+    "does",
+    "each",
+    "for",
+    "from",
+    "had",
+    "has",
+    "have",
+    "into",
+    "its",
+    "more",
+    "most",
+    "not",
+    "only",
+    "other",
+    "our",
+    "over",
+    "same",
+    "should",
+    "some",
+    "such",
+    "than",
+    "that",
+    "the",
+    "their",
+    "there",
+    "these",
+    "they",
+    "this",
+    "those",
+    "through",
+    "under",
+    "using",
+    "was",
+    "were",
+    "what",
+    "when",
+    "where",
+    "which",
+    "while",
+    "will",
+    "with",
+    "would",
+    "you",
+    "your",
 }
 PRODUCT_URL_RE = re.compile(
     r"/(?:product|products|part|parts|catalog|p)/[^/?#]+",
@@ -131,6 +186,7 @@ def _compact_search_diagnostics(
     query: str,
     outcome: object,
     phase: str,
+    query_role: Optional[str] = None,
 ) -> Optional[dict]:
     """Copy bounded, non-content diagnostics from a SearchResults instance."""
     raw = getattr(outcome, "diagnostics", None)
@@ -141,6 +197,8 @@ def _compact_search_diagnostics(
         "query": _truncate_text(query, 300),
         "phase": phase,
     }
+    if query_role:
+        output["query_role"] = query_role
     policy = raw.get("search_policy")
     if isinstance(policy, dict):
         categories = policy.get("categories")
@@ -252,9 +310,7 @@ def _compact_search_diagnostics(
                     3,
                 )
             if isinstance(cache.get("freshness_unverified"), bool):
-                compact_cache["freshness_unverified"] = cache[
-                    "freshness_unverified"
-                ]
+                compact_cache["freshness_unverified"] = cache["freshness_unverified"]
             if cache.get("warning"):
                 compact_cache["warning"] = _safe_error_detail(
                     cache["warning"],
@@ -272,8 +328,7 @@ def _compact_search_diagnostics(
                 "stage": max(0, min(int(stage.get("stage") or 0), 20)),
                 "status": str(stage.get("status") or "")[:60],
                 "engines": [
-                    str(engine)[:100]
-                    for engine in (stage.get("engines") or [])[:10]
+                    str(engine)[:100] for engine in (stage.get("engines") or [])[:10]
                 ],
             }
             for key in (
@@ -332,12 +387,22 @@ def _candidate_rank_key(item: dict) -> tuple:
     has_rerank_score = (
         isinstance(rerank_score, (int, float))
         and not isinstance(rerank_score, bool)
+        and math.isfinite(float(rerank_score))
     )
     return (
         1 if has_rerank_score else 0,
         float(rerank_score) if has_rerank_score else 0.0,
         float(item.get("score", 0) or 0),
     )
+
+
+def _candidate_intents(item: dict) -> list[str]:
+    relevance = item.get("topical_relevance")
+    if isinstance(relevance, dict) and "relevant_intents" in relevance:
+        return [
+            str(value) for value in relevance.get("relevant_intents") or () if value
+        ]
+    return [str(value) for value in item.get("matched_intents") or () if value]
 
 
 def _select_candidates(
@@ -354,7 +419,7 @@ def _select_candidates(
         uncovered = [
             item
             for item in candidates
-            if set(item.get("matched_intents") or ()) - excluded_intents
+            if set(_candidate_intents(item)) - excluded_intents
         ]
         if uncovered:
             eligible = uncovered
@@ -404,7 +469,7 @@ def _build_candidate_pool(
             (
                 item
                 for item in ranked
-                if intent_id in (item.get("matched_intents") or ())
+                if intent_id in _candidate_intents(item)
                 and item.get("url") not in selected_urls
             ),
             None,
@@ -413,7 +478,7 @@ def _build_candidate_pool(
             continue
         selected.append(candidate)
         selected_urls.add(candidate.get("url"))
-        covered_intents.update(candidate.get("matched_intents") or ())
+        covered_intents.update(_candidate_intents(candidate))
         if len(selected) >= limit:
             break
 
@@ -482,6 +547,7 @@ async def _rerank_search_candidates(
             and 0 <= index < len(limited)
             and isinstance(score, (int, float))
             and not isinstance(score, bool)
+            and math.isfinite(float(score))
         ):
             scored[index] = float(score)
     if not scored:
@@ -611,42 +677,117 @@ async def _run_search_batch_bounded(
     outcomes: list[object] = [
         TimeoutError("research search budget exhausted") for _ in queries
     ]
-    done, pending = await asyncio.wait(tasks, timeout=max(0.0, timeout_seconds))
-    for task in done:
-        index = task_indexes[task]
-        try:
-            outcomes[index] = task.result()
-        except asyncio.CancelledError:
-            outcomes[index] = TimeoutError("research search was cancelled")
-        except Exception as exc:
-            outcomes[index] = exc
-    if pending:
-        await _cancel_tasks_bounded(list(pending), timeout_seconds=0.1)
-    return outcomes
+    try:
+        done, _ = await asyncio.wait(tasks, timeout=max(0.0, timeout_seconds))
+        for task in done:
+            index = task_indexes[task]
+            try:
+                outcomes[index] = task.result()
+            except asyncio.CancelledError:
+                outcomes[index] = TimeoutError("research search was cancelled")
+            except Exception as exc:
+                outcomes[index] = exc
+        return outcomes
+    finally:
+        await _cancel_tasks_bounded(tasks, timeout_seconds=0.1)
 
 
-def _partition_search_query_waves(
+def _validated_query_roles(
+    queries: list[str],
+    intent_ids: list[str],
+    query_roles: object,
+) -> Optional[list[str]]:
+    """Return complete role metadata or fall back to legacy scheduling."""
+    allowed_query_roles = {
+        "calling_model",
+        "semantic_expansion",
+        "deterministic",
+    }
+    if (
+        not isinstance(query_roles, list)
+        or len(query_roles) != len(queries)
+        or len(intent_ids) != len(queries)
+        or any(
+            not isinstance(role, str) or role not in allowed_query_roles
+            for role in query_roles
+        )
+    ):
+        return None
+
+    roles = list(query_roles)
+    for intent_id in unique_preserve_order(intent_ids):
+        intent_roles = [
+            role
+            for role, query_intent_id in zip(roles, intent_ids)
+            if query_intent_id == intent_id
+        ]
+        if "semantic_expansion" in intent_roles and "deterministic" not in intent_roles:
+            return None
+    return roles
+
+
+def _partition_search_query_indexes(
     queries: list[str],
     policies: list[object],
     intent_ids: list[str],
     *,
     max_reserve_per_intent: int = 1,
-) -> tuple[list[tuple[str, object, str]], list[list[tuple[str, object, str]]]]:
-    """Build one primary wave followed by ordered per-intent reserve waves."""
-    primary: list[tuple[str, object, str]] = []
-    reserve_by_intent: dict[str, list[tuple[str, object, str]]] = {}
+    query_roles: object = None,
+) -> tuple[list[int], list[list[int]], Optional[list[str]]]:
+    """Build bounded primary and reserve waves while preserving legacy behavior."""
+    roles = _validated_query_roles(queries, intent_ids, query_roles)
+    if len(policies) != len(queries):
+        roles = None
+    primary_indexes: set[int] = set()
+    role_primary_intents: set[str] = set()
+    if roles is not None:
+        indexes_by_intent: dict[str, list[int]] = {}
+        for index, intent_id in enumerate(intent_ids):
+            indexes_by_intent.setdefault(intent_id, []).append(index)
+        for intent_id, indexes in indexes_by_intent.items():
+            semantic_index = next(
+                (index for index in indexes if roles[index] == "semantic_expansion"),
+                None,
+            )
+            deterministic_index = next(
+                (index for index in indexes if roles[index] == "deterministic"),
+                None,
+            )
+            if semantic_index is not None and deterministic_index is not None:
+                primary_indexes.update((semantic_index, deterministic_index))
+                role_primary_intents.add(intent_id)
+
+    primary: list[int] = []
+    reserve_by_intent: dict[str, list[int]] = {}
     primary_intents: set[str] = set()
     primary_intent_order: list[str] = []
-    for query, policy, intent_id in zip(queries, policies, intent_ids):
-        entry = (query, policy, intent_id)
-        if intent_id not in primary_intents:
-            primary.append(entry)
-            primary_intents.add(intent_id)
-            primary_intent_order.append(intent_id)
+    for index, (_query, _policy, intent_id) in enumerate(
+        zip(queries, policies, intent_ids)
+    ):
+        role_aware_intent = intent_id in role_primary_intents
+        if index in primary_indexes or (
+            not role_aware_intent and intent_id not in primary_intents
+        ):
+            primary.append(index)
+            if intent_id not in primary_intents:
+                primary_intents.add(intent_id)
+                primary_intent_order.append(intent_id)
         else:
             reserves = reserve_by_intent.setdefault(intent_id, [])
-            if len(reserves) < max(0, max_reserve_per_intent):
-                reserves.append(entry)
+            if role_aware_intent or len(reserves) < max(0, max_reserve_per_intent):
+                reserves.append(index)
+    if roles is not None:
+        for intent_id in role_primary_intents:
+            reserves = reserve_by_intent.get(intent_id, [])
+            deterministic_reserves = [
+                index for index in reserves if roles[index] == "deterministic"
+            ]
+            other_reserves = [
+                index for index in reserves if roles[index] != "deterministic"
+            ]
+            reserve_by_intent[intent_id] = (deterministic_reserves + other_reserves)[
+                : max(0, max_reserve_per_intent)
+            ]
     reserve_waves = [
         [
             reserve_by_intent[intent_id][index]
@@ -657,56 +798,547 @@ def _partition_search_query_waves(
             max((len(items) for items in reserve_by_intent.values()), default=0)
         )
     ]
-    return primary, reserve_waves
+    return primary, reserve_waves, roles
+
+
+def _partition_search_query_waves(
+    queries: list[str],
+    policies: list[object],
+    intent_ids: list[str],
+    *,
+    max_reserve_per_intent: int = 1,
+    query_roles: object = None,
+) -> tuple[list[tuple[str, object, str]], list[list[tuple[str, object, str]]]]:
+    """Build one primary wave followed by ordered per-intent reserve waves."""
+    primary_indexes, reserve_indexes, _roles = _partition_search_query_indexes(
+        queries,
+        policies,
+        intent_ids,
+        max_reserve_per_intent=max_reserve_per_intent,
+        query_roles=query_roles,
+    )
+    entries = list(zip(queries, policies, intent_ids))
+    return (
+        [entries[index] for index in primary_indexes],
+        [
+            [entries[index] for index in reserve_wave]
+            for reserve_wave in reserve_indexes
+        ],
+    )
 
 
 def _search_outcome_has_source_coverage(
     outcome: object,
     *,
+    query: str,
     min_results: int = 2,
     min_owners: int = 2,
 ) -> bool:
     if isinstance(outcome, Exception) or not isinstance(outcome, (list, tuple)):
         return False
-    owners = set()
-    result_urls = set()
-    for item in outcome:
+    relevance = topical_relevance_summary(outcome, query)
+    relevant_indexes = {
+        index
+        for index in relevance.get("relevant_indexes") or ()
+        if _pipeline_result_relevance(outcome[index], query).get("is_relevant")
+    }
+    owners: set[str] = set()
+    result_urls: set[str] = set()
+    for index, item in enumerate(outcome):
+        if index not in relevant_indexes:
+            continue
         if not isinstance(item, dict):
             continue
         url = normalize_search_url(str(item.get("url") or ""))
         if url:
             result_urls.add(url)
-        domain = normalize_domain(
-            str(item.get("domain") or get_domain(url))
-        )
+        domain = normalize_domain(str(item.get("domain") or get_domain(url)))
         owner = estimate_source_owner_domain(domain)
         if owner:
             owners.add(owner)
     return len(result_urls) >= min_results and len(owners) >= min_owners
 
 
+def _pipeline_result_relevance(candidate: dict, query: str) -> dict:
+    return search_result_relevance(candidate, query)
+
+
+def _canonical_result_relevance(
+    candidate: dict,
+    canonical_context: str,
+    *,
+    executed_query: Optional[str] = None,
+) -> dict:
+    analysis = _pipeline_result_relevance(candidate, canonical_context)
+    if not analysis.get("is_relevant") or not executed_query:
+        return analysis
+    if (
+        executed_query.strip().rstrip(".,!?;:").casefold()
+        == canonical_context.strip().rstrip(".,!?;:").casefold()
+    ):
+        return analysis
+
+    distinctive_terms = {
+        str(term).casefold() for term in analysis.get("distinctive_query_terms") or ()
+    }
+    matched_distinctive_terms = {
+        str(term).casefold() for term in analysis.get("matched_distinctive_terms") or ()
+    }
+    if distinctive_terms and analysis.get("reason") != "relevant_cjk_bigram_overlap":
+        required_distinctive_matches = (
+            len(distinctive_terms)
+            if len(distinctive_terms) <= 4
+            else max(2, math.ceil(len(distinctive_terms) * 0.6))
+        )
+        if (
+            len(distinctive_terms & matched_distinctive_terms)
+            < required_distinctive_matches
+        ):
+            output = dict(analysis)
+            output["is_relevant"] = False
+            output["reason"] = "insufficient_canonical_distinctive_overlap"
+            return output
+
+    ignored_context_terms = {
+        "configure",
+        "current",
+        "explain",
+        "find",
+        "fix",
+        "guide",
+        "how",
+        "install",
+        "latest",
+        "setup",
+        "using",
+    }
+    canonical_terms = {
+        str(term).casefold()
+        for term in analysis.get("query_terms") or ()
+        if str(term).casefold() not in ignored_context_terms
+        and not re.fullmatch(r"\d{4}(?:-\d{2}-\d{2})?", str(term))
+    }
+    matched_terms = {
+        str(term).casefold() for term in analysis.get("matched_terms") or ()
+    }
+    minimum_matches = min(2, len(canonical_terms))
+    if minimum_matches and len(canonical_terms & matched_terms) < minimum_matches:
+        output = dict(analysis)
+        output["is_relevant"] = False
+        output["reason"] = "insufficient_canonical_intent_overlap"
+        return output
+    return analysis
+
+
 def _resolved_search_intents(
+    queries: list[str],
     intent_ids: list[str],
     outcomes: list[object],
     *,
     mode: str,
+    intent_contexts: Optional[dict[str, str]] = None,
+    strict_intent_ids: Optional[set[str]] = None,
+    query_roles: Optional[list[Optional[str]]] = None,
 ) -> set[str]:
     grouped: dict[str, list[dict]] = {}
-    for intent_id, outcome in zip(intent_ids, outcomes):
+    roles = (
+        query_roles
+        if isinstance(query_roles, list) and len(query_roles) == len(queries)
+        else [None] * len(queries)
+    )
+    for search_query, intent_id, outcome, query_role in zip(
+        queries,
+        intent_ids,
+        outcomes,
+        roles,
+    ):
+        if query_role == "semantic_expansion":
+            continue
         if isinstance(outcome, (list, tuple)):
+            strict_context = intent_id in (strict_intent_ids or set())
+            canonical_context = str(
+                (intent_contexts or {}).get(intent_id) or search_query
+                if strict_context
+                else search_query
+            )
+            relevance = topical_relevance_summary(outcome, canonical_context)
+            relevant_indexes = {
+                index
+                for index in relevance.get("relevant_indexes") or ()
+                if _canonical_result_relevance(
+                    outcome[index],
+                    canonical_context,
+                    executed_query=(search_query if strict_context else None),
+                ).get("is_relevant")
+            }
             grouped.setdefault(intent_id, []).extend(
-                item for item in outcome if isinstance(item, dict)
+                item
+                for index, item in enumerate(outcome)
+                if index in relevant_indexes and isinstance(item, dict)
             )
     min_results, min_owners = (6, 3) if mode == "deep" else (2, 2)
-    return {
-        intent_id
-        for intent_id, candidates in grouped.items()
-        if _search_outcome_has_source_coverage(
-            candidates,
-            min_results=min_results,
-            min_owners=min_owners,
+    resolved = set()
+    for intent_id, candidates in grouped.items():
+        urls = {
+            normalize_search_url(str(item.get("url") or ""))
+            for item in candidates
+            if normalize_search_url(str(item.get("url") or ""))
+        }
+        owners = {
+            estimate_source_owner_domain(
+                normalize_domain(
+                    str(
+                        item.get("domain")
+                        or get_domain(normalize_search_url(str(item.get("url") or "")))
+                    )
+                )
+            )
+            for item in candidates
+        }
+        owners.discard("")
+        if len(urls) >= min_results and len(owners) >= min_owners:
+            resolved.add(intent_id)
+    return resolved
+
+
+def _candidate_query_contexts(
+    candidate: dict,
+    query: str,
+    *,
+    intent_id: Optional[str] = None,
+) -> list[str]:
+    associations = [
+        item
+        for item in candidate.get("matched_query_intents") or ()
+        if isinstance(item, dict)
+        and str(item.get("query") or "").strip()
+        and (intent_id is None or str(item.get("intent_id") or "") == intent_id)
+    ]
+    if associations:
+        contexts = [
+            str(
+                item.get("intent_context")
+                if item.get("strict_intent_context")
+                else item["query"]
+            )
+            for item in associations
+        ]
+    elif intent_id is not None:
+        if intent_id not in (candidate.get("matched_intents") or ()):
+            return []
+        contexts = [
+            str(value)
+            for value in candidate.get("matched_queries") or ()
+            if str(value).strip()
+        ]
+    else:
+        contexts = [
+            str(value)
+            for value in candidate.get("matched_queries") or ()
+            if str(value).strip()
+        ]
+    if intent_id is None:
+        contexts.insert(0, query)
+    return unique_preserve_order(contexts)
+
+
+def _candidate_topical_relevance(
+    candidate: dict,
+    query: str,
+    *,
+    intent_id: Optional[str] = None,
+) -> dict:
+    """Assess a candidate against its request or one specific planned intent."""
+    associations = [
+        item
+        for item in candidate.get("matched_query_intents") or ()
+        if isinstance(item, dict)
+        and str(item.get("query") or "").strip()
+        and (intent_id is None or str(item.get("intent_id") or "") == intent_id)
+    ]
+    if associations:
+        assessments = [
+            _canonical_result_relevance(
+                candidate,
+                str(
+                    item.get("intent_context")
+                    if item.get("strict_intent_context")
+                    else item["query"]
+                ),
+                executed_query=(
+                    str(item["query"]) if item.get("strict_intent_context") else None
+                ),
+            )
+            for item in associations
+        ]
+    else:
+        assessments = []
+    candidate_queries = _candidate_query_contexts(
+        candidate,
+        query,
+        intent_id=intent_id,
+    )
+    if not associations:
+        assessments.extend(
+            _pipeline_result_relevance(candidate, candidate_query)
+            for candidate_query in candidate_queries
+            if candidate_query.strip()
         )
+    if not assessments:
+        return {
+            "score": 0.0,
+            "is_relevant": False,
+            "matched_terms": [],
+            "matched_phrases": [],
+            "threshold": 1.0,
+            "reason": "no_query_terms",
+        }
+    return max(
+        assessments,
+        key=lambda item: (
+            bool(item.get("is_relevant")),
+            float(item.get("score") or 0.0),
+        ),
+    )
+
+
+def _candidate_relevant_intents(candidate: dict, query: str) -> list[str]:
+    intent_ids = unique_preserve_order(
+        [
+            str(item.get("intent_id") or "")
+            for item in candidate.get("matched_query_intents") or ()
+            if isinstance(item, dict) and item.get("intent_id")
+        ]
+        + [str(value) for value in candidate.get("matched_intents") or () if value]
+    )
+    return [
+        intent_id
+        for intent_id in intent_ids
+        if _candidate_topical_relevance(
+            candidate,
+            query,
+            intent_id=intent_id,
+        ).get("is_relevant")
+    ]
+
+
+def _candidate_relevance_summary(candidates: list[dict], query: str) -> dict:
+    relevant_indexes = []
+    relevant_owners = set()
+    scores = []
+    for index, candidate in enumerate(candidates):
+        relevance = _candidate_topical_relevance(candidate, query)
+        scores.append(round(float(relevance.get("score") or 0.0), 4))
+        if not relevance.get("is_relevant"):
+            continue
+        relevant_indexes.append(index)
+        owner = _candidate_owner(candidate)
+        if owner:
+            relevant_owners.add(owner)
+    return {
+        "result_count": len(candidates),
+        "relevant_count": len(relevant_indexes),
+        "relevant_ratio": round(len(relevant_indexes) / len(candidates), 4)
+        if candidates
+        else 0.0,
+        "distinct_relevant_owners": len(relevant_owners),
+        "relevant_indexes": relevant_indexes,
+        "scores": scores,
+        "status": (
+            "sufficient"
+            if relevant_indexes
+            else "low_relevance"
+            if candidates
+            else "insufficient"
+        ),
     }
+
+
+def _distinct_semantic_recovery_query(
+    source_query: str,
+    *,
+    current_date: Optional[str],
+    existing_query_keys: set[str],
+) -> str:
+    """Build one distinct repair query while retaining the intent's date language."""
+    compact = fallback_search_query(source_query, current_date=current_date).strip()
+    unquoted = re.sub(r'["\u201c\u201d]+', "", compact).strip()
+    candidates = [compact, unquoted]
+    for base, qualifier in (
+        (unquoted or compact, "primary sources"),
+        (unquoted or compact, "independent sources"),
+    ):
+        if base:
+            candidates.append(f"{base[:160].rstrip()} {qualifier}"[:180].strip())
+    return next(
+        (
+            candidate
+            for candidate in unique_preserve_order(candidates)
+            if candidate and candidate.casefold() not in existing_query_keys
+        ),
+        "",
+    )
+
+
+def _candidate_matches_intent(candidate: dict, intent_id: str) -> bool:
+    return intent_id in (candidate.get("matched_intents") or ())
+
+
+def _candidate_has_authoritative_intent_match(
+    candidate: dict,
+    intent_id: str,
+) -> bool:
+    associations = [
+        item
+        for item in candidate.get("matched_query_intents") or ()
+        if isinstance(item, dict) and item.get("intent_id") == intent_id
+    ]
+    if not associations or not any("query_role" in item for item in associations):
+        return True
+    return any(item.get("query_role") != "semantic_expansion" for item in associations)
+
+
+def _intent_web_coverage(
+    intent_ids: list[str],
+    candidates: list[dict],
+    web_evidence: list[dict],
+) -> dict:
+    evidence_urls = {
+        normalize_search_url(str(value or ""))
+        for item in web_evidence
+        for value in (item.get("url"), item.get("requested_url"))
+        if value
+    }
+    coverage = {}
+    for intent_id in intent_ids:
+        relevant_candidates = [
+            candidate
+            for candidate in candidates
+            if intent_id
+            in (
+                (candidate.get("topical_relevance") or {}).get("relevant_intents") or ()
+            )
+            and _candidate_has_authoritative_intent_match(candidate, intent_id)
+        ]
+        evidence_candidates = [
+            candidate
+            for candidate in relevant_candidates
+            if normalize_search_url(str(candidate.get("url") or "")) in evidence_urls
+        ]
+        owners = {_candidate_owner(candidate) for candidate in evidence_candidates}
+        owners.discard("")
+        coverage[intent_id] = {
+            "status": "resolved" if evidence_candidates else "unresolved",
+            "relevant_candidates": len(relevant_candidates),
+            "evidence_items": len(evidence_candidates),
+            "distinct_source_owners_estimate": len(owners),
+        }
+    return coverage
+
+
+def _filter_relevant_search_candidates(
+    candidates: list[dict],
+    query: str,
+    *,
+    reranking_status: str,
+    allow_reranker_rejection: bool = True,
+) -> tuple[list[dict], dict]:
+    """Reject off-topic discovery results before crawling or evidence assembly."""
+    numeric_rerank_scores = [
+        float(item["rerank_score"])
+        for item in candidates
+        if _candidate_topical_relevance(item, query).get("is_relevant")
+        if isinstance(item.get("rerank_score"), (int, float))
+        and not isinstance(item.get("rerank_score"), bool)
+        and math.isfinite(float(item["rerank_score"]))
+    ]
+    reranker_outlier_floor = None
+    if len(numeric_rerank_scores) >= 4:
+        center = median(numeric_rerank_scores)
+        absolute_deviations = [abs(score - center) for score in numeric_rerank_scores]
+        median_absolute_deviation = median(absolute_deviations)
+        if median_absolute_deviation > 0:
+            proposed_floor = center - (4.0 * median_absolute_deviation)
+            if min(numeric_rerank_scores) < proposed_floor:
+                reranker_outlier_floor = proposed_floor
+        else:
+            lower_scores = [score for score in numeric_rerank_scores if score < center]
+            if len(lower_scores) == 1:
+                lower_score = lower_scores[0]
+                meaningful_gap = max(0.05, abs(center) * 0.1)
+                if center - lower_score >= meaningful_gap:
+                    reranker_outlier_floor = center
+    use_reranker_gate = bool(
+        allow_reranker_rejection
+        and reranking_status == "applied"
+        and reranker_outlier_floor is not None
+    )
+
+    accepted = []
+    deterministic_rejections = 0
+    reranker_rejections = 0
+    invalid_reranker_scores = 0
+    for candidate in candidates:
+        relevance = _candidate_topical_relevance(candidate, query)
+        deterministic_relevant = bool(relevance.get("is_relevant"))
+        rerank_score = candidate.get("rerank_score")
+        rerank_score_is_finite = bool(
+            isinstance(rerank_score, (int, float))
+            and not isinstance(rerank_score, bool)
+            and math.isfinite(float(rerank_score))
+        )
+        if rerank_score is not None and not rerank_score_is_finite:
+            invalid_reranker_scores += 1
+        reranker_rejected = bool(
+            use_reranker_gate
+            and rerank_score_is_finite
+            and float(rerank_score) < reranker_outlier_floor
+        )
+        if not deterministic_relevant:
+            deterministic_rejections += 1
+            continue
+        if reranker_rejected:
+            reranker_rejections += 1
+            continue
+
+        output = dict(candidate)
+        if rerank_score is not None and not rerank_score_is_finite:
+            output.pop("rerank_score", None)
+        relevant_intents = _candidate_relevant_intents(candidate, query)
+        output["topical_relevance"] = {
+            "score": round(float(relevance.get("score") or 0.0), 4),
+            "is_relevant": True,
+            "matched_terms": list(relevance.get("matched_terms") or ())[:20],
+            "matched_phrases": list(relevance.get("matched_phrases") or ())[:10],
+            "threshold": relevance.get("threshold"),
+            "reason": relevance.get("reason"),
+            "relevant_intents": relevant_intents,
+        }
+        accepted.append(output)
+
+    owners = {_candidate_owner(item) for item in accepted}
+    owners.discard("")
+    diagnostics = {
+        "status": (
+            "sufficient"
+            if accepted
+            else "low_relevance"
+            if candidates
+            else "insufficient"
+        ),
+        "evaluated_candidates": len(candidates),
+        "accepted_candidates": len(accepted),
+        "rejected_candidates": len(candidates) - len(accepted),
+        "deterministic_rejections": deterministic_rejections,
+        "reranker_rejections": reranker_rejections,
+        "invalid_reranker_scores": invalid_reranker_scores,
+        "distinct_relevant_owners": len(owners),
+        "reranker_signal_used": use_reranker_gate,
+        "reranker_rejection_policy": (
+            "finite_relative_low_outlier" if use_reranker_gate else "not_applied"
+        ),
+    }
+    return accepted, diagnostics
 
 
 async def _invalidate_ingestion_attempt_bounded(
@@ -780,7 +1412,11 @@ def _evidence_terms(item: dict) -> set[str]:
 def build_source_coverage(evidence: List[dict]) -> dict:
     hosts = sorted({item.get("domain") for item in evidence if item.get("domain")})
     owner_estimates = sorted(
-        {estimate_source_owner_domain(host) for host in hosts if estimate_source_owner_domain(host)}
+        {
+            estimate_source_owner_domain(host)
+            for host in hosts
+            if estimate_source_owner_domain(host)
+        }
     )
     return {
         "evidence_items": len(evidence),
@@ -831,7 +1467,7 @@ def build_verification_metadata(
         left_terms = _evidence_terms(left)
         if not left_owner or not left_terms:
             continue
-        for right in verification_evidence[left_index + 1:]:
+        for right in verification_evidence[left_index + 1 :]:
             right_owner = estimate_source_owner_domain(right.get("domain") or "")
             if not right_owner or right_owner == left_owner:
                 continue
@@ -842,7 +1478,10 @@ def build_verification_metadata(
             if len(shared_terms) >= 3 and overlap >= 0.2:
                 pairs.append(
                     {
-                        "evidence_ids": [left.get("evidence_id"), right.get("evidence_id")],
+                        "evidence_ids": [
+                            left.get("evidence_id"),
+                            right.get("evidence_id"),
+                        ],
                         "source_owner_estimates": [left_owner, right_owner],
                         "lexical_overlap": round(overlap, 3),
                         "shared_terms": shared_terms[:12],
@@ -917,13 +1556,10 @@ def _search_discovery_provenance(item: dict) -> dict:
     return {
         "search_cache_status": item.get("search_cache_status"),
         "search_cached_at_utc": cached_at,
-        "discovery_retrieved_at_utc": cached_at
-        or item.get("retrieved_at_utc"),
+        "discovery_retrieved_at_utc": cached_at or item.get("retrieved_at_utc"),
         "discovery_freshness": item.get("freshness"),
         "discovery_freshness_status": item.get("freshness_status"),
-        "discovery_freshness_unverified": bool(
-            item.get("freshness_unverified")
-        ),
+        "discovery_freshness_unverified": bool(item.get("freshness_unverified")),
     }
 
 
@@ -956,7 +1592,8 @@ def _compact_found_sections(sections: dict) -> dict:
                 _truncate_text(item, URL_RELEVANT_LINE_CHAR_LIMIT)
                 for item in items[:URL_SECTION_ITEM_LIMIT]
             ],
-            "truncated": len(str(content)) > URL_SECTION_CHAR_LIMIT or len(items) > URL_SECTION_ITEM_LIMIT,
+            "truncated": len(str(content)) > URL_SECTION_CHAR_LIMIT
+            or len(items) > URL_SECTION_ITEM_LIMIT,
         }
 
     return compact
@@ -1041,7 +1678,9 @@ def compact_investigation_result(
                 "type": "table_like_rows",
                 "rows": table_like_rows,
                 "row_count_returned": len(table_like_rows),
-                "row_count_total": result.get("table_like_row_count", len(table_like_rows)),
+                "row_count_total": result.get(
+                    "table_like_row_count", len(table_like_rows)
+                ),
             }
         )
         evidence_id += 1
@@ -1066,7 +1705,9 @@ def compact_investigation_result(
             }
         )
 
-    content_preview_limit = URL_EVIDENCE_CONTENT_PREVIEW_LIMIT if evidence else preview_chars
+    content_preview_limit = (
+        URL_EVIDENCE_CONTENT_PREVIEW_LIMIT if evidence else preview_chars
+    )
 
     compact = {
         "url": result.get("url"),
@@ -1090,7 +1731,8 @@ def compact_investigation_result(
         "content_trust": "untrusted_external_content",
         "errors": result.get("errors", []),
         "duration_seconds": result.get("duration_seconds"),
-        "retrieval_context": result.get("retrieval_context") or runtime_retrieval_context(),
+        "retrieval_context": result.get("retrieval_context")
+        or runtime_retrieval_context(),
         "truncated": result.get("truncated", False) or len(content) > preview_chars,
         "answering_instructions": [
             _freshness_instruction(),
@@ -1131,7 +1773,9 @@ async def explore_url_pipeline(
     start = time.monotonic()
     max_chars = clamp_int(max_chars, 10000, ABSOLUTE_MAX_CHARS)
     product_bias = is_product_task(task) or _looks_like_product_url(url)
-    inferred_labels = infer_page_labels(task=task, headers=labels, product_bias=product_bias)
+    inferred_labels = infer_page_labels(
+        task=task, headers=labels, product_bias=product_bias
+    )
 
     attempts = []
     text_parts = []
@@ -1146,11 +1790,15 @@ async def explore_url_pipeline(
     strategy_used = None
     crawl_low_confidence = False
 
-    def build_result(profile: str, content: str, playwright_result: Optional[dict] = None) -> dict:
+    def build_result(
+        profile: str, content: str, playwright_result: Optional[dict] = None
+    ) -> dict:
         retrieval_context = runtime_retrieval_context()
         analysis_content = content[:max_chars]
         sections = extract_sections_from_text(analysis_content, inferred_labels[:50])
-        found_sections = {key: value for key, value in sections.items() if value.get("found")}
+        found_sections = {
+            key: value for key, value in sections.items() if value.get("found")
+        }
         rows = table_like_rows or extract_table_like_rows(
             analysis_content,
             task=task,
@@ -1268,7 +1916,13 @@ async def explore_url_pipeline(
 
     for profile in profiles:
         try:
-            dynamic = await playwright_explore_page(url, labels=inferred_labels, task=task, max_chars=max_chars, profile=profile)
+            dynamic = await playwright_explore_page(
+                url,
+                labels=inferred_labels,
+                task=task,
+                max_chars=max_chars,
+                profile=profile,
+            )
             dynamic_content = dynamic.get("content", "")
             if dynamic_content:
                 text_parts.append(dynamic_content)
@@ -1282,7 +1936,9 @@ async def explore_url_pipeline(
             network_responses = dynamic.get("network_responses", [])
             scrollable_elements = dynamic.get("scrollable_elements", [])
             table_like_rows = dynamic.get("table_like_rows", [])
-            errors.extend(_safe_error_detail(item) for item in dynamic.get("errors", []))
+            errors.extend(
+                _safe_error_detail(item) for item in dynamic.get("errors", [])
+            )
 
             combined_parts = [part for part in text_parts if part]
             combined = "\n\n".join(combined_parts)
@@ -1301,7 +1957,9 @@ async def explore_url_pipeline(
                     "success": True,
                     "content_chars": dynamic.get("content_chars", 0),
                     "network_response_count": dynamic.get("network_response_count", 0),
-                    "scrollable_element_count": dynamic.get("scrollable_element_count", 0),
+                    "scrollable_element_count": dynamic.get(
+                        "scrollable_element_count", 0
+                    ),
                     "clicked": dynamic.get("clicked", []),
                     "sufficient": sufficient,
                 }
@@ -1313,7 +1971,9 @@ async def explore_url_pipeline(
         except Exception as exc:
             detail = _safe_error_detail(exc)
             errors.append(f"playwright {profile} extraction failed: {detail}")
-            attempts.append({"strategy": f"playwright_{profile}", "success": False, "error": detail})
+            attempts.append(
+                {"strategy": f"playwright_{profile}", "success": False, "error": detail}
+            )
 
     combined_parts = [part for part in text_parts if part]
     combined = "\n\n".join(combined_parts)
@@ -1401,8 +2061,10 @@ async def crawl_source(
                 detail = _safe_error_detail(item)
                 if detail in errors:
                     continue
-                if crawl_error and crawl_error in errors and detail.endswith(
-                    f": {crawl_error}"
+                if (
+                    crawl_error
+                    and crawl_error in errors
+                    and detail.endswith(f": {crawl_error}")
                 ):
                     continue
                 errors.append(detail)
@@ -1519,13 +2181,9 @@ async def _write_crawled_source_artifact(
             "freshness_unverified": bool(output.get("freshness_unverified")),
             "search_cache_status": output.get("search_cache_status"),
             "search_cached_at_utc": output.get("search_cached_at_utc"),
-            "discovery_retrieved_at_utc": output.get(
-                "discovery_retrieved_at_utc"
-            ),
+            "discovery_retrieved_at_utc": output.get("discovery_retrieved_at_utc"),
             "discovery_freshness": output.get("discovery_freshness"),
-            "discovery_freshness_status": output.get(
-                "discovery_freshness_status"
-            ),
+            "discovery_freshness_status": output.get("discovery_freshness_status"),
             "discovery_freshness_unverified": bool(
                 output.get("discovery_freshness_unverified")
             ),
@@ -1698,13 +2356,9 @@ async def persist_crawled_source(
                     "published_at": output.get("published_at"),
                     "freshness_status": output.get("freshness_status"),
                     "freshness": output.get("freshness"),
-                    "freshness_unverified": bool(
-                        output.get("freshness_unverified")
-                    ),
+                    "freshness_unverified": bool(output.get("freshness_unverified")),
                     "search_cache_status": output.get("search_cache_status"),
-                    "search_cached_at_utc": output.get(
-                        "search_cached_at_utc"
-                    ),
+                    "search_cached_at_utc": output.get("search_cached_at_utc"),
                     "discovery_retrieved_at_utc": output.get(
                         "discovery_retrieved_at_utc"
                     ),
@@ -1875,44 +2529,40 @@ def build_evidence_pack(results: List[dict]) -> List[dict]:
 
         artifact_path = item.get("artifact_path")
         evidence_item = {
-                "evidence_id": index,
-                "title": item.get("title"),
-                "url": item.get("url") or item.get("source"),
-                "requested_url": item.get("requested_url"),
-                "domain": item.get("domain"),
-                "section": item.get("section"),
-                "quote": text[:1600],
-                "vector_score": item.get("vector_score"),
-                "rerank_score": item.get("rerank_score"),
-                "ingested_at": item.get("ingested_at"),
-                "retrieved_at_utc": item.get("retrieved_at_utc") or item.get("ingested_at"),
-                "published_at": item.get("published_at"),
-                "freshness_status": item.get("freshness_status"),
-                "freshness": item.get("freshness"),
-                "freshness_unverified": bool(item.get("freshness_unverified")),
-                "search_cache_status": item.get("search_cache_status"),
-                "search_cached_at_utc": item.get("search_cached_at_utc"),
-                "discovery_retrieved_at_utc": item.get(
-                    "discovery_retrieved_at_utc"
-                ),
-                "discovery_freshness": item.get("discovery_freshness"),
-                "discovery_freshness_status": item.get(
-                    "discovery_freshness_status"
-                ),
-                "discovery_freshness_unverified": bool(
-                    item.get("discovery_freshness_unverified")
-                ),
-                "search_engine": item.get("search_engine"),
-                "search_rank": item.get("search_rank"),
-                "research_run_id": item.get("research_run_id"),
-                "snapshot_id": item.get("snapshot_id"),
-                "artifact_id": item.get("artifact_id"),
-                "artifact_path": artifact_path,
-                "source_version": item.get("source_version"),
-                "lifecycle_status": item.get("lifecycle_status"),
-                "content_trust": "untrusted_external_content",
-                "evidence_type": item.get("evidence_type") or "extracted_page_content",
-            }
+            "evidence_id": index,
+            "title": item.get("title"),
+            "url": item.get("url") or item.get("source"),
+            "requested_url": item.get("requested_url"),
+            "domain": item.get("domain"),
+            "section": item.get("section"),
+            "quote": text[:1600],
+            "vector_score": item.get("vector_score"),
+            "rerank_score": item.get("rerank_score"),
+            "ingested_at": item.get("ingested_at"),
+            "retrieved_at_utc": item.get("retrieved_at_utc") or item.get("ingested_at"),
+            "published_at": item.get("published_at"),
+            "freshness_status": item.get("freshness_status"),
+            "freshness": item.get("freshness"),
+            "freshness_unverified": bool(item.get("freshness_unverified")),
+            "search_cache_status": item.get("search_cache_status"),
+            "search_cached_at_utc": item.get("search_cached_at_utc"),
+            "discovery_retrieved_at_utc": item.get("discovery_retrieved_at_utc"),
+            "discovery_freshness": item.get("discovery_freshness"),
+            "discovery_freshness_status": item.get("discovery_freshness_status"),
+            "discovery_freshness_unverified": bool(
+                item.get("discovery_freshness_unverified")
+            ),
+            "search_engine": item.get("search_engine"),
+            "search_rank": item.get("search_rank"),
+            "research_run_id": item.get("research_run_id"),
+            "snapshot_id": item.get("snapshot_id"),
+            "artifact_id": item.get("artifact_id"),
+            "artifact_path": artifact_path,
+            "source_version": item.get("source_version"),
+            "lifecycle_status": item.get("lifecycle_status"),
+            "content_trust": "untrusted_external_content",
+            "evidence_type": item.get("evidence_type") or "extracted_page_content",
+        }
         if artifact_path:
             evidence_item["artifact_reference"] = {
                 "artifact_id": item.get("artifact_id"),
@@ -1992,13 +2642,12 @@ def build_search_snippet_evidence(
             not url
             or not snippet
             or url in existing_urls
-            or freshness_status in {"outside_window", "outside_requested_window", "stale"}
+            or freshness_status
+            in {"outside_window", "outside_requested_window", "stale"}
         ):
             continue
         stale_cache = candidate.get("search_cache_status") == "stale_fallback"
-        limitations = (
-            "Discovery snippet only; the linked page was not available as extracted evidence."
-        )
+        limitations = "Discovery snippet only; the linked page was not available as extracted evidence."
         if stale_cache:
             limitations += (
                 " Discovery came from an explicitly stale cache fallback after a transient "
@@ -2017,9 +2666,7 @@ def build_search_snippet_evidence(
                 "retrieved_at_utc": candidate.get("retrieved_at_utc"),
                 "freshness_status": candidate.get("freshness_status"),
                 "freshness": candidate.get("freshness"),
-                "freshness_unverified": bool(
-                    candidate.get("freshness_unverified")
-                ),
+                "freshness_unverified": bool(candidate.get("freshness_unverified")),
                 "search_cache_status": candidate.get("search_cache_status"),
                 "search_cached_at_utc": candidate.get("search_cached_at_utc"),
                 "search_engine": candidate.get("engine"),
@@ -2051,8 +2698,10 @@ async def _research_pipeline_impl(
     ingestion_attempt_id: Optional[str] = None,
     ingestion_order_ns: Optional[int] = None,
     search_cache_scope: Optional[str] = None,
+    proposed_queries: Optional[List[str]] = None,
 ) -> dict:
     start = time.monotonic()
+    proposed_queries = normalize_proposed_queries(proposed_queries)
     retrieval_context = runtime_retrieval_context()
     mode = mode if mode in RESEARCH_MODE_CONFIG else "balanced"
     config = RESEARCH_MODE_CONFIG[mode]
@@ -2062,10 +2711,14 @@ async def _research_pipeline_impl(
     total_budget_seconds = float(
         config.get("total_budget", max(1.0, crawl_budget_seconds + 30.0))
     )
-    terminal_reserve_seconds = min(
-        2.0,
-        max(0.0, total_budget_seconds * 0.05),
-    ) if defer_persistence else 0.0
+    terminal_reserve_seconds = (
+        min(
+            2.0,
+            max(0.0, total_budget_seconds * 0.05),
+        )
+        if defer_persistence
+        else 0.0
+    )
     research_deadline = start + max(
         1.0,
         total_budget_seconds - terminal_reserve_seconds,
@@ -2078,7 +2731,14 @@ async def _research_pipeline_impl(
         if planner_budget_seconds <= 0:
             raise TimeoutError
         async with asyncio.timeout(planner_budget_seconds):
-            plan = await build_research_plan(query, mode)
+            if proposed_queries is None:
+                plan = await build_research_plan(query, mode)
+            else:
+                plan = await build_research_plan(
+                    query,
+                    mode,
+                    proposed_queries=proposed_queries,
+                )
     except TimeoutError:
         plan = deterministic_plan(query, mode)
         plan["planner_fallback"] = "interactive planner budget exhausted"
@@ -2086,7 +2746,11 @@ async def _research_pipeline_impl(
     # Keep each mode inside its intended latency envelope. MCP/SSE clients often
     # close long-running tool calls, so a balanced request should not become a
     # 10-source crawl just because the caller provided a high max_sources value.
-    max_urls_value = config["max_urls"] if max_sources is None else clamp_int(max_sources, 0, config["max_urls"])
+    max_urls_value = (
+        config["max_urls"]
+        if max_sources is None
+        else clamp_int(max_sources, 0, config["max_urls"])
+    )
     search_results_value = config["search_results"]
     top_k_value = config["top_k"]
 
@@ -2102,6 +2766,14 @@ async def _research_pipeline_impl(
         except TimeoutError:
             rag_result = {"results": []}
         local_evidence = build_evidence_pack(rag_result.get("results", []))
+        local_verification = build_verification_metadata(
+            local_evidence,
+            requested=verify,
+        )
+        local_verification_inconclusive = bool(
+            verify
+            and local_verification["status"] != "cross_source_topical_overlap_observed"
+        )
         return {
             "query": query,
             "mode": mode,
@@ -2116,14 +2788,28 @@ async def _research_pipeline_impl(
             "evidence": local_evidence,
             "results": rag_result.get("results", []),
             "source_coverage": build_source_coverage(local_evidence),
-            "verification": build_verification_metadata(local_evidence, requested=verify),
+            "verification": local_verification,
             "completion": {
-                "status": "complete" if local_evidence else "insufficient",
+                "status": (
+                    "partial"
+                    if local_evidence and local_verification_inconclusive
+                    else "complete"
+                    if local_evidence
+                    else "insufficient"
+                ),
                 "reason": (
-                    "local_memory_retrieved"
+                    "local_memory_retrieved_with_limitations"
+                    if local_evidence and local_verification_inconclusive
+                    else "local_memory_retrieved"
                     if local_evidence
                     else "no_local_memory_evidence"
                 ),
+                "reasons": (
+                    ["verification_inconclusive"]
+                    if local_verification_inconclusive
+                    else []
+                ),
+                "evidence_items": len(local_evidence),
             },
             "artifact_lifecycle": {
                 "policy": "artifact retention is independent from vector-memory retention",
@@ -2142,18 +2828,55 @@ async def _research_pipeline_impl(
 
     planned_search_queries = list(plan.get("queries") or [query])
     raw_intent_ids = plan.get("query_intent_ids")
-    if not isinstance(raw_intent_ids, list) or len(raw_intent_ids) != len(
-        planned_search_queries
-    ):
+    intent_metadata_valid = bool(
+        isinstance(raw_intent_ids, list)
+        and len(raw_intent_ids) == len(planned_search_queries)
+        and all(
+            isinstance(value, str) and bool(value.strip())
+            for value in raw_intent_ids
+        )
+    )
+    if not intent_metadata_valid:
         # Malformed or legacy planner output must not turn every query variant
         # into an independent primary wave. Treat it as one intent and retain
-        # only the mode's bounded reserve-query allowance.
+        # only the mode's bounded reserve-query allowance. Role metadata is
+        # coupled to this mapping and must fail closed with it.
         planned_search_intent_ids = ["intent-1"] * len(planned_search_queries)
     else:
         planned_search_intent_ids = [
-            str(value or f"query-{index}")[:100]
-            for index, value in enumerate(raw_intent_ids)
+            value.strip()[:100]
+            for value in raw_intent_ids
         ]
+    planned_intent_order = unique_preserve_order(planned_search_intent_ids)
+    planned_queries_by_intent = {
+        intent_id: [
+            search_query
+            for search_query, query_intent_id in zip(
+                planned_search_queries,
+                planned_search_intent_ids,
+            )
+            if query_intent_id == intent_id
+        ]
+        for intent_id in planned_intent_order
+    }
+    raw_intent_contexts = plan.get("intent_contexts")
+    strict_intent_ids = {
+        intent_id
+        for intent_id in planned_intent_order
+        if isinstance(raw_intent_contexts, dict)
+        and bool(raw_intent_contexts.get(intent_id))
+    }
+    planned_intent_contexts = {
+        intent_id: str(
+            raw_intent_contexts.get(intent_id)
+            if isinstance(raw_intent_contexts, dict)
+            and raw_intent_contexts.get(intent_id)
+            else query
+            if len(planned_intent_order) == 1
+            else (planned_queries_by_intent.get(intent_id) or [query])[0]
+        ).strip()[:500]
+        for intent_id in planned_intent_order
+    }
     planned_search_policies = [
         infer_search_policy(
             item,
@@ -2163,15 +2886,28 @@ async def _research_pipeline_impl(
         )
         for item in planned_search_queries
     ]
-    primary_queries, reserve_waves = _partition_search_query_waves(
-        planned_search_queries,
-        planned_search_policies,
-        planned_search_intent_ids,
-        max_reserve_per_intent=(4 if mode == "deep" else 1),
+    primary_indexes, reserve_index_waves, planned_search_query_roles = (
+        _partition_search_query_indexes(
+            planned_search_queries,
+            planned_search_policies,
+            planned_search_intent_ids,
+            max_reserve_per_intent=(4 if mode == "deep" else 1),
+            query_roles=(
+                plan.get("query_roles")
+                if intent_metadata_valid
+                else None
+            ),
+        )
     )
-    search_queries = [item[0] for item in primary_queries]
-    search_policies = [item[1] for item in primary_queries]
-    search_intent_ids = [item[2] for item in primary_queries]
+    search_queries = [planned_search_queries[index] for index in primary_indexes]
+    search_policies = [planned_search_policies[index] for index in primary_indexes]
+    search_intent_ids = [planned_search_intent_ids[index] for index in primary_indexes]
+    search_query_roles: list[Optional[str]] = [
+        planned_search_query_roles[index]
+        if planned_search_query_roles is not None
+        else None
+        for index in primary_indexes
+    ]
     search_budget_seconds = min(
         float(config.get("search_budget", 30.0)),
         max(0.0, research_deadline - time.monotonic()),
@@ -2186,16 +2922,22 @@ async def _research_pipeline_impl(
         cache_scope=search_cache_scope,
     )
     resolved_intents = _resolved_search_intents(
+        search_queries,
         search_intent_ids,
         search_outcomes,
         mode=mode,
+        intent_contexts=planned_intent_contexts,
+        strict_intent_ids=strict_intent_ids,
+        query_roles=search_query_roles,
     )
-    fallback_variant_executed = False
-    for reserve_wave in reserve_waves:
-        fallback_queries = [
-            item for item in reserve_wave if item[2] not in resolved_intents
+    reserve_executed_intents: set[str] = set()
+    for reserve_index_wave in reserve_index_waves:
+        fallback_indexes = [
+            index
+            for index in reserve_index_wave
+            if planned_search_intent_ids[index] not in resolved_intents
         ]
-        if not fallback_queries:
+        if not fallback_indexes:
             continue
         fallback_budget_seconds = min(
             max(0.0, search_budget_seconds - (time.monotonic() - search_started)),
@@ -2204,22 +2946,40 @@ async def _research_pipeline_impl(
         if fallback_budget_seconds <= 0:
             break
         fallback_outcomes = await _run_search_batch_bounded(
-            [item[0] for item in fallback_queries],
-            [item[1] for item in fallback_queries],
+            [planned_search_queries[index] for index in fallback_indexes],
+            [planned_search_policies[index] for index in fallback_indexes],
             max_results=search_results_value,
             mode=mode,
             timeout_seconds=fallback_budget_seconds,
             cache_scope=search_cache_scope,
         )
-        search_queries.extend(item[0] for item in fallback_queries)
-        search_policies.extend(item[1] for item in fallback_queries)
-        search_intent_ids.extend(item[2] for item in fallback_queries)
+        search_queries.extend(
+            planned_search_queries[index] for index in fallback_indexes
+        )
+        search_policies.extend(
+            planned_search_policies[index] for index in fallback_indexes
+        )
+        search_intent_ids.extend(
+            planned_search_intent_ids[index] for index in fallback_indexes
+        )
+        search_query_roles.extend(
+            planned_search_query_roles[index]
+            if planned_search_query_roles is not None
+            else None
+            for index in fallback_indexes
+        )
         search_outcomes.extend(fallback_outcomes)
-        fallback_variant_executed = True
+        reserve_executed_intents.update(
+            planned_search_intent_ids[index] for index in fallback_indexes
+        )
         resolved_intents = _resolved_search_intents(
+            search_queries,
             search_intent_ids,
             search_outcomes,
             mode=mode,
+            intent_contexts=planned_intent_contexts,
+            strict_intent_ids=strict_intent_ids,
+            query_roles=search_query_roles,
         )
 
     merged_candidates: Dict[str, dict] = {}
@@ -2232,6 +2992,7 @@ async def _research_pipeline_impl(
         *,
         phase: str = "initial",
         intent_id: Optional[str] = None,
+        query_role: Optional[str] = None,
     ) -> None:
         if isinstance(outcome, Exception):
             detail = _safe_error_detail(outcome)
@@ -2241,14 +3002,18 @@ async def _research_pipeline_impl(
             logger.error("SearXNG search failed for query %r: %s", search_query, detail)
             return
 
-        diagnostics = _compact_search_diagnostics(search_query, outcome, phase)
+        diagnostics = _compact_search_diagnostics(
+            search_query,
+            outcome,
+            phase,
+            query_role=query_role,
+        )
         if diagnostics:
             search_diagnostics.append(diagnostics)
             if diagnostics.get("acquisition_status") == "failed":
                 acquisition_error = diagnostics.get("acquisition_error") or {}
                 error_code = str(
-                    acquisition_error.get("code")
-                    or "search_backend_unavailable"
+                    acquisition_error.get("code") or "search_backend_unavailable"
                 )[:100]
                 search_errors.append(
                     {
@@ -2267,6 +3032,22 @@ async def _research_pipeline_impl(
             candidate["domain"] = normalize_domain(get_domain(normalized_url))
             candidate["matched_queries"] = [search_query]
             candidate["matched_intents"] = [intent_id] if intent_id else []
+            candidate["matched_query_intents"] = (
+                [
+                    {
+                        "query": search_query,
+                        "intent_id": intent_id,
+                        "intent_context": planned_intent_contexts.get(
+                            intent_id,
+                            search_query,
+                        ),
+                        "strict_intent_context": intent_id in strict_intent_ids,
+                        **({"query_role": query_role} if query_role else {}),
+                    }
+                ]
+                if intent_id
+                else []
+            )
             existing = merged_candidates.get(normalized_url)
             if existing:
                 existing["matched_queries"] = unique_preserve_order(
@@ -2276,6 +3057,20 @@ async def _research_pipeline_impl(
                     existing.get("matched_intents", [])
                     + ([intent_id] if intent_id else [])
                 )
+                query_intents = list(existing.get("matched_query_intents") or ())
+                association = {
+                    "query": search_query,
+                    "intent_id": intent_id,
+                    "intent_context": planned_intent_contexts.get(
+                        intent_id,
+                        search_query,
+                    ),
+                    "strict_intent_context": intent_id in strict_intent_ids,
+                    **({"query_role": query_role} if query_role else {}),
+                }
+                if intent_id and association not in query_intents:
+                    query_intents.append(association)
+                existing["matched_query_intents"] = query_intents
                 freshness_priority = {
                     "exact_match": 3,
                     "within_window": 2,
@@ -2294,154 +3089,227 @@ async def _research_pipeline_impl(
                 if candidate_key > existing_key:
                     matched_queries = existing["matched_queries"]
                     matched_intents = existing["matched_intents"]
+                    matched_query_intents = existing["matched_query_intents"]
                     existing.update(candidate)
                     existing["matched_queries"] = matched_queries
                     existing["matched_intents"] = matched_intents
+                    existing["matched_query_intents"] = matched_query_intents
             else:
                 merged_candidates[normalized_url] = candidate
 
-    for search_query, intent_id, outcome in zip(
+    for search_query, intent_id, outcome, query_role in zip(
         search_queries,
         search_intent_ids,
         search_outcomes,
+        search_query_roles,
     ):
-        merge_search_outcome(search_query, outcome, intent_id=intent_id)
+        merge_search_outcome(
+            search_query,
+            outcome,
+            intent_id=intent_id,
+            query_role=query_role,
+        )
 
     fallback_metadata = None
-    successful_search = any(
-        not isinstance(outcome, Exception)
-        and getattr(outcome, "diagnostics", {}).get("acquisition_status")
-        != "failed"
-        for outcome in search_outcomes
-    )
-    any_accepted_results = any(
-        bool(outcome)
-        for outcome in search_outcomes
-        if not isinstance(outcome, Exception)
-    )
-    compact_fallback = fallback_search_query(
-        query,
-        current_date=retrieval_context.get("current_date_local"),
-    )
-    initial_search_query_keys = {item.lower() for item in search_queries}
-    strict_searches = [
-        (item, policy, intent_id)
-        for item, policy, intent_id in zip(
-            search_queries,
-            search_policies,
-            search_intent_ids,
-        )
-        if policy.strict_date
-    ]
-    relaxable_strict_searches = [
-        (item, policy, intent_id)
-        for item, policy, intent_id in strict_searches
-        if policy.time_range is not None
-    ]
-    if relaxable_strict_searches:
-        recovery_query, recovery_base_policy, recovery_intent_id = min(
-            relaxable_strict_searches,
-            key=lambda item: (len(item[0]), item[0].lower()),
-        )
-    else:
-        recovery_query = compact_fallback
-        recovery_intent_id = search_intent_ids[0] if search_intent_ids else "fallback"
-        recovery_base_policy = infer_search_policy(
-            recovery_query,
-            mode,
-            current_date=retrieval_context.get("current_date_local"),
-            timezone_name=retrieval_context.get("timezone"),
-        )
-    recovery_query_is_new = bool(
-        recovery_query and recovery_query.lower() not in initial_search_query_keys
-    )
-    can_relax_engine_time_range = bool(
-        recovery_base_policy.strict_date
-        and recovery_base_policy.time_range is not None
-    )
-    exact_matches_before = sum(
-        1
-        for candidate in merged_candidates.values()
-        if candidate.get("freshness_status") == "exact_match"
-    )
     target_exact_matches = min(max_urls_value, 3 if verify else 1)
-    zero_result_fallback = bool(
-        not merged_candidates
-        and successful_search
-        and not any_accepted_results
-        and not fallback_variant_executed
-        and recovery_query
-        and (can_relax_engine_time_range or recovery_query_is_new)
+    initial_topical_relevance = _candidate_relevance_summary(
+        list(merged_candidates.values()),
+        query,
     )
-    freshness_recovery = bool(
-        bool(relaxable_strict_searches)
-        and successful_search
-        and recovery_query
-        and target_exact_matches > 0
-        and exact_matches_before < target_exact_matches
-        and (merged_candidates or not any_accepted_results)
-    )
-    if zero_result_fallback or freshness_recovery:
-        recovery_policy = (
-            replace(recovery_base_policy, time_range=None)
-            if can_relax_engine_time_range
-            else recovery_base_policy
+    existing_query_keys = {item.casefold() for item in search_queries}
+    recovery_entries: list[tuple[str, object, str, str, dict]] = []
+    recovery_diagnostics: list[dict] = []
+    for intent_id in planned_intent_order:
+        intent_indexes = [
+            index
+            for index, query_intent_id in enumerate(search_intent_ids)
+            if query_intent_id == intent_id
+        ]
+        intent_outcomes = [search_outcomes[index] for index in intent_indexes]
+        successful_intent_search = any(
+            not isinstance(outcome, Exception)
+            and getattr(outcome, "diagnostics", {}).get("acquisition_status")
+            != "failed"
+            for outcome in intent_outcomes
         )
-        reason = (
-            "initial_queries_returned_no_results"
-            if not merged_candidates
-            else "insufficient_exact_date_coverage"
+        if not successful_intent_search:
+            continue
+        intent_candidates = [
+            candidate
+            for candidate in merged_candidates.values()
+            if _candidate_matches_intent(candidate, intent_id)
+        ]
+        relevant_intent_candidates = [
+            candidate
+            for candidate in intent_candidates
+            if _candidate_topical_relevance(
+                candidate,
+                query,
+                intent_id=intent_id,
+            ).get("is_relevant")
+        ]
+        intent_searches = [
+            (search_queries[index], search_policies[index]) for index in intent_indexes
+        ]
+        relaxable_strict_searches = [
+            (search_query, policy)
+            for search_query, policy in intent_searches
+            if policy.strict_date and policy.time_range is not None
+        ]
+        exact_matches_before = sum(
+            1
+            for candidate in relevant_intent_candidates
+            if candidate.get("freshness_status") == "exact_match"
         )
-        fallback_metadata = {
-            "triggered": True,
-            "reason": reason,
-            "query": recovery_query,
+        recovery_query = ""
+        recovery_policy = None
+        recovery_phase = "fallback"
+        recovery_reason = ""
+        recovery_metadata: dict = {
+            "intent_id": intent_id,
+            "reserve_executed": intent_id in reserve_executed_intents,
         }
-        if can_relax_engine_time_range:
-            fallback_metadata.update(
+
+        if not relevant_intent_candidates:
+            source_query = planned_intent_contexts.get(intent_id) or (
+                query
+                if len(planned_intent_order) == 1
+                else (planned_queries_by_intent.get(intent_id) or [""])[0]
+            )
+            if intent_candidates:
+                recovery_query = _distinct_semantic_recovery_query(
+                    source_query,
+                    current_date=retrieval_context.get("current_date_local"),
+                    existing_query_keys=existing_query_keys,
+                )
+                recovery_reason = "low_topical_relevance"
+                recovery_phase = "relevance_recovery"
+            else:
+                recovery_query = _distinct_semantic_recovery_query(
+                    source_query,
+                    current_date=retrieval_context.get("current_date_local"),
+                    existing_query_keys=existing_query_keys,
+                )
+                if recovery_query:
+                    recovery_reason = "initial_queries_returned_no_results"
+            if recovery_query:
+                recovery_policy = infer_search_policy(
+                    recovery_query,
+                    mode,
+                    current_date=retrieval_context.get("current_date_local"),
+                    timezone_name=retrieval_context.get("timezone"),
+                )
+                if (
+                    recovery_reason == "initial_queries_returned_no_results"
+                    and recovery_policy.strict_date
+                    and recovery_policy.time_range is not None
+                ):
+                    recovery_policy = replace(recovery_policy, time_range=None)
+                    recovery_metadata["policy_relaxation"] = "engine_time_range_only"
+        elif (
+            relaxable_strict_searches
+            and target_exact_matches > 0
+            and exact_matches_before < target_exact_matches
+        ):
+            recovery_query, base_policy = min(
+                relaxable_strict_searches,
+                key=lambda item: (len(item[0]), item[0].casefold()),
+            )
+            recovery_policy = replace(base_policy, time_range=None)
+            recovery_reason = "insufficient_exact_date_coverage"
+            recovery_phase = "freshness_recovery"
+            recovery_metadata["policy_relaxation"] = "engine_time_range_only"
+
+        if not recovery_query or recovery_policy is None:
+            continue
+        existing_query_keys.add(recovery_query.casefold())
+        recovery_metadata.update(
+            {
+                "reason": recovery_reason,
+                "query": recovery_query,
+                "phase": recovery_phase,
+            }
+        )
+        if recovery_metadata.get("policy_relaxation"):
+            recovery_metadata.update(
                 {
-                    "policy_relaxation": "engine_time_range_only",
                     "exact_matches_before": exact_matches_before,
                     "target_exact_matches": target_exact_matches,
                 }
             )
-        fallback_timeout = min(
+        recovery_entries.append(
+            (
+                recovery_query,
+                recovery_policy,
+                intent_id,
+                recovery_phase,
+                recovery_metadata,
+            )
+        )
+
+    recovery_timeout = 0.0
+    if recovery_entries:
+        recovery_timeout = min(
             5.0,
+            max(0.0, search_budget_seconds - (time.monotonic() - search_started)),
             max(0.0, research_deadline - time.monotonic()),
         )
-        try:
-            if fallback_timeout <= 0:
-                raise TimeoutError
-            async with asyncio.timeout(fallback_timeout):
-                fallback_kwargs = {
-                    "query": recovery_query,
-                    "max_results": search_results_value,
-                    "mode": mode,
-                    "policy": recovery_policy,
-                }
-                if search_cache_scope:
-                    fallback_kwargs["cache_scope"] = search_cache_scope
-                fallback_outcome = await searxng_search(**fallback_kwargs)
-        except Exception as exc:
-            fallback_outcome = exc
-        search_queries.append(recovery_query)
-        search_intent_ids.append(recovery_intent_id)
-        merge_search_outcome(
-            recovery_query,
-            fallback_outcome,
-            phase=(
-                "freshness_recovery"
-                if can_relax_engine_time_range
-                else "fallback"
-            ),
-            intent_id=recovery_intent_id,
+    if recovery_entries and recovery_timeout > 0:
+        recovery_outcomes = await _run_search_batch_bounded(
+            [item[0] for item in recovery_entries],
+            [item[1] for item in recovery_entries],
+            max_results=search_results_value,
+            mode=mode,
+            timeout_seconds=recovery_timeout,
+            cache_scope=search_cache_scope,
         )
+        for entry, recovery_outcome in zip(recovery_entries, recovery_outcomes):
+            recovery_query, recovery_policy, intent_id, phase, metadata = entry
+            search_queries.append(recovery_query)
+            search_policies.append(recovery_policy)
+            search_intent_ids.append(intent_id)
+            recovery_query_role = (
+                "deterministic" if planned_search_query_roles is not None else None
+            )
+            search_query_roles.append(recovery_query_role)
+            search_outcomes.append(recovery_outcome)
+            merge_search_outcome(
+                recovery_query,
+                recovery_outcome,
+                phase=phase,
+                intent_id=intent_id,
+                query_role=recovery_query_role,
+            )
+            recovery_diagnostics.append(metadata)
+
+        if len(recovery_diagnostics) == 1:
+            item = recovery_diagnostics[0]
+            fallback_metadata = {
+                "triggered": True,
+                "reason": item["reason"],
+                "query": item["query"],
+                "intent_id": item["intent_id"],
+            }
+            for key in (
+                "policy_relaxation",
+                "exact_matches_before",
+                "target_exact_matches",
+            ):
+                if key in item:
+                    fallback_metadata[key] = item[key]
+        else:
+            fallback_metadata = {
+                "triggered": True,
+                "reason": "unresolved_search_intents",
+                "recoveries": recovery_diagnostics,
+            }
 
     provisional_limit = max(
         search_results_value,
         SEARCH_RERANKER_MAX_CANDIDATES
         if SEARCH_RERANKER_ENABLED
         else search_results_value,
+        len(merged_candidates),
     )
     provisional_candidates = _build_candidate_pool(
         list(merged_candidates.values()),
@@ -2452,6 +3320,26 @@ async def _research_pipeline_impl(
         query,
         provisional_candidates,
         timeout_seconds=max(0.0, research_deadline - time.monotonic()),
+    )
+    provisional_candidates, topical_relevance = _filter_relevant_search_candidates(
+        provisional_candidates,
+        query,
+        reranking_status=str(discovery_reranking.get("status") or ""),
+        allow_reranker_rejection=len(planned_intent_order) == 1,
+    )
+    relevance_recoveries = [
+        item
+        for item in recovery_diagnostics
+        if item.get("reason") == "low_topical_relevance"
+    ]
+    topical_relevance.update(
+        {
+            "scope": "web",
+            "recovery_attempted": bool(recovery_diagnostics),
+            "recovery_queries": [item["query"] for item in recovery_diagnostics],
+            "relevance_recovery_attempted": bool(relevance_recoveries),
+            "initial_relevant_candidates": initial_topical_relevance["relevant_count"],
+        }
     )
     candidates = _build_candidate_pool(
         provisional_candidates,
@@ -2499,9 +3387,7 @@ async def _research_pipeline_impl(
                     or retrieval_context.get("freshness"),
                     "published_at": original.get("published_at"),
                     "freshness_status": original.get("freshness_status"),
-                    "freshness_unverified": bool(
-                        original.get("freshness_unverified")
-                    ),
+                    "freshness_unverified": bool(original.get("freshness_unverified")),
                     **_search_discovery_provenance(original),
                     "search_engine": original.get("engine"),
                     "search_rank": original.get("search_rank"),
@@ -2590,7 +3476,7 @@ async def _research_pipeline_impl(
                 owner = _candidate_owner(item)
                 if owner:
                     attempted_owners.add(owner)
-                attempted_intents.update(item.get("matched_intents") or ())
+                attempted_intents.update(_candidate_intents(item))
                 task = asyncio.create_task(
                     crawl_source_limited(
                         semaphore,
@@ -2618,9 +3504,7 @@ async def _research_pipeline_impl(
                     harvest_done()
                     if len(crawled_sources) >= max_urls_value:
                         break
-                    if active or (
-                        remaining and quota_attempts < attempt_limit
-                    ):
+                    if active or (remaining and quota_attempts < attempt_limit):
                         crawl_budget_exhausted = True
                     cleanup_tasks = list(active)
                     for task, (original, _deadline) in list(active.items()):
@@ -2730,7 +3614,9 @@ async def _research_pipeline_impl(
         for task in staging_tasks:
             if task in pending:
                 staging_outcomes.append(
-                    TimeoutError("source staging exceeded the interactive latency budget")
+                    TimeoutError(
+                        "source staging exceeded the interactive latency budget"
+                    )
                 )
                 continue
             try:
@@ -2835,7 +3721,9 @@ async def _research_pipeline_impl(
                 failed_copy = dict(source)
                 failed_copy.pop("_content", None)
                 errors = list(failed_copy.get("errors") or [])
-                errors.append(f"source persistence failed: {_safe_error_detail(outcome)}")
+                errors.append(
+                    f"source persistence failed: {_safe_error_detail(outcome)}"
+                )
                 failed_copy["errors"] = errors
                 persisted_sources.append(failed_copy)
             elif isinstance(outcome, dict):
@@ -2939,9 +3827,7 @@ async def _research_pipeline_impl(
             )
 
     web_evidence = build_evidence_pack(current_rag_results)
-    web_evidence.extend(
-        build_crawled_source_evidence(crawled_sources, web_evidence)
-    )
+    web_evidence.extend(build_crawled_source_evidence(crawled_sources, web_evidence))
     web_evidence_source_urls = {
         normalize_search_url(item.get("url") or "")
         for item in web_evidence
@@ -2973,18 +3859,36 @@ async def _research_pipeline_impl(
         for item in memory_results
         if not (
             normalize_search_url(item.get("url") or item.get("source") or "")
-            and normalize_search_url(
-                item.get("url") or item.get("source") or ""
-            )
+            and normalize_search_url(item.get("url") or item.get("source") or "")
             in current_urls
         )
     ]
     memory_evidence = build_evidence_pack(memory_results)
+    intent_coverage = _intent_web_coverage(
+        planned_intent_order,
+        candidates,
+        web_evidence,
+    )
+    resolved_intents_final = [
+        intent_id
+        for intent_id in planned_intent_order
+        if intent_coverage[intent_id]["status"] == "resolved"
+    ]
+    unresolved_intents = [
+        intent_id
+        for intent_id in planned_intent_order
+        if intent_coverage[intent_id]["status"] == "unresolved"
+    ]
     evidence = _reindex_evidence(web_evidence + memory_evidence)
     rag_results = current_rag_results + memory_results
     source_coverage = build_source_coverage(evidence)
     latency_exhausted = time.monotonic() >= research_deadline
     incomplete_reasons = []
+    low_web_topical_relevance = topical_relevance["status"] == "low_relevance"
+    if low_web_topical_relevance:
+        incomplete_reasons.append("low_web_topical_relevance")
+    if unresolved_intents:
+        incomplete_reasons.append("unresolved_search_intents")
     if latency_exhausted:
         incomplete_reasons.append("latency_budget_exhausted")
     if crawl_budget_exhausted:
@@ -2993,10 +3897,24 @@ async def _research_pipeline_impl(
         incomplete_reasons.append("search_failures")
     if failed_sources:
         incomplete_reasons.append("source_failures")
-    if evidence:
+    if verify and verification["status"] != "cross_source_topical_overlap_observed":
+        incomplete_reasons.append("verification_inconclusive")
+    if low_web_topical_relevance and memory_evidence:
+        completion_status = "partial"
+        completion_reason = "memory_evidence_without_relevant_web_evidence"
+    elif low_web_topical_relevance:
+        completion_status = "insufficient"
+        completion_reason = "low_topical_relevance"
+    elif evidence:
         completion_status = "partial" if incomplete_reasons else "complete"
+        completion_reason = (
+            "evidence_retrieved_with_limitations"
+            if incomplete_reasons
+            else "relevant_evidence_retrieved"
+        )
     else:
         completion_status = "insufficient"
+        completion_reason = "no_usable_evidence"
 
     response = {
         "query": query,
@@ -3025,6 +3943,8 @@ async def _research_pipeline_impl(
             "policy": "return_best_available_evidence",
         },
         "discovery_reranking": discovery_reranking,
+        "topical_relevance": topical_relevance,
+        "intent_coverage": intent_coverage,
         "evidence": evidence,
         "results": rag_results,
         "memory_results": rag_results,
@@ -3032,8 +3952,11 @@ async def _research_pipeline_impl(
         "verification": verification,
         "completion": {
             "status": completion_status,
+            "reason": completion_reason,
             "reasons": incomplete_reasons,
             "evidence_items": len(evidence),
+            "resolved_intents": resolved_intents_final,
+            "unresolved_intents": unresolved_intents,
         },
         "artifact_lifecycle": {
             "policy": "artifact retention is independent from vector-memory retention",
@@ -3074,6 +3997,19 @@ async def _research_pipeline_impl(
             "Background vector indexing is eventual and does not delay or improve the current evidence response; answer now from evidence."
         )
 
+    if low_web_topical_relevance:
+        relevance_recovery_attempted = bool(
+            topical_relevance.get("relevance_recovery_attempted")
+        )
+        response["answering_instructions"].append(
+            (
+                "The bounded internal relevance recovery found no topically relevant web evidence. "
+                if relevance_recovery_attempted
+                else "The bounded search found no topically relevant web evidence. "
+            )
+            + "Do not repeat the same research_web request in this response; report the evidence gap instead."
+        )
+
     if search_errors:
         response["search_errors"] = search_errors
     if search_diagnostics:
@@ -3082,13 +4018,48 @@ async def _research_pipeline_impl(
         response["persistence"] = persistence_diagnostics
     if deferred_persistence:
         response["_deferred_persistence"] = deferred_persistence
+    if recovery_diagnostics:
+        for item in recovery_diagnostics:
+            intent_candidates = [
+                candidate
+                for candidate in candidates
+                if item["intent_id"]
+                in (
+                    (candidate.get("topical_relevance") or {}).get("relevant_intents")
+                    or ()
+                )
+            ]
+            item["produced_relevant_results"] = bool(intent_candidates)
+            if item.get("policy_relaxation"):
+                item["exact_matches_after"] = sum(
+                    1
+                    for candidate in intent_candidates
+                    if candidate.get("freshness_status") == "exact_match"
+                )
+        response["search_recoveries"] = recovery_diagnostics
     if fallback_metadata:
-        fallback_metadata["produced_results"] = bool(merged_candidates)
-        if recovery_policy.strict_date:
-            fallback_metadata["exact_matches_after"] = sum(
-                1
-                for candidate in merged_candidates.values()
-                if candidate.get("freshness_status") == "exact_match"
+        fallback_intent_id = fallback_metadata.get("intent_id")
+        if fallback_intent_id:
+            fallback_candidates = [
+                candidate
+                for candidate in candidates
+                if fallback_intent_id
+                in (
+                    (candidate.get("topical_relevance") or {}).get("relevant_intents")
+                    or ()
+                )
+            ]
+            fallback_metadata["produced_results"] = bool(fallback_candidates)
+            if fallback_metadata.get("policy_relaxation"):
+                fallback_metadata["exact_matches_after"] = sum(
+                    1
+                    for candidate in fallback_candidates
+                    if candidate.get("freshness_status") == "exact_match"
+                )
+        else:
+            fallback_metadata["produced_results"] = any(
+                bool(item.get("produced_relevant_results"))
+                for item in recovery_diagnostics
             )
         response["search_fallback"] = fallback_metadata
 
@@ -3127,6 +4098,7 @@ async def research_pipeline(
     ingestion_attempt_id: Optional[str] = None,
     ingestion_order_ns: Optional[int] = None,
     search_cache_scope: Optional[str] = None,
+    proposed_queries: Optional[List[str]] = None,
 ) -> dict:
     """Run research under one ingestion attempt that can be revoked on cancellation."""
     effective_attempt_id = ingestion_attempt_id or uuid.uuid4().hex
@@ -3146,6 +4118,7 @@ async def research_pipeline(
             ingestion_attempt_id=effective_attempt_id,
             ingestion_order_ns=ingestion_order_ns,
             search_cache_scope=search_cache_scope,
+            proposed_queries=proposed_queries,
         )
     except asyncio.CancelledError as cancellation:
         if not defer_persistence and mode != "local_only" and max_sources != 0:

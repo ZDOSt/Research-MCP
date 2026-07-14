@@ -27,6 +27,7 @@ from job_store import (
     validate_job_id,
 )
 from redaction import redact_sensitive_text
+from query_hints import normalize_proposed_queries
 
 
 logger = logging.getLogger(__name__)
@@ -219,22 +220,32 @@ async def dispatch_job(kind: str, payload: Mapping[str, Any]) -> Any:
         mode = payload.get("mode", "balanced")
         if not isinstance(mode, str):
             raise ValueError("mode must be a string")
-        return await research_pipeline(
-            query=_required_string(payload, "query"),
-            mode=mode,
-            max_sources=max_sources,
-            verify=_optional_bool(payload, "verify", True),
-            namespace=_optional_string(payload, "namespace", DEFAULT_NAMESPACE),
-            include_memory=_optional_bool(payload, "include_memory", False),
-            synthesize=_optional_bool(payload, "synthesize", False),
-            research_run_id=_optional_string(payload, "research_run_id"),
-            defer_persistence=_env_bool("RESEARCH_DEFER_PERSISTENCE", True),
-            ingestion_attempt_id=ingestion_attempt_id,
-            ingestion_order_ns=ingestion_order_ns,
-            search_cache_scope=_optional_string(
+        proposed_queries = normalize_proposed_queries(
+            payload.get("proposed_queries")
+            if "proposed_queries" in payload
+            else None
+        )
+        research_kwargs = {
+            "query": _required_string(payload, "query"),
+            "mode": mode,
+            "max_sources": max_sources,
+            "verify": _optional_bool(payload, "verify", True),
+            "namespace": _optional_string(payload, "namespace", DEFAULT_NAMESPACE),
+            "include_memory": _optional_bool(payload, "include_memory", False),
+            "synthesize": _optional_bool(payload, "synthesize", False),
+            "research_run_id": _optional_string(payload, "research_run_id"),
+            "defer_persistence": _env_bool("RESEARCH_DEFER_PERSISTENCE", True),
+            "ingestion_attempt_id": ingestion_attempt_id,
+            "ingestion_order_ns": ingestion_order_ns,
+            "search_cache_scope": _optional_string(
                 payload,
                 _INTERNAL_SEARCH_CACHE_SCOPE,
             ),
+        }
+        if proposed_queries is not None:
+            research_kwargs["proposed_queries"] = proposed_queries
+        return await research_pipeline(
+            **research_kwargs,
         )
 
     if kind == "persist_research_source":

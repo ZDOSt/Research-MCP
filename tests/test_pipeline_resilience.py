@@ -1,4 +1,5 @@
 import asyncio
+import math
 import time
 from unittest.mock import AsyncMock
 
@@ -7,6 +8,161 @@ import pytest
 import pipelines
 from artifact_store import ArtifactStore
 from searching import SearchResults
+
+
+@pytest.mark.asyncio
+async def test_proposed_primary_cannot_resolve_without_canonical_relevance(monkeypatch):
+    calls = []
+    planner_inputs = []
+    proposed = "Docker container network fixes"
+    canonical = "install SillyTavern on Ubuntu using Docker"
+
+    async def plan(query, mode, proposed_queries=None):
+        planner_inputs.append(proposed_queries)
+        return {
+            "query": query,
+            "mode": mode,
+            "queries": [proposed, canonical],
+            "query_intent_ids": ["install", "install"],
+            "intent_contexts": {"install": canonical},
+            "generated_by": "calling-model+deterministic",
+        }
+
+    async def search(*, query, **_kwargs):
+        calls.append(query)
+        if query == proposed:
+            return [
+                {
+                    "title": "Docker bridge network fixes",
+                    "snippet": "Troubleshoot generic container bridge networking",
+                    "url": "https://network-one.example/guide",
+                    "domain": "network-one.example",
+                },
+                {
+                    "title": "Docker container network troubleshooting",
+                    "snippet": "Repair bridge and DNS connectivity",
+                    "url": "https://network-two.example/guide",
+                    "domain": "network-two.example",
+                },
+            ]
+        return [
+            {
+                "title": "Install SillyTavern on Ubuntu with Docker",
+                "snippet": "SillyTavern Docker installation steps for Ubuntu",
+                "url": "https://install-one.example/guide",
+                "domain": "install-one.example",
+            },
+            {
+                "title": "SillyTavern Docker setup on Ubuntu",
+                "snippet": "Deploy SillyTavern using Docker on Ubuntu",
+                "url": "https://install-two.example/guide",
+                "domain": "install-two.example",
+            },
+        ]
+
+    monkeypatch.setattr(pipelines, "build_research_plan", plan)
+    monkeypatch.setattr(pipelines, "searxng_search", search)
+    monkeypatch.setattr(
+        pipelines,
+        "rag_query_impl",
+        AsyncMock(return_value={"results": []}),
+    )
+
+    result = await pipelines.research_pipeline(
+        canonical,
+        mode="balanced",
+        max_sources=0,
+        verify=False,
+        persist_source_artifacts=False,
+        proposed_queries=[proposed],
+    )
+
+    assert planner_inputs == [[proposed]]
+    assert calls == [proposed, canonical]
+    assert result["plan"]["intent_contexts"] == {"install": canonical}
+    assert all("network-" not in item["url"] for item in result["searched"])
+
+
+@pytest.mark.parametrize(
+    ("canonical", "executed_query"),
+    [
+        ("vegan dinner recipes", "chicken dinner recipes"),
+        ("wireless headphones", "wired headphones"),
+        ("free project management software", "paid project management software"),
+        ("indoor security cameras", "outdoor security cameras"),
+        ("beginner Python tutorials", "advanced Python tutorials"),
+        ("cat food recommendations", "dog food recommendations"),
+        ("Android TV boxes", "Android TV remote apps"),
+    ],
+)
+def test_noncanonical_result_cannot_substitute_canonical_topic_qualifier(
+    canonical,
+    executed_query,
+):
+    analysis = pipelines._canonical_result_relevance(
+        {
+            "title": executed_query,
+            "snippet": f"A detailed guide to {executed_query}",
+            "url": "https://drift.example/result",
+        },
+        canonical,
+        executed_query=executed_query,
+    )
+
+    assert analysis["is_relevant"] is False
+    assert analysis["reason"] == "conflicting_topic_qualifier"
+
+
+@pytest.mark.parametrize(
+    ("canonical", "executed_query"),
+    [
+        (
+            "Find free password managers for families",
+            "free password managers for Windows",
+        ),
+        (
+            "accounting software for small businesses",
+            "accounting software for students",
+        ),
+        (
+            "plants for low-light bathrooms",
+            "plants for sunny offices",
+        ),
+    ],
+)
+def test_noncanonical_result_must_cover_the_distinctive_canonical_intent(
+    canonical,
+    executed_query,
+):
+    analysis = pipelines._canonical_result_relevance(
+        {
+            "title": executed_query,
+            "snippet": f"Detailed recommendations for {executed_query}",
+            "url": "https://drift.example/result",
+        },
+        canonical,
+        executed_query=executed_query,
+    )
+
+    assert analysis["is_relevant"] is False
+    assert analysis["reason"] in {
+        "insufficient_canonical_distinctive_overlap",
+        "insufficient_topic_overlap",
+    }
+
+
+def test_noncanonical_result_allows_a_complete_safe_reformulation():
+    analysis = pipelines._canonical_result_relevance(
+        {
+            "title": "SillyTavern Docker installation on Ubuntu",
+            "snippet": "Official documentation for installing SillyTavern with Docker",
+            "url": "https://docs.example/installation",
+        },
+        "install SillyTavern on Ubuntu using Docker",
+        executed_query="SillyTavern Docker installation Ubuntu official documentation",
+    )
+
+    assert analysis["is_relevant"] is True
 
 
 @pytest.mark.asyncio
@@ -37,6 +193,45 @@ async def test_search_batch_caps_upstream_query_concurrency(monkeypatch):
 
     assert outcomes == [["one"], ["two"], ["three"], ["four"]]
     assert peak_active == 2
+
+
+@pytest.mark.asyncio
+async def test_search_batch_cancellation_stops_owned_searches(monkeypatch):
+    active = 0
+    started = asyncio.Event()
+    stopped = asyncio.Event()
+
+    async def search(**_kwargs):
+        nonlocal active
+        active += 1
+        if active == 2:
+            started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            active -= 1
+            if active == 0:
+                stopped.set()
+
+    monkeypatch.setattr(pipelines, "SEARCH_QUERY_CONCURRENCY", 2)
+    monkeypatch.setattr(pipelines, "searxng_search", search)
+
+    task = asyncio.create_task(
+        pipelines._run_search_batch_bounded(
+            ["one", "two"],
+            [None, None],
+            max_results=4,
+            mode="balanced",
+            timeout_seconds=10,
+        )
+    )
+    await asyncio.wait_for(started.wait(), timeout=0.2)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.wait_for(stopped.wait(), timeout=0.2)
+    assert active == 0
 
 
 def test_search_query_waves_keep_one_primary_and_one_reserve_per_intent():
@@ -72,17 +267,782 @@ def test_deep_search_retains_ordered_reserve_waves():
     ]
 
 
-def test_search_outcome_coverage_requires_distinct_source_owners():
-    same_owner = [
-        {"url": "https://docs.example.com/one", "domain": "docs.example.com"},
-        {"url": "https://www.example.com/two", "domain": "www.example.com"},
+def test_role_aware_search_pairs_expansion_with_canonical_anchor():
+    primary, reserve_waves = pipelines._partition_search_query_waves(
+        [
+            "calling-model wording",
+            "semantic expansion",
+            "canonical anchor",
+            "deterministic reserve",
+        ],
+        [1, 2, 3, 4],
+        ["topic"] * 4,
+        query_roles=[
+            "calling_model",
+            "semantic_expansion",
+            "deterministic",
+            "deterministic",
+        ],
+    )
+
+    assert primary == [
+        ("semantic expansion", 2, "topic"),
+        ("canonical anchor", 3, "topic"),
     ]
-    distinct_owners = same_owner + [
-        {"url": "https://other.example.net/three", "domain": "other.example.net"}
+    assert reserve_waves == [[("deterministic reserve", 4, "topic")]]
+
+
+@pytest.mark.parametrize(
+    "query_roles",
+    [
+        ["semantic_expansion"],
+        ["semantic_expansion", "calling_model"],
+        ["semantic_expansion", "unsupported"],
+        ["semantic_expansion", {"role": "deterministic"}],
+        ["semantic_expansion", "deterministic", "calling_model"],
+    ],
+)
+def test_malformed_or_unanchored_query_roles_use_exact_legacy_waves(query_roles):
+    arguments = (
+        ["first", "second"],
+        [1, 2],
+        ["topic", "topic"],
+    )
+
+    legacy = pipelines._partition_search_query_waves(*arguments)
+    role_aware = pipelines._partition_search_query_waves(
+        *arguments,
+        query_roles=query_roles,
+    )
+
+    assert role_aware == legacy
+
+
+@pytest.mark.parametrize(
+    "raw_intent_ids",
+    [
+        ["topic"],
+        ["", "", ""],
+    ],
+)
+@pytest.mark.asyncio
+async def test_malformed_intent_metadata_disables_query_roles(
+    monkeypatch,
+    raw_intent_ids,
+):
+    calls = []
+
+    async def plan(query, mode):
+        return {
+            "query": query,
+            "mode": mode,
+            "queries": ["Docker", "Docker docs", "Docker releases"],
+            "query_intent_ids": raw_intent_ids,
+            "query_roles": [
+                "semantic_expansion",
+                "deterministic",
+                "deterministic",
+            ],
+        }
+
+    async def search(*, query, **_kwargs):
+        calls.append(query)
+        return [
+            {
+                "title": f"Docker result {index}",
+                "snippet": "Docker container documentation",
+                "url": f"https://docker-{index}.example/{query.replace(' ', '-')}",
+                "domain": f"docker-{index}.example",
+            }
+            for index in range(2)
+        ]
+
+    monkeypatch.setattr(pipelines, "build_research_plan", plan)
+    monkeypatch.setattr(pipelines, "searxng_search", search)
+    monkeypatch.setattr(
+        pipelines,
+        "rag_query_impl",
+        AsyncMock(return_value={"results": []}),
+    )
+
+    await pipelines.research_pipeline(
+        "Docker",
+        mode="balanced",
+        max_sources=0,
+        verify=False,
+        persist_source_artifacts=False,
+    )
+
+    assert calls == ["Docker"]
+
+
+@pytest.mark.asyncio
+async def test_expansion_only_coverage_runs_deterministic_reserve(monkeypatch):
+    expansion = "SillyTavern Linux Docker setup guide"
+    canonical = "install SillyTavern on Ubuntu using Docker"
+    deterministic_reserve = "SillyTavern Ubuntu Docker official documentation"
+    calls = []
+
+    async def plan(query, mode, proposed_queries=None):
+        return {
+            "query": query,
+            "mode": mode,
+            "queries": [expansion, canonical, deterministic_reserve],
+            "query_intent_ids": ["install"] * 3,
+            "query_roles": [
+                "semantic_expansion",
+                "deterministic",
+                "deterministic",
+            ],
+            "intent_contexts": {"install": canonical},
+        }
+
+    async def search(*, query, **_kwargs):
+        calls.append(query)
+        if query != expansion:
+            return []
+        return [
+            {
+                "title": "Install SillyTavern on Ubuntu with Docker",
+                "snippet": "SillyTavern Docker installation steps for Ubuntu",
+                "url": f"https://install-{index}.example/guide",
+                "domain": f"install-{index}.example",
+            }
+            for index in range(2)
+        ]
+
+    async def crawl(_semaphore, candidate, **_kwargs):
+        return {
+            "ok": True,
+            "title": candidate["title"],
+            "url": candidate["url"],
+            "requested_url": candidate["url"],
+            "domain": candidate["domain"],
+            "evidence_text": candidate["snippet"],
+        }
+
+    monkeypatch.setattr(pipelines, "build_research_plan", plan)
+    monkeypatch.setattr(pipelines, "searxng_search", search)
+    monkeypatch.setattr(pipelines, "crawl_source_limited", crawl)
+    monkeypatch.setattr(pipelines, "SEARCH_RERANKER_ENABLED", False)
+    monkeypatch.setattr(
+        pipelines,
+        "rag_query_impl",
+        AsyncMock(return_value={"results": []}),
+    )
+
+    result = await pipelines.research_pipeline(
+        canonical,
+        mode="balanced",
+        max_sources=1,
+        verify=False,
+        persist_source_artifacts=False,
+    )
+
+    assert calls[:2] == [expansion, canonical]
+    assert calls[2] == deterministic_reserve
+    assert result["completion"]["resolved_intents"] == []
+    assert result["completion"]["unresolved_intents"] == ["install"]
+    assert all(
+        association.get("query_role") == "semantic_expansion"
+        for item in result["searched"]
+        for association in item.get("matched_query_intents") or ()
+    )
+
+
+def test_candidate_pool_reserves_only_topically_relevant_intents():
+    candidates = [
+        {
+            "url": "https://shared.example/result",
+            "score": 10,
+            "matched_intents": ["one", "two"],
+            "topical_relevance": {"relevant_intents": ["one"]},
+        },
+        {
+            "url": "https://one.example/result",
+            "score": 9,
+            "matched_intents": ["one"],
+            "topical_relevance": {"relevant_intents": ["one"]},
+        },
+        {
+            "url": "https://two.example/result",
+            "score": 1,
+            "matched_intents": ["two"],
+            "topical_relevance": {"relevant_intents": ["two"]},
+        },
     ]
 
-    assert pipelines._search_outcome_has_source_coverage(same_owner) is False
-    assert pipelines._search_outcome_has_source_coverage(distinct_owners) is True
+    selected = pipelines._build_candidate_pool(candidates, 2, ["one", "two"])
+
+    assert {item["url"] for item in selected} == {
+        "https://shared.example/result",
+        "https://two.example/result",
+    }
+
+
+@pytest.mark.asyncio
+async def test_local_only_requested_verification_does_not_overstate_completion(
+    monkeypatch,
+):
+    async def plan(query, mode):
+        return {"query": query, "mode": mode, "queries": []}
+
+    monkeypatch.setattr(pipelines, "build_research_plan", plan)
+    monkeypatch.setattr(
+        pipelines,
+        "rag_query_impl",
+        AsyncMock(
+            return_value={
+                "results": [
+                    {
+                        "title": "Stored note",
+                        "url": "https://memory.example/note",
+                        "domain": "memory.example",
+                        "text": "Relevant stored research evidence.",
+                    },
+                    {
+                        "title": "Independent note",
+                        "url": "https://archive.example/item",
+                        "domain": "archive.example",
+                        "text": "Separate archival material about the subject.",
+                    },
+                ]
+            }
+        ),
+    )
+
+    result = await pipelines.research_pipeline(
+        "stored research",
+        mode="local_only",
+        verify=True,
+    )
+
+    assert (
+        result["verification"]["status"] == "multiple_sources_without_detected_overlap"
+    )
+    assert result["completion"]["status"] == "partial"
+    assert result["completion"]["reason"] == "local_memory_retrieved_with_limitations"
+    assert result["completion"]["reasons"] == ["verification_inconclusive"]
+
+
+def test_search_outcome_coverage_requires_distinct_source_owners():
+    same_owner = [
+        {
+            "title": "Powerful Android TV box comparison",
+            "snippet": "Android streaming box benchmarks and specifications",
+            "url": "https://docs.example.com/one",
+            "domain": "docs.example.com",
+        },
+        {
+            "title": "Best high-performance Android TV devices",
+            "snippet": "Compare Android TV box performance",
+            "url": "https://www.example.com/two",
+            "domain": "www.example.com",
+        },
+    ]
+    distinct_owners = same_owner + [
+        {
+            "title": "Android TV box benchmark results",
+            "snippet": "Independent performance measurements for Android boxes",
+            "url": "https://other.example.net/three",
+            "domain": "other.example.net",
+        }
+    ]
+    irrelevant = [
+        {
+            "title": "Traditional German cider guide",
+            "snippet": "Regional apple varieties used to make Most",
+            "url": "https://cider.example.org/most",
+            "domain": "cider.example.org",
+        },
+        {
+            "title": "Apple harvest festival",
+            "snippet": "A calendar of local orchard events",
+            "url": "https://festival.example.net/events",
+            "domain": "festival.example.net",
+        },
+    ]
+
+    query = "powerful Android TV box comparison"
+    assert (
+        pipelines._search_outcome_has_source_coverage(
+            same_owner,
+            query=query,
+        )
+        is False
+    )
+    assert (
+        pipelines._search_outcome_has_source_coverage(
+            distinct_owners,
+            query=query,
+        )
+        is True
+    )
+    assert (
+        pipelines._search_outcome_has_source_coverage(
+            irrelevant,
+            query=query,
+        )
+        is False
+    )
+
+
+@pytest.mark.asyncio
+async def test_relevant_primary_results_skip_reserve_and_recovery(monkeypatch):
+    calls = []
+    candidates = [
+        {
+            "title": "High-performance Android TV box benchmark",
+            "snippet": "Android TV box performance compared with Nvidia Shield",
+            "url": "https://benchmarks.example/device",
+            "domain": "benchmarks.example",
+            "score": 9,
+        },
+        {
+            "title": "Best Nvidia Shield alternatives",
+            "snippet": "Current powerful Android TV streaming boxes compared",
+            "url": "https://reviews.example/android-tv",
+            "domain": "reviews.example",
+            "score": 8,
+        },
+    ]
+
+    async def plan(query, mode):
+        return {
+            "query": query,
+            "mode": mode,
+            "queries": [
+                "powerful Android TV box Nvidia Shield alternative",
+                "Android TV box performance benchmark",
+            ],
+            "query_intent_ids": ["android-tv", "android-tv"],
+        }
+
+    async def search(*, query, **_kwargs):
+        calls.append(query)
+        return candidates
+
+    async def crawl(_semaphore, candidate, **_kwargs):
+        return {
+            "ok": True,
+            "title": candidate["title"],
+            "url": candidate["url"],
+            "requested_url": candidate["url"],
+            "domain": candidate["domain"],
+            "evidence_text": candidate["snippet"],
+        }
+
+    monkeypatch.setattr(pipelines, "build_research_plan", plan)
+    monkeypatch.setattr(pipelines, "searxng_search", search)
+    monkeypatch.setattr(pipelines, "crawl_source_limited", crawl)
+    monkeypatch.setattr(
+        pipelines,
+        "rag_query_impl",
+        AsyncMock(return_value={"results": []}),
+    )
+
+    result = await pipelines.research_pipeline(
+        "Find a powerful Android TV box that is an Nvidia Shield alternative",
+        max_sources=1,
+        verify=False,
+        persist_source_artifacts=False,
+    )
+
+    assert calls == ["powerful Android TV box Nvidia Shield alternative"]
+    assert result["topical_relevance"]["status"] == "sufficient"
+    assert result["topical_relevance"]["accepted_candidates"] == 2
+    assert result["completion"]["status"] == "complete"
+    assert "search_fallback" not in result
+
+
+@pytest.mark.asyncio
+async def test_low_relevance_runs_one_internal_repair_and_filters_noise(monkeypatch):
+    calls = []
+    irrelevant = [
+        {
+            "title": "Traditional German cider guide",
+            "snippet": "Regional apple varieties used to make Most",
+            "url": "https://cider.example/most",
+            "domain": "cider.example",
+            "score": 20,
+        },
+        {
+            "title": "Orchard harvest calendar",
+            "snippet": "Apple festivals and cider tastings this year",
+            "url": "https://orchards.example/events",
+            "domain": "orchards.example",
+            "score": 19,
+        },
+    ]
+    repaired = [
+        {
+            "title": "High-performance Android TV box benchmark",
+            "snippet": "Android TV box performance compared with Nvidia Shield",
+            "url": "https://benchmarks.example/android-tv",
+            "domain": "benchmarks.example",
+            "score": 9,
+        },
+        {
+            "title": "Best Nvidia Shield alternatives",
+            "snippet": "Powerful Android TV streaming boxes reviewed",
+            "url": "https://reviews.example/shield-alternative",
+            "domain": "reviews.example",
+            "score": 8,
+        },
+    ]
+    repair_query = "best high performance Android TV box Nvidia Shield alternative"
+
+    async def plan(query, mode):
+        return {
+            "query": query,
+            "mode": mode,
+            "queries": [
+                'most powerful "shield-killer"',
+                "Android TV box performance benchmark",
+            ],
+            "query_intent_ids": ["android-tv", "android-tv"],
+        }
+
+    async def search(*, query, **_kwargs):
+        calls.append(query)
+        return repaired if query == repair_query else irrelevant
+
+    async def crawl(_semaphore, candidate, **_kwargs):
+        return {
+            "ok": True,
+            "title": candidate["title"],
+            "url": candidate["url"],
+            "requested_url": candidate["url"],
+            "domain": candidate["domain"],
+            "evidence_text": candidate["snippet"],
+        }
+
+    monkeypatch.setattr(pipelines, "build_research_plan", plan)
+    monkeypatch.setattr(
+        pipelines, "fallback_search_query", lambda *_args, **_kwargs: repair_query
+    )
+    monkeypatch.setattr(pipelines, "searxng_search", search)
+    monkeypatch.setattr(pipelines, "crawl_source_limited", crawl)
+    monkeypatch.setattr(
+        pipelines,
+        "rag_query_impl",
+        AsyncMock(return_value={"results": []}),
+    )
+
+    result = await pipelines.research_pipeline(
+        "Find a powerful Android TV box that is an Nvidia Shield alternative",
+        max_sources=1,
+        verify=False,
+        persist_source_artifacts=False,
+    )
+
+    assert calls == [
+        'most powerful "shield-killer"',
+        "Android TV box performance benchmark",
+        repair_query,
+    ]
+    assert result["search_fallback"]["reason"] == "low_topical_relevance"
+    assert result["topical_relevance"]["recovery_attempted"] is True
+    assert result["topical_relevance"]["accepted_candidates"] == 2
+    assert {item["domain"] for item in result["searched"]} == {
+        "benchmarks.example",
+        "reviews.example",
+    }
+    assert result["completion"]["status"] == "complete"
+
+
+@pytest.mark.asyncio
+async def test_low_relevance_after_repair_is_reported_as_insufficient(monkeypatch):
+    calls = []
+    irrelevant = [
+        {
+            "title": "Traditional German cider guide",
+            "snippet": "Regional apple varieties used to make Most",
+            "url": "https://cider.example/most",
+            "domain": "cider.example",
+            "score": 9,
+        },
+        {
+            "title": "Orchard harvest calendar",
+            "snippet": "Apple festivals and cider tastings this year",
+            "url": "https://orchards.example/events",
+            "domain": "orchards.example",
+            "score": 8,
+        },
+    ]
+    repair_query = "best high performance Android TV box Nvidia Shield alternative"
+
+    async def plan(query, mode):
+        return {
+            "query": query,
+            "mode": mode,
+            "queries": ["powerful shield killer"],
+            "query_intent_ids": ["android-tv"],
+        }
+
+    async def search(*, query, **_kwargs):
+        calls.append(query)
+        return irrelevant
+
+    monkeypatch.setattr(pipelines, "build_research_plan", plan)
+    monkeypatch.setattr(
+        pipelines, "fallback_search_query", lambda *_args, **_kwargs: repair_query
+    )
+    monkeypatch.setattr(pipelines, "searxng_search", search)
+    monkeypatch.setattr(
+        pipelines,
+        "rag_query_impl",
+        AsyncMock(return_value={"results": []}),
+    )
+
+    result = await pipelines.research_pipeline(
+        "Find a powerful Android TV box that is an Nvidia Shield alternative",
+        max_sources=1,
+        verify=False,
+        persist_source_artifacts=False,
+    )
+
+    assert calls == ["powerful shield killer", repair_query]
+    assert result["searched"] == []
+    assert result["evidence"] == []
+    assert result["topical_relevance"]["status"] == "low_relevance"
+    assert result["completion"]["status"] == "insufficient"
+    assert result["completion"]["reason"] == "low_topical_relevance"
+    assert "low_web_topical_relevance" in result["completion"]["reasons"]
+    assert any(
+        "Do not repeat the same research_web request" in instruction
+        for instruction in result["answering_instructions"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_multi_intent_completion_tracks_unresolved_intent_and_recovery(
+    monkeypatch,
+):
+    calls = []
+    android_results = [
+        {
+            "title": "Android TV box benchmark",
+            "snippet": "Powerful Nvidia Shield alternative performance",
+            "url": f"https://android{index}.example/review",
+            "domain": f"android{index}.example",
+            "score": 10 - index,
+        }
+        for index in range(2)
+    ]
+    irrelevant = [
+        {
+            "title": "Traditional cider guide",
+            "snippet": "Apple varieties and orchard events",
+            "url": f"https://cider{index}.example/guide",
+            "domain": f"cider{index}.example",
+            "score": 8 - index,
+        }
+        for index in range(2)
+    ]
+
+    async def plan(query, mode):
+        return {
+            "query": query,
+            "mode": mode,
+            "queries": [
+                "powerful Android TV box",
+                "Android TV box benchmark",
+                "install Docker Engine",
+                "Docker Engine setup guide",
+            ],
+            "query_intent_ids": ["android", "android", "docker", "docker"],
+        }
+
+    async def search(*, query, **_kwargs):
+        calls.append(query)
+        return android_results if "Android" in query else irrelevant
+
+    async def crawl(_semaphore, candidate, **_kwargs):
+        return {
+            "ok": True,
+            "title": candidate["title"],
+            "url": candidate["url"],
+            "requested_url": candidate["url"],
+            "domain": candidate["domain"],
+            "evidence_text": candidate["snippet"],
+        }
+
+    monkeypatch.setattr(pipelines, "build_research_plan", plan)
+    monkeypatch.setattr(
+        pipelines,
+        "fallback_search_query",
+        lambda source, **_kwargs: f"{source} repaired",
+    )
+    monkeypatch.setattr(pipelines, "searxng_search", search)
+    monkeypatch.setattr(pipelines, "crawl_source_limited", crawl)
+    monkeypatch.setattr(
+        pipelines,
+        "rag_query_impl",
+        AsyncMock(return_value={"results": []}),
+    )
+
+    result = await pipelines.research_pipeline(
+        "Find a powerful Android TV box and explain how to install Docker Engine",
+        max_sources=1,
+        verify=False,
+        persist_source_artifacts=False,
+    )
+
+    assert "Android TV box benchmark" not in calls
+    assert "Docker Engine setup guide" in calls
+    assert "install Docker Engine repaired" in calls
+    assert result["completion"]["status"] == "partial"
+    assert result["completion"]["resolved_intents"] == ["android"]
+    assert result["completion"]["unresolved_intents"] == ["docker"]
+    assert result["intent_coverage"]["android"]["status"] == "resolved"
+    assert result["intent_coverage"]["docker"]["status"] == "unresolved"
+    assert result["search_recoveries"][0]["intent_id"] == "docker"
+    assert result["search_recoveries"][0]["reserve_executed"] is True
+
+
+@pytest.mark.asyncio
+async def test_low_web_relevance_with_memory_is_partial_not_insufficient(monkeypatch):
+    irrelevant = [
+        {
+            "title": "Traditional cider guide",
+            "snippet": "Apple varieties and orchard events",
+            "url": "https://cider.example/guide",
+            "domain": "cider.example",
+            "score": 8,
+        }
+    ]
+
+    async def plan(query, mode):
+        return {
+            "query": query,
+            "mode": mode,
+            "queries": ["powerful Android TV box"],
+            "query_intent_ids": ["android"],
+        }
+
+    monkeypatch.setattr(pipelines, "build_research_plan", plan)
+    monkeypatch.setattr(
+        pipelines,
+        "fallback_search_query",
+        lambda *_args, **_kwargs: "Android TV box benchmark",
+    )
+    monkeypatch.setattr(
+        pipelines,
+        "searxng_search",
+        AsyncMock(return_value=irrelevant),
+    )
+    monkeypatch.setattr(
+        pipelines,
+        "rag_query_impl",
+        AsyncMock(
+            return_value={
+                "results": [
+                    {
+                        "title": "Stored Android TV research",
+                        "url": "https://memory.example/android-tv",
+                        "domain": "memory.example",
+                        "text": "Previously stored Android TV box benchmark evidence.",
+                    }
+                ]
+            }
+        ),
+    )
+
+    result = await pipelines.research_pipeline(
+        "Find a powerful Android TV box",
+        max_sources=1,
+        include_memory=True,
+        verify=False,
+        persist_source_artifacts=False,
+    )
+
+    assert result["completion"]["status"] == "partial"
+    assert (
+        result["completion"]["reason"]
+        == "memory_evidence_without_relevant_web_evidence"
+    )
+    assert result["evidence"][0]["url"] == "https://memory.example/android-tv"
+    assert any(
+        "no topically relevant web evidence" in instruction.lower()
+        for instruction in result["answering_instructions"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_strict_date_low_relevance_uses_distinct_semantic_repair(monkeypatch):
+    calls = []
+    source_query = "today's AI news"
+    irrelevant = [
+        {
+            "title": "Traditional cider guide",
+            "snippet": "Apple varieties used to make Most",
+            "url": "https://cider.example/most",
+            "domain": "cider.example",
+            "score": 8,
+        }
+    ]
+    relevant = [
+        {
+            "title": "Today's AI news from primary sources",
+            "snippet": "Current AI model and infrastructure news today",
+            "url": "https://news.example/ai",
+            "domain": "news.example",
+            "freshness_status": "exact_match",
+            "score": 10,
+        }
+    ]
+
+    async def plan(query, mode):
+        return {
+            "query": query,
+            "mode": mode,
+            "queries": [source_query],
+            "query_intent_ids": ["news"],
+        }
+
+    async def search(*, query, **_kwargs):
+        calls.append(query)
+        return irrelevant if query == source_query else relevant
+
+    async def crawl(_semaphore, candidate, **_kwargs):
+        return {
+            "ok": True,
+            "title": candidate["title"],
+            "url": candidate["url"],
+            "requested_url": candidate["url"],
+            "domain": candidate["domain"],
+            "evidence_text": candidate["snippet"],
+            "freshness_status": candidate["freshness_status"],
+        }
+
+    monkeypatch.setattr(pipelines, "build_research_plan", plan)
+    monkeypatch.setattr(
+        pipelines,
+        "fallback_search_query",
+        lambda *_args, **_kwargs: source_query,
+    )
+    monkeypatch.setattr(pipelines, "searxng_search", search)
+    monkeypatch.setattr(pipelines, "crawl_source_limited", crawl)
+    monkeypatch.setattr(
+        pipelines,
+        "rag_query_impl",
+        AsyncMock(return_value={"results": []}),
+    )
+
+    result = await pipelines.research_pipeline(
+        source_query,
+        max_sources=1,
+        verify=False,
+        persist_source_artifacts=False,
+    )
+
+    assert len(calls) == 2
+    assert calls[1] != calls[0]
+    assert "today" in calls[1].lower()
+    assert result["search_recoveries"][0]["phase"] == "relevance_recovery"
+    assert "policy_relaxation" not in result["search_recoveries"][0]
+    assert result["completion"]["status"] == "complete"
 
 
 @pytest.mark.asyncio
@@ -115,7 +1075,48 @@ async def test_missing_intent_ids_cannot_execute_every_planner_variant(monkeypat
         persist_source_artifacts=False,
     )
 
-    assert calls == ["question", "question docs"]
+    assert calls == ["question", "question docs", "question primary sources"]
+
+
+@pytest.mark.asyncio
+async def test_quick_zero_result_uses_one_distinct_internal_repair(monkeypatch):
+    calls = []
+
+    async def plan(_query, mode):
+        return {
+            "query": "Android TV box benchmark",
+            "mode": mode,
+            "queries": ["Android TV box benchmark"],
+            "query_intent_ids": ["android"],
+        }
+
+    async def search(*, query, **_kwargs):
+        calls.append(query)
+        return []
+
+    monkeypatch.setattr(pipelines, "build_research_plan", plan)
+    monkeypatch.setattr(pipelines, "searxng_search", search)
+    monkeypatch.setattr(
+        pipelines,
+        "rag_query_impl",
+        AsyncMock(return_value={"results": []}),
+    )
+
+    result = await pipelines.research_pipeline(
+        "Android TV box benchmark",
+        mode="quick",
+        max_sources=0,
+        verify=False,
+        persist_source_artifacts=False,
+    )
+
+    assert calls == [
+        "Android TV box benchmark",
+        "Android TV box benchmark primary sources",
+    ]
+    assert result["search_fallback"]["reason"] == (
+        "initial_queries_returned_no_results"
+    )
 
 
 @pytest.mark.asyncio
@@ -284,7 +1285,7 @@ async def test_vector_query_failure_returns_extracted_redirect_without_snippet(
     monkeypatch,
 ):
     candidate = {
-        "title": "Current guide",
+        "title": "Current product guide",
         "url": "https://origin.example/guide",
         "domain": "origin.example",
         "snippet": "Discovery-only summary",
@@ -301,7 +1302,7 @@ async def test_vector_query_failure_returns_extracted_redirect_without_snippet(
     async def crawl(_semaphore, _candidate, **_kwargs):
         return {
             "ok": True,
-            "title": "Current guide",
+            "title": "Current product guide",
             "url": "https://final.example/guide",
             "requested_url": candidate["url"],
             "domain": "final.example",
@@ -333,6 +1334,8 @@ async def test_vector_query_failure_returns_extracted_redirect_without_snippet(
     assert result["source_coverage"]["extracted_evidence_items"] == 1
     assert result["source_coverage"]["search_snippet_evidence_items"] == 0
     assert result["verification"]["excluded_search_snippet_evidence_items"] == 0
+    assert result["completion"]["status"] == "partial"
+    assert "verification_inconclusive" in result["completion"]["reasons"]
 
 
 @pytest.mark.asyncio
@@ -521,8 +1524,8 @@ async def test_research_uses_one_date_safe_recovery_and_surfaces_diagnostics(
                         "undated_results": 1,
                         "unresponsive_engines": 1,
                     },
-                        "unresponsive_engines": [
-                            {"engine": "news-engine", "reason_code": "timeout"}
+                    "unresponsive_engines": [
+                        {"engine": "news-engine", "reason_code": "timeout"}
                     ],
                 },
                 policy=policy,
@@ -563,7 +1566,9 @@ async def test_research_uses_one_date_safe_recovery_and_surfaces_diagnostics(
             "freshness_status": candidate["freshness_status"],
         }
 
-    monkeypatch.setattr(pipelines, "runtime_retrieval_context", lambda: retrieval_context)
+    monkeypatch.setattr(
+        pipelines, "runtime_retrieval_context", lambda: retrieval_context
+    )
     monkeypatch.setattr(pipelines, "build_research_plan", plan)
     monkeypatch.setattr(pipelines, "searxng_search", search)
     monkeypatch.setattr(pipelines, "crawl_source_limited", crawl)
@@ -601,7 +1606,7 @@ async def test_research_uses_one_date_safe_recovery_and_surfaces_diagnostics(
 
 
 @pytest.mark.asyncio
-async def test_historical_exact_date_does_not_repeat_an_identical_search(monkeypatch):
+async def test_historical_exact_date_uses_a_distinct_date_safe_repair(monkeypatch):
     query = "AI news on 2026-06-01"
     calls = []
 
@@ -613,7 +1618,9 @@ async def test_historical_exact_date_does_not_repeat_an_identical_search(monkeyp
         return SearchResults([], policy=policy)
 
     monkeypatch.setattr(pipelines, "build_research_plan", plan)
-    monkeypatch.setattr(pipelines, "fallback_search_query", lambda *_args, **_kwargs: query)
+    monkeypatch.setattr(
+        pipelines, "fallback_search_query", lambda *_args, **_kwargs: query
+    )
     monkeypatch.setattr(pipelines, "searxng_search", search)
 
     result = await pipelines.research_pipeline(
@@ -624,10 +1631,15 @@ async def test_historical_exact_date_does_not_repeat_an_identical_search(monkeyp
         persist_source_artifacts=False,
     )
 
-    assert len(calls) == 1
-    assert calls[0][1].strict_date is True
-    assert calls[0][1].time_range is None
-    assert "search_fallback" not in result
+    assert [item[0] for item in calls] == [
+        query,
+        f"{query} primary sources",
+    ]
+    assert all(item[1].strict_date for item in calls)
+    assert all(item[1].time_range is None for item in calls)
+    assert result["search_fallback"]["reason"] == (
+        "initial_queries_returned_no_results"
+    )
 
 
 @pytest.mark.asyncio
@@ -854,7 +1866,7 @@ async def test_persistence_uses_source_concurrency_limit(monkeypatch):
             "title": f"Source {index}",
             "url": f"https://source{index}.example/doc",
             "domain": f"source{index}.example",
-            "snippet": f"Source {index} discovery",
+            "snippet": f"Independent comparison of source {index}",
             "score": 10 - index,
             "score_reasons": [],
         }
@@ -921,7 +1933,9 @@ async def test_persistence_uses_source_concurrency_limit(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_persistence_timeout_returns_extraction_and_invalidates_attempt(monkeypatch):
+async def test_persistence_timeout_returns_extraction_and_invalidates_attempt(
+    monkeypatch,
+):
     candidate = {
         "title": "Current guide",
         "url": "https://docs.example/current",
@@ -1002,9 +2016,9 @@ async def test_persistence_timeout_returns_extraction_and_invalidates_attempt(mo
     assert all(
         source["memory_indexed"] is False for source in result["crawled_sources"]
     )
-    assert {
-        source["memory_index_state"] for source in result["crawled_sources"]
-    } == {"revoked"}
+    assert {source["memory_index_state"] for source in result["crawled_sources"]} == {
+        "revoked"
+    }
     assert result["persistence"] == {
         "budget_seconds": 0.02,
         "timed_out": True,
@@ -1047,7 +2061,9 @@ async def test_bounded_invalidation_reports_failure_without_raising(monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_cancellation_during_persistence_reaches_invalidation_promptly(monkeypatch):
+async def test_cancellation_during_persistence_reaches_invalidation_promptly(
+    monkeypatch,
+):
     candidate = {
         "title": "Current guide",
         "url": "https://docs.example/current",
@@ -1198,7 +2214,8 @@ async def test_deferred_research_returns_fresh_evidence_without_qdrant_round_tri
             "requested_url": source["url"],
             "domain": source["domain"],
             "evidence_text": "Run the supported installer, then verify the service health.",
-            "_content": "Run the supported installer, then verify the service health. " * 20,
+            "_content": "Run the supported installer, then verify the service health. "
+            * 20,
         }
 
     store = ArtifactStore(tmp_path)
@@ -1298,6 +2315,148 @@ async def test_discovery_reranker_reorders_candidates_and_falls_back_on_timeout(
     assert fallback == candidates
     assert diagnostics["status"] == "timed_out"
     assert cancellation_seen.is_set()
+
+
+def test_relevance_gate_uses_reranker_only_when_it_has_a_strong_contrast():
+    candidates = [
+        {
+            "title": "Android TV box benchmark",
+            "snippet": "High-performance Nvidia Shield alternative",
+            "url": "https://strong.example/android-tv",
+            "domain": "strong.example",
+            "rerank_score": 0.92,
+        },
+        {
+            "title": "Android TV box product listing",
+            "snippet": "Android streaming box sold as a Shield alternative",
+            "url": "https://weak.example/android-tv",
+            "domain": "weak.example",
+            "rerank_score": 0.01,
+        },
+        {
+            "title": "Android TV device performance review",
+            "snippet": "Benchmarks for a powerful Nvidia Shield alternative",
+            "url": "https://second.example/android-tv",
+            "domain": "second.example",
+            "rerank_score": 0.80,
+        },
+        {
+            "title": "Android TV streaming box comparison",
+            "snippet": "Current high-performance Shield alternatives",
+            "url": "https://third.example/android-tv",
+            "domain": "third.example",
+            "rerank_score": 0.75,
+        },
+    ]
+    query = "powerful Android TV box Nvidia Shield alternative"
+
+    gated, diagnostics = pipelines._filter_relevant_search_candidates(
+        candidates,
+        query,
+        reranking_status="applied",
+    )
+    deterministic, fallback_diagnostics = pipelines._filter_relevant_search_candidates(
+        candidates,
+        query,
+        reranking_status="disabled",
+    )
+    multi_intent, multi_diagnostics = pipelines._filter_relevant_search_candidates(
+        candidates,
+        query,
+        reranking_status="applied",
+        allow_reranker_rejection=False,
+    )
+
+    assert [item["domain"] for item in gated] == [
+        "strong.example",
+        "second.example",
+        "third.example",
+    ]
+    assert diagnostics["reranker_signal_used"] is True
+    assert diagnostics["reranker_rejections"] == 1
+    assert len(deterministic) == 4
+    assert fallback_diagnostics["reranker_signal_used"] is False
+    assert len(multi_intent) == 4
+    assert multi_diagnostics["reranker_signal_used"] is False
+
+
+def test_relevance_gate_does_not_reject_negligible_zero_dispersion_gap():
+    candidates = [
+        {
+            "title": "Android TV box benchmark",
+            "snippet": "Powerful Nvidia Shield alternative",
+            "url": f"https://source{index}.example/android-tv",
+            "domain": f"source{index}.example",
+            "rerank_score": score,
+        }
+        for index, score in enumerate([1.0, 1.0, 1.0, 0.99])
+    ]
+
+    accepted, diagnostics = pipelines._filter_relevant_search_candidates(
+        candidates,
+        "powerful Android TV box Nvidia Shield alternative",
+        reranking_status="applied",
+    )
+
+    assert len(accepted) == 4
+    assert diagnostics["reranker_signal_used"] is False
+    assert diagnostics["reranker_rejections"] == 0
+
+
+def test_reranker_floor_ignores_deterministically_irrelevant_candidates():
+    candidates = [
+        {
+            "title": f"Unrelated cider result {index}",
+            "snippet": "Apple harvest and cider production",
+            "url": f"https://noise{index}.example/result",
+            "rerank_score": score,
+        }
+        for index, score in enumerate([0.99, 0.98, 0.97])
+    ]
+    candidates.append(
+        {
+            "title": "Android TV box benchmark",
+            "snippet": "Nvidia Shield alternatives compared",
+            "url": "https://relevant.example/android-tv",
+            "rerank_score": 0.01,
+        }
+    )
+
+    accepted, diagnostics = pipelines._filter_relevant_search_candidates(
+        candidates,
+        "powerful Android TV box Nvidia Shield alternative",
+        reranking_status="applied",
+    )
+
+    assert [item["url"] for item in accepted] == ["https://relevant.example/android-tv"]
+    assert diagnostics["reranker_signal_used"] is False
+
+
+def test_relevance_gate_ignores_nonfinite_reranker_scores():
+    candidates = [
+        {
+            "title": "Android TV box benchmark",
+            "snippet": "Powerful Nvidia Shield alternative",
+            "url": f"https://source{index}.example/android-tv",
+            "domain": f"source{index}.example",
+            "rerank_score": score,
+        }
+        for index, score in enumerate([0.9, 0.8, float("nan"), float("inf")])
+    ]
+
+    gated, diagnostics = pipelines._filter_relevant_search_candidates(
+        candidates,
+        "powerful Android TV box Nvidia Shield alternative",
+        reranking_status="applied",
+    )
+
+    assert len(gated) == 4
+    assert diagnostics["invalid_reranker_scores"] == 2
+    assert all(
+        not isinstance(item.get("rerank_score"), float)
+        or math.isfinite(item["rerank_score"])
+        for item in gated
+    )
 
 
 @pytest.mark.asyncio

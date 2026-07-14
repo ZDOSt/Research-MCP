@@ -15,7 +15,12 @@ def _payload(count=4, *, unresponsive=None):
             {
                 "title": f"Result {index}",
                 "url": f"https://source{index}.example/article",
-                "content": "Relevant current source material",
+                "content": (
+                    "Relevant current source material about a rate limit test, "
+                    "Docker docs, stale fallback query, shared Redis cache, "
+                    "concurrent scoped cache, shared circuit, partial cache "
+                    "response, clean zero result, and fail open Redis circuit."
+                ),
             }
             for index in range(count)
         ],
@@ -516,3 +521,364 @@ async def test_redis_circuit_timeout_fails_open(monkeypatch):
 
     assert results
     assert len(captured) == 1
+
+
+def test_topical_relevance_rejects_cider_but_accepts_android_tv_results():
+    query = "most powerful Android TV box Nvidia Shield alternative"
+    cider = searching.search_result_relevance(
+        {
+            "title": "Most: Austrian cider and perry",
+            "url": "https://cider.example/most",
+            "snippet": "Traditional apple and pear cider called Most in German.",
+        },
+        query,
+    )
+    android = searching.search_result_relevance(
+        {
+            "title": "High-performance Android TV boxes compared",
+            "url": "https://tech.example/android-tv-boxes",
+            "snippet": "Benchmarks of current Nvidia Shield alternatives.",
+        },
+        query,
+    )
+
+    assert cider["is_relevant"] is False
+    assert cider["matched_terms"] == []
+    assert android["is_relevant"] is True
+    assert {"android", "tv", "box", "nvidia", "shield", "alternative"}.issubset(
+        set(android["matched_terms"])
+    )
+
+
+def test_topical_relevance_normalizes_common_research_intent_synonyms():
+    installation = searching.search_result_relevance(
+        {
+            "title": "Current product guide",
+            "url": "https://docs.example/product/guide",
+            "snippet": "A maintained product manual.",
+        },
+        "install the product",
+    )
+    comparison = searching.search_result_relevance(
+        {
+            "title": "Independent device benchmark",
+            "url": "https://reviews.example/device-benchmark",
+            "snippet": "Performance review of the device.",
+        },
+        "compare the device",
+    )
+    generic_installation = searching.search_result_relevance(
+        {
+            "title": "Installation guide",
+            "url": "https://unrelated.example/installation-guide",
+            "snippet": "A general setup manual for unrelated software.",
+        },
+        "install the product",
+    )
+
+    assert installation["is_relevant"] is True
+    assert "install" in installation["matched_terms"]
+    assert comparison["is_relevant"] is True
+    assert "compare" in comparison["matched_terms"]
+    assert generic_installation["is_relevant"] is False
+    assert generic_installation["reason"] == "generic_only_topic_overlap"
+
+
+@pytest.mark.parametrize(
+    ("query", "drifted_title", "requested", "substituted"),
+    [
+        ("vegan dinner recipes", "chicken dinner recipes", "vegan", "chicken"),
+        ("wireless headphones", "wired headphones", "wireless", "wired"),
+        (
+            "free project management software",
+            "paid project management software",
+            "free",
+            "paid",
+        ),
+        ("indoor security cameras", "outdoor security cameras", "indoor", "outdoor"),
+        ("beginner Python tutorials", "advanced Python tutorials", "beginner", "advanced"),
+        ("cat food recommendations", "dog food recommendations", "cat", "dog"),
+        ("Android TV boxes", "Android TV remote apps", "box", "app"),
+    ],
+)
+def test_topical_relevance_rejects_explicit_qualifier_substitution(
+    query,
+    drifted_title,
+    requested,
+    substituted,
+):
+    analysis = searching.search_result_relevance(
+        {
+            "title": drifted_title,
+            "url": "https://drift.example/result",
+        },
+        query,
+        threshold=0.42,
+    )
+
+    assert analysis["is_relevant"] is False
+    assert analysis["reason"] == "conflicting_topic_qualifier"
+    assert any(
+        requested in conflict["requested"]
+        and substituted in conflict["substituted"]
+        for conflict in analysis["topic_conflicts"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("query", "reformulated_title"),
+    [
+        ("vegan dinner recipes", "plant-based dinner recipes"),
+        ("wireless headphones", "cordless Bluetooth headphones"),
+        ("free project management software", "no-cost project management software"),
+        ("beginner Python tutorials", "introductory Python guides"),
+        ("cat food recommendations", "feline food recommendations"),
+        ("Android TV boxes", "Android TV streaming devices"),
+        (
+            "wireless versus wired headphones",
+            "wired headphones compared with wireless models",
+        ),
+    ],
+)
+def test_topical_relevance_preserves_equivalent_or_comparative_reformulations(
+    query,
+    reformulated_title,
+):
+    analysis = searching.search_result_relevance(
+        {
+            "title": reformulated_title,
+            "url": "https://reformulation.example/result",
+        },
+        query,
+        threshold=0.42,
+    )
+
+    assert analysis["is_relevant"] is True
+    assert analysis["reason"] == "relevant_topic_overlap"
+
+
+def test_topical_relevance_splits_mixed_japanese_and_latin_scripts():
+    analysis = searching.search_result_relevance(
+        {
+            "title": "Ubuntu に Docker Engine をインストールする",
+            "snippet": "Docker Engine の公式インストール手順",
+            "url": "https://docs.docker.com/engine/install/ubuntu/",
+        },
+        "DockerをUbuntuにインストールする方法",
+    )
+
+    assert analysis["is_relevant"] is True
+    assert {"docker", "ubuntu", "インストール"}.issubset(analysis["matched_terms"])
+
+
+def test_topical_relevance_matches_reordered_chinese_character_runs():
+    analysis = searching.search_result_relevance(
+        {
+            "title": "\u5bb6\u5ead\u81ea\u52a8\u5316\u7cfb\u7edf\u5b89\u88c5\u6307\u5357",
+            "snippet": "\u914d\u7f6e\u548c\u5b89\u5168\u5efa\u8bae",
+            "url": "https://docs.example/home-automation",
+        },
+        "\u5982\u4f55\u5b89\u88c5\u5bb6\u5ead\u81ea\u52a8\u5316\u7cfb\u7edf",
+    )
+
+    assert analysis["is_relevant"] is True
+    assert analysis["reason"] == "relevant_cjk_bigram_overlap"
+    assert analysis["cjk_overlap"]["matched_bigram_count"] >= 2
+    assert analysis["cjk_overlap"]["coverage"] >= 0.30
+
+
+def test_topical_relevance_matches_reordered_kanji_character_runs():
+    analysis = searching.search_result_relevance(
+        {
+            "title": "\u5c0e\u5165\u65b9\u6cd5: \u5bb6\u5ead\u5411\u3051\u81ea\u52d5\u5316",
+            "snippet": "\u73fe\u5728\u306e\u8a2d\u5b9a\u624b\u9806",
+            "url": "https://docs.example/home-automation-ja",
+        },
+        "\u5bb6\u5ead\u81ea\u52d5\u5316\u5c0e\u5165\u65b9\u6cd5",
+    )
+
+    assert analysis["is_relevant"] is True
+    assert analysis["reason"] == "relevant_cjk_bigram_overlap"
+    assert analysis["cjk_overlap"]["coverage"] >= 0.30
+
+
+def test_topical_relevance_matches_korean_spacing_variants():
+    analysis = searching.search_result_relevance(
+        {
+            "title": "\ucd5c\uc2e0\ub274\uc2a4\uc778\uacf5\uc9c0\ub2a5\ub3d9\ud5a5",
+            "snippet": "AI \ubaa8\ub378\uacfc \uc0b0\uc5c5 \ub3d9\ud5a5",
+            "url": "https://news.example/ai",
+        },
+        "\uc778\uacf5\uc9c0\ub2a5\ub274\uc2a4\uc54c\ub824\uc918",
+    )
+
+    assert analysis["is_relevant"] is True
+    assert analysis["reason"] == "relevant_cjk_bigram_overlap"
+    assert analysis["cjk_overlap"]["coverage"] >= 0.30
+
+
+def test_cjk_bigram_fallback_rejects_weak_generic_overlap():
+    analysis = searching.search_result_relevance(
+        {
+            "title": "\u82f9\u679c\u6c34\u679c\u8425\u517b\u6307\u5357",
+            "snippet": "\u82f9\u679c\u7684\u8425\u517b\u4ef7\u503c",
+            "url": "https://food.example/apple",
+        },
+        "\u82f9\u679c\u624b\u673a\u8bc4\u6d4b",
+    )
+
+    assert analysis["is_relevant"] is False
+    assert analysis["reason"] == "insufficient_topic_overlap"
+    assert analysis["cjk_overlap"]["matched_bigram_count"] == 1
+    assert analysis["cjk_overlap"]["used"] is False
+
+
+def test_generic_publication_overlap_does_not_count_as_topic_relevance():
+    analysis = searching.search_result_relevance(
+        {
+            "title": "University calendar published today",
+            "url": "https://university.example/calendar",
+            "snippet": "The updated academic calendar was published this morning.",
+        },
+        "AI news published today",
+    )
+
+    assert analysis["matched_terms"] == ["published"]
+    assert analysis["distinctive_query_terms"] == ["ai"]
+    assert analysis["matched_distinctive_terms"] == []
+    assert analysis["is_relevant"] is False
+    assert analysis["reason"] == "generic_only_topic_overlap"
+
+
+def test_relevant_results_are_not_truncated_behind_high_ranked_noise():
+    results = searching.compact_search_results(
+        {
+            "results": [
+                {
+                    "title": "Traditional German cider festival",
+                    "url": "https://cider.example/most",
+                    "content": "Apple varieties and regional Most tasting events.",
+                    "score": 100,
+                },
+                {
+                    "title": "Android TV box benchmarks",
+                    "url": "https://benchmarks.example/android-tv",
+                    "content": "Nvidia Shield alternatives compared by streaming performance.",
+                    "score": 1,
+                },
+            ]
+        },
+        "powerful Android TV box Nvidia Shield alternative",
+        max_results=1,
+    )
+
+    assert [item["domain"] for item in results] == ["benchmarks.example"]
+    assert results[0]["topical_relevance"]["is_relevant"] is True
+
+
+@pytest.mark.asyncio
+async def test_irrelevant_owner_diversity_does_not_stop_later_engine_stage(
+    monkeypatch,
+):
+    captured = []
+    payloads = [
+        {
+            "results": [
+                {
+                    "title": f"Most cider producer {index}",
+                    "url": f"https://cider{index}.example/most",
+                    "content": "Austrian apple cider and perry production.",
+                }
+                for index in range(4)
+            ]
+        },
+        {
+            "results": [
+                {
+                    "title": "Best Android TV boxes",
+                    "url": "https://android.example/tv-boxes",
+                    "content": "Current Nvidia Shield alternative models.",
+                },
+                {
+                    "title": "Android TV box benchmark comparison",
+                    "url": "https://bench.example/android-tv",
+                    "content": "Performance results for streaming boxes.",
+                },
+                {
+                    "title": "High performance Google TV boxes",
+                    "url": "https://streaming.example/google-tv-box",
+                    "content": "Android streaming hardware compared.",
+                },
+                {
+                    "title": "Nvidia Shield alternatives",
+                    "url": "https://media.example/shield-alternatives",
+                    "content": "Android TV replacement boxes reviewed.",
+                },
+            ]
+        },
+    ]
+
+    def responder(_params):
+        return _Response(payloads.pop(0))
+
+    monkeypatch.setattr(
+        searching.httpx,
+        "AsyncClient",
+        lambda **kwargs: _Client(responder, captured, **kwargs),
+    )
+
+    results = await searching.searxng_search(
+        "most powerful Android TV box Nvidia Shield alternative"
+    )
+
+    assert len(captured) == 2
+    stages = results.diagnostics["search_stages"]
+    assert stages[0]["coverage_sufficient"] is False
+    assert stages[0]["topical_relevance"]["relevant_count"] == 0
+    assert stages[1]["coverage_sufficient"] is True
+    assert stages[1]["topical_relevance"]["relevant_count"] >= 3
+
+
+@pytest.mark.asyncio
+async def test_generic_only_overlap_does_not_stop_later_engine_stage(monkeypatch):
+    captured = []
+    payloads = [
+        {
+            "results": [
+                {
+                    "title": f"University notice published today {index}",
+                    "url": f"https://campus{index}.example/notices",
+                    "content": "An academic calendar update published today.",
+                }
+                for index in range(4)
+            ]
+        },
+        {
+            "results": [
+                {
+                    "title": f"AI news report {index}",
+                    "url": f"https://ainews{index}.example/report",
+                    "content": "Artificial intelligence industry news published today.",
+                }
+                for index in range(4)
+            ]
+        },
+    ]
+
+    def responder(_params):
+        return _Response(payloads.pop(0))
+
+    monkeypatch.setattr(
+        searching.httpx,
+        "AsyncClient",
+        lambda **kwargs: _Client(responder, captured, **kwargs),
+    )
+
+    results = await searching.searxng_search("AI news published today")
+
+    assert len(captured) == 2
+    stages = results.diagnostics["search_stages"]
+    assert stages[0]["coverage_sufficient"] is False
+    assert stages[0]["topical_relevance"]["relevant_count"] == 0
+    assert stages[1]["coverage_sufficient"] is True
+    assert stages[1]["topical_relevance"]["relevant_count"] >= 3

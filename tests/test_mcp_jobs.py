@@ -396,6 +396,74 @@ class MCPJobIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((kind, tool_name), ("research_web", "research_web"))
         self.assertEqual(payload["query"], "question")
         self.assertEqual(payload["namespace"], "project-a")
+        self.assertNotIn("proposed_queries", payload)
+
+    async def test_sync_research_normalizes_and_enqueues_proposed_queries(self):
+        server = load_mcp_server(backend="redis")
+        queued_result = {"job_id": uuid.uuid4().hex, "status": "running"}
+        enqueue_and_wait = AsyncMock(return_value=queued_result)
+        with patch.object(server, "_enqueue_and_wait", enqueue_and_wait):
+            result = await server.research_web(
+                "How do I install Docker?",
+                proposed_queries=[
+                    "  Docker   official installation  ",
+                    "Docker official installation?",
+                ],
+            )
+
+        self.assertEqual(result, queued_result)
+        payload = enqueue_and_wait.await_args.args[1]
+        self.assertEqual(
+            payload["proposed_queries"],
+            ["Docker official installation"],
+        )
+
+    async def test_inline_research_forwards_proposed_queries(self):
+        server = load_mcp_server(backend="inline")
+        pipeline = AsyncMock(return_value={"query": "question"})
+        with patch.object(server, "research_pipeline", pipeline):
+            await server.research_web(
+                "question",
+                proposed_queries=["focused search query"],
+            )
+
+        self.assertEqual(
+            pipeline.await_args.kwargs["proposed_queries"],
+            ["focused search query"],
+        )
+
+    async def test_start_research_normalizes_proposed_queries(self):
+        server = load_mcp_server()
+        enqueue = AsyncMock(
+            return_value={
+                "job_id": uuid.uuid4().hex,
+                "kind": "research_web",
+                "status": "queued",
+            }
+        )
+        with patch.object(server, "enqueue_job", enqueue):
+            await server.start_research(
+                "current Docker guidance",
+                proposed_queries=["  Docker   official docs  "],
+            )
+
+        payload = enqueue.await_args.args[1]
+        self.assertEqual(payload["proposed_queries"], ["Docker official docs"])
+
+    async def test_start_research_omits_proposed_queries_when_absent(self):
+        server = load_mcp_server()
+        enqueue = AsyncMock(
+            return_value={
+                "job_id": uuid.uuid4().hex,
+                "kind": "research_web",
+                "status": "queued",
+            }
+        )
+        with patch.object(server, "enqueue_job", enqueue):
+            await server.start_research("current Docker guidance")
+
+        payload = enqueue.await_args.args[1]
+        self.assertNotIn("proposed_queries", payload)
 
     async def test_authenticated_inline_research_does_not_create_unowned_artifacts(self):
         server = load_mcp_server(backend="inline", auth_token="top-secret")

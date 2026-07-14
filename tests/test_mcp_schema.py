@@ -33,6 +33,18 @@ async def test_all_public_tools_expose_bounded_client_schemas():
         "minimum": 0,
         "type": "integer",
     }
+    for tool_name in ("research_web", "start_research"):
+        parameters = tools[tool_name].parameters
+        proposed_schema = next(
+            branch
+            for branch in parameters["properties"]["proposed_queries"]["anyOf"]
+            if branch.get("type") == "array"
+        )
+        assert proposed_schema["minItems"] == 1
+        assert proposed_schema["maxItems"] == 5
+        assert proposed_schema["items"]["minLength"] == 1
+        assert proposed_schema["items"]["maxLength"] == 180
+        assert "proposed_queries" not in parameters.get("required", [])
 
     investigation = tools["investigate_url"].parameters["properties"]
     assert investigation["mode"]["enum"] == ["auto", "targeted", "balanced", "exhaustive"]
@@ -81,6 +93,18 @@ async def test_tool_discovery_promotes_proactive_research_without_redundant_arti
     assert "did not explicitly ask to search" in research_description
     assert "complete research question or task" in research_description
     assert "effective search queries internally" in research_description
+    assert "formulate one or more concise search-engine queries" in research_description
+    assert "validates proposals against the complete task" in research_description
+    assert "Quick mode's one-query budget" in research_description
+    assert "Omit proposed_queries in those modes" in research_description
+    assert "one bounded query repair" in research_description
+    assert "low_topical_relevance" in research_description
+    assert "instead of repeating the same research_web call" in research_description
+
+    start_description = tools["start_research"].description
+    assert "complete research task" in start_description
+    assert "proposed_queries are ineligible in both modes" in start_description
+    assert "Pass Keep" not in start_description
 
     artifact_description = tools["get_research_artifact"].description
     assert "intentionally omit their" in artifact_description

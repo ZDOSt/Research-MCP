@@ -153,7 +153,7 @@ def test_exact_version_anchor_is_not_satisfied_by_a_longer_version():
 
 @pytest.mark.parametrize(
     "source_query",
-    ["best paper shredder", "how to make a paper airplane", "study desk buying guide"],
+    ["how to make a paper airplane", "study desk buying guide"],
 )
 def test_nonacademic_uses_of_academic_words_keep_general_variants(source_query):
     queries = deterministic_plan(source_query, "balanced")["queries"]
@@ -456,6 +456,67 @@ def test_three_intent_request_uses_the_query_budget_for_each_intent(monkeypatch)
     assert any("breaking changes" in query for query in plan["queries"])
 
 
+def test_coordinated_subject_list_becomes_independent_research_intents():
+    plan = deterministic_plan(
+        "Find AI news, Docker releases, and PostgreSQL releases.",
+        "balanced",
+    )
+
+    assert plan["queries"] == [
+        "AI news",
+        "Docker releases",
+        "PostgreSQL releases",
+    ]
+    assert plan["query_intent_ids"] == ["intent-1", "intent-2", "intent-3"]
+    assert plan["intent_contexts"] == {
+        "intent-1": "AI news",
+        "intent-2": "Docker releases",
+        "intent-3": "PostgreSQL releases",
+    }
+
+
+def test_coordinated_modifiers_sharing_a_trailing_subject_stay_together():
+    plan = deterministic_plan(
+        "Find red, green, and blue paint options.",
+        "balanced",
+    )
+
+    assert set(plan["query_intent_ids"]) == {"intent-1"}
+    assert "red, green, and blue paint options" in plan["queries"][0]
+
+
+@pytest.mark.asyncio
+async def test_specialized_proposals_align_to_coordinated_subject_intents(monkeypatch):
+    planner = pytest.importorskip("planner")
+    monkeypatch.setattr(planner, "PLANNER_BASE_URL", "")
+    monkeypatch.setattr(planner, "PLANNER_MODEL", "")
+
+    plan = await planner.build_research_plan(
+        "Find AI news, Docker releases, and PostgreSQL releases.",
+        "deep",
+        proposed_queries=[
+            "latest artificial intelligence headlines",
+            "current Docker release notes",
+            "latest PostgreSQL release notes",
+        ],
+    )
+
+    handling = plan["proposed_query_handling"]
+    aligned = handling["accepted"] + [
+        item
+        for item in handling["rejected"]
+        if item["reason"] == "mode_query_budget_exhausted"
+    ]
+    assert {item["intent_id"] for item in aligned} == {
+        "intent-1",
+        "intent-2",
+        "intent-3",
+    }
+    assert not {
+        item["reason"] for item in handling["rejected"]
+    } & {"off_topic", "ambiguous_intent"}
+
+
 def test_relative_date_context_does_not_leak_between_independent_intents():
     queries = compact_search_queries(
         "What happened in AI today? How do I install Docker?",
@@ -505,8 +566,8 @@ def test_compound_mixed_intents_are_split_and_grouped_without_date_leakage(monke
         and intent_id == "intent-2"
         for query, intent_id in zip(plan["queries"], plan["query_intent_ids"])
     )
-    assert plan["query_intent_ids"].count("intent-1") == 2
-    assert plan["query_intent_ids"].count("intent-2") == 1
+    assert plan["query_intent_ids"].count("intent-1") == 1
+    assert plan["query_intent_ids"].count("intent-2") == 2
 
 
 @pytest.mark.parametrize(
@@ -637,6 +698,345 @@ def test_environment_context_supports_but_does_not_displace_the_explicit_intent(
     assert queries[0] == "install Docker"
     assert any("install Docker" in query and "Debian" in query for query in queries)
     assert all(query != "My server uses Debian 12." for query in queries)
+
+
+@pytest.mark.parametrize(
+    ("source_query", "required_terms"),
+    [
+        ("Android TV box. Must support WiFi 7.", ("Android TV box", "WiFi 7")),
+        (
+            "I want an Android TV box. It must support WiFi 7.",
+            ("Android TV box", "WiFi 7"),
+        ),
+        (
+            "Find an Android TV box. It needs at least 8GB RAM.",
+            ("Android TV box", "8GB", "RAM"),
+        ),
+        ("I want a NAS. ZFS support is required.", ("NAS", "ZFS")),
+    ],
+)
+def test_declarative_constraint_is_part_of_the_primary_query(
+    source_query,
+    required_terms,
+):
+    plan = deterministic_plan(source_query, "balanced")
+
+    assert plan["queries"]
+    assert all(
+        all(term in query for term in required_terms)
+        for query in plan["queries"]
+    )
+    assert set(plan["query_intent_ids"]) == {"intent-1"}
+
+
+def test_self_contained_comparison_remains_independent_of_prior_intent():
+    plan = deterministic_plan(
+        "What is the weather in New York and compare PostgreSQL and MySQL?",
+        "balanced",
+    )
+    grouped = list(zip(plan["queries"], plan["query_intent_ids"]))
+
+    assert ("What is the weather in New York", "intent-1") in grouped
+    assert ("compare PostgreSQL and MySQL?", "intent-2") in grouped
+    assert all(
+        "PostgreSQL" not in query and "MySQL" not in query
+        for query, intent_id in grouped
+        if intent_id == "intent-1"
+    )
+    assert all(
+        "weather" not in query.lower()
+        for query, intent_id in grouped
+        if intent_id == "intent-2"
+    )
+
+
+@pytest.mark.parametrize(
+    "source_query",
+    [
+        "I use PostgreSQL. How does it compare with MySQL?",
+        "I want a PostgreSQL database. Compare prices and features.",
+    ],
+)
+def test_context_dependent_comparison_still_inherits_prior_context(source_query):
+    plan = deterministic_plan(source_query, "balanced")
+
+    assert all("PostgreSQL" in query for query in plan["queries"])
+    assert set(plan["query_intent_ids"]) == {"intent-1"}
+
+
+@pytest.mark.parametrize(
+    "source_query",
+    ["Let's talk about something else.", "Anyway."],
+)
+def test_discourse_and_topic_reset_segments_never_become_queries(source_query):
+    assert compact_search_query(source_query) == ""
+    assert compact_search_queries(source_query) == []
+    assert fallback_search_query(source_query) == ""
+    assert deterministic_plan(source_query, "balanced")["queries"] == []
+
+
+@pytest.mark.parametrize(
+    "source_query",
+    [
+        "Let's talk about something else. I want a NAS.",
+        "Anyway. I want a NAS.",
+        "I want an old laptop. Let's talk about something else. I want a NAS.",
+    ],
+)
+def test_discourse_is_removed_and_topic_reset_discards_stale_intents(source_query):
+    plan = deterministic_plan(source_query, "balanced")
+
+    assert plan["queries"] == [
+        "NAS",
+        "NAS authoritative sources",
+        "NAS independent sources",
+    ]
+
+
+@pytest.mark.parametrize(
+    "source_query",
+    [
+        "Let's talk about something else, I want a NAS.",
+        "Let's talk about something else: I want a NAS.",
+        "Anyway, I want a NAS.",
+    ],
+)
+def test_inline_reset_or_discourse_prefix_retains_the_following_request(source_query):
+    plan = deterministic_plan(source_query, "balanced")
+
+    assert plan["queries"] == [
+        "NAS",
+        "NAS authoritative sources",
+        "NAS independent sources",
+    ]
+
+
+@pytest.mark.parametrize(
+    "source_query",
+    [
+        "Install and configure Docker.",
+        "I need to install and configure Docker.",
+    ],
+)
+def test_compound_actions_with_a_shared_object_remain_one_intent(source_query):
+    plan = deterministic_plan(source_query, "balanced")
+
+    assert plan["queries"][0].rstrip(".").lower() == "install and configure docker"
+    assert set(plan["query_intent_ids"]) == {"intent-1"}
+
+
+@pytest.mark.parametrize(
+    ("context", "required_term"),
+    [
+        ("My budget is $200.", "$200"),
+        ("I use Plex.", "Plex"),
+        ("I live in Canada.", "Canada"),
+    ],
+)
+def test_pre_goal_user_constraints_are_carried_into_selection_queries(
+    context,
+    required_term,
+):
+    plan = deterministic_plan(
+        f"{context} I want an Android TV box. Which should I buy?",
+        "balanced",
+    )
+
+    assert all(required_term in query for query in plan["queries"])
+    assert all("Android TV box" in query for query in plan["queries"])
+    assert set(plan["query_intent_ids"]) == {"intent-1"}
+
+
+def test_shared_year_date_range_is_preserved_in_every_query_variant():
+    plan = deterministic_plan(
+        "Find Nextcloud releases from July 10 to July 12 2026.",
+        "balanced",
+    )
+
+    assert all("from July 10 to July 12 2026" in query for query in plan["queries"])
+
+
+def test_dependent_upgrade_clause_carries_the_nextcloud_subject():
+    plan = deterministic_plan(
+        "How do I install Nextcloud? How do I upgrade it safely?",
+        "balanced",
+    )
+
+    assert all("Nextcloud" in query for query in plan["queries"])
+    assert all("upgrade" in query.lower() for query in plan["queries"])
+    assert set(plan["query_intent_ids"]) == {"intent-1"}
+
+
+def test_version_only_upgrade_clause_retains_the_product_subject():
+    plan = deterministic_plan(
+        "What is the latest Nextcloud version and how do I upgrade from 29?",
+        "balanced",
+    )
+
+    assert plan["queries"]
+    assert all("Nextcloud" in query for query in plan["queries"])
+    assert all("upgrade" in query.lower() for query in plan["queries"])
+    assert all("29" in query for query in plan["queries"])
+
+
+def test_dependent_explanation_clause_does_not_become_a_search_intent():
+    plan = deterministic_plan(
+        "Find the top AI stories and explain why they matter.",
+        "balanced",
+    )
+
+    assert all("AI stories" in query for query in plan["queries"])
+    assert all("why they matter" not in query.lower() for query in plan["queries"])
+    assert set(plan["query_intent_ids"]) == {"intent-1"}
+
+
+def test_topic_goals_are_independent_explicit_intents():
+    plan = deterministic_plan(
+        "I want a NAS. I want an Android phone.",
+        "balanced",
+    )
+
+    assert ("NAS", "intent-1") in zip(plan["queries"], plan["query_intent_ids"])
+    assert ("Android phone", "intent-2") in zip(
+        plan["queries"], plan["query_intent_ids"]
+    )
+    assert plan["query_intent_ids"].count("intent-2") == 2
+
+
+@pytest.mark.parametrize(
+    ("source_query", "expected_query"),
+    [
+        ("I want a NAS. Which should I buy?", "NAS best option"),
+        (
+            "I want an Android phone. What is the best alternative?",
+            "Android phone best alternative",
+        ),
+        ("I want a laptop. which one is best?", "laptop best option"),
+    ],
+)
+def test_elliptical_selection_followups_attach_the_topic(source_query, expected_query):
+    plan = deterministic_plan(source_query, "balanced")
+
+    assert plan["queries"][0] == expected_query
+    assert all(expected_query in query for query in plan["queries"])
+    assert all("Which" not in query and "which" not in query for query in plan["queries"])
+    assert set(plan["query_intent_ids"]) == {"intent-1"}
+
+
+def test_elliptical_followup_backtracks_over_topic_to_related_constraints():
+    source_query = "It must support WiFi 7. I want a router. Which should I buy?"
+
+    compact = compact_search_query(source_query)
+    plan = deterministic_plan(source_query, "balanced")
+
+    assert compact == "must support WiFi 7 router best option"
+    assert all("WiFi 7" in query and "router" in query for query in plan["queries"])
+
+
+def test_elliptical_followup_stops_at_an_independent_prior_intent():
+    plan = deterministic_plan(
+        "How do I install Docker? It must support WiFi 7. "
+        "I want a router. Which should I buy?",
+        "balanced",
+    )
+    grouped = list(zip(plan["queries"], plan["query_intent_ids"]))
+
+    assert ("install Docker", "intent-1") in grouped
+    assert ("must support WiFi 7 router best option", "intent-2") in grouped
+    assert all(
+        "Docker" not in query
+        for query, intent_id in grouped
+        if intent_id == "intent-2"
+    )
+    assert plan["query_intent_ids"].count("intent-2") == 2
+
+
+@pytest.mark.parametrize(
+    "source_query",
+    [
+        "Compare PostgreSQL and MySQL",
+        "PostgreSQL alternative",
+        "most powerful mini PC",
+        "fastest WiFi router",
+        "best paper shredder",
+    ],
+)
+def test_comparisons_and_product_selection_get_evidence_oriented_variants(source_query):
+    queries = deterministic_plan(source_query, "balanced")["queries"]
+
+    assert "benchmarks specifications" in queries[1]
+    assert "independent comparisons" in queries[2]
+
+
+def test_best_practices_are_not_mistaken_for_product_selection():
+    queries = deterministic_plan("Docker security best practices", "balanced")["queries"]
+
+    assert any("authoritative sources" in query for query in queries)
+    assert all("benchmarks specifications" not in query for query in queries)
+
+
+def test_unquoted_killer_nickname_is_rewritten_as_an_alternative():
+    compact = compact_search_query("What is the shield-killer?")
+
+    assert compact == "shield alternative"
+
+
+ANDROID_TV_COMPARISON_REQUEST = (
+    "The Shield is old as fuck anyway. And it's still 200 bucks... lol... "
+    "Let's talk about something else. I want a powerful android TV box. NOT the shield. "
+    "As powerful as that thing is, it has some serious limitations in 2026. So... "
+    'what\'s the "shield-killer" out there that would be more powerful than a Bravia '
+    "XR-65X90CK"
+)
+
+
+def test_contextual_product_comparison_becomes_focused_search_queries(monkeypatch):
+    monkeypatch.setattr(
+        "planner.runtime_retrieval_context",
+        lambda: {"current_date_local": "2026-07-13"},
+    )
+
+    compact = compact_search_query(ANDROID_TV_COMPARISON_REQUEST)
+    plan = deterministic_plan(ANDROID_TV_COMPARISON_REQUEST, "balanced")
+
+    assert "powerful android TV box" in compact
+    assert "shield alternative" in compact.lower()
+    assert "Bravia XR-65X90CK" in compact
+    assert "2026" in compact
+    assert any("benchmarks specifications" in query for query in plan["queries"])
+    assert "benchmarks specifications" in plan["queries"][1]
+    assert all(query.lower().count("shield") == 1 for query in plan["queries"])
+    assert all('"shield-killer"' not in query.lower() for query in plan["queries"])
+    assert all("200" not in query for query in plan["queries"])
+    assert all(" Let " not in f" {query} " for query in plan["queries"])
+    assert all(" NOT " not in f" {query} " for query in plan["queries"])
+
+
+def test_contextual_comparison_rewrite_is_not_domain_specific():
+    source_query = (
+        "I am looking for a high-performance home router. Not the Apex Pro. "
+        'Which "Apex Pro-killer" is faster than a RouterMax X900?'
+    )
+
+    queries = deterministic_plan(source_query, "balanced")["queries"]
+
+    assert all("high-performance home router" in query for query in queries)
+    assert all("Apex Pro alternative" in query for query in queries)
+    assert all("RouterMax X900" in query for query in queries)
+    assert all(query.count("Apex Pro") == 1 for query in queries)
+    assert all('"Apex Pro-killer"' not in query for query in queries)
+
+
+def test_exact_term_filter_drops_prices_without_dropping_status_or_model_numbers():
+    planner = pytest.importorskip("planner")
+
+    assert "200" not in planner._protected_exact_terms("It still costs 200 bucks")
+    assert "200" not in planner._protected_exact_terms("The price is $200")
+    assert "404" in planner._protected_exact_terms("HTTP 404 Not Found")
+    assert "200" in planner._protected_exact_terms("Canon EOS 200 specifications")
+    assert "Canon EOS 200" in compact_search_query(
+        "Research Canon EOS 200. Return current specifications."
+    )
 
 
 @pytest.mark.parametrize(
@@ -885,14 +1285,13 @@ async def test_research_pipeline_retries_compact_query_after_zero_results(monkey
         "target_exact_matches": 1,
         "produced_results": True,
         "exact_matches_after": 0,
+        "intent_id": "intent-1",
     }
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("initial", [RuntimeError("search unavailable"), [{"url": ""}]])
-async def test_research_pipeline_does_not_fallback_on_error_or_raw_results(
+async def test_research_pipeline_does_not_recover_from_a_search_backend_error(
     monkeypatch,
-    initial,
 ):
     calls = []
 
@@ -901,9 +1300,7 @@ async def test_research_pipeline_does_not_fallback_on_error_or_raw_results(
 
     async def fake_search(query, max_results, mode, policy=None):
         calls.append(query)
-        if isinstance(initial, Exception):
-            raise initial
-        return initial
+        raise RuntimeError("search unavailable")
 
     monkeypatch.setattr(pipelines, "build_research_plan", fake_plan)
     monkeypatch.setattr(pipelines, "searxng_search", fake_search)
@@ -917,6 +1314,48 @@ async def test_research_pipeline_does_not_fallback_on_error_or_raw_results(
 
     assert calls == ["initial query"]
     assert "search_fallback" not in result
+
+
+@pytest.mark.asyncio
+async def test_research_pipeline_attempts_one_recovery_for_invalid_raw_results(
+    monkeypatch,
+):
+    calls = []
+
+    async def fake_plan(query, mode):
+        return {"query": query, "mode": mode, "queries": ["initial query"]}
+
+    async def fake_search(query, max_results, mode, policy=None):
+        calls.append(query)
+        return [{"url": ""}]
+
+    monkeypatch.setattr(pipelines, "build_research_plan", fake_plan)
+    monkeypatch.setattr(pipelines, "searxng_search", fake_search)
+    monkeypatch.setattr(
+        pipelines,
+        "runtime_retrieval_context",
+        lambda: {"current_date_local": "2026-07-12"},
+    )
+
+    result = await pipelines.research_pipeline(
+        VERBOSE_AI_NEWS_QUERY,
+        mode="quick",
+        max_sources=0,
+        persist_source_artifacts=False,
+    )
+
+    assert calls == ["initial query", "AI news published today 2026-07-12"]
+    assert result["search_fallback"] == {
+        "triggered": True,
+        "reason": "initial_queries_returned_no_results",
+        "query": "AI news published today 2026-07-12",
+        "policy_relaxation": "engine_time_range_only",
+        "exact_matches_before": 0,
+        "target_exact_matches": 0,
+        "produced_results": False,
+        "exact_matches_after": 0,
+        "intent_id": "intent-1",
+    }
 
 
 @pytest.mark.asyncio
@@ -1109,6 +1548,31 @@ async def test_configured_planner_discards_ambiguous_multi_intent_model_query(mo
 
 
 @pytest.mark.asyncio
+async def test_configured_planner_rejects_invented_query_constraints(monkeypatch):
+    planner = pytest.importorskip("planner")
+    source_query = "How do I install Docker on Ubuntu 24.04?"
+    invented_query = "Docker installation Windows 11 port 8080"
+    monkeypatch.setattr(planner, "PLANNER_BASE_URL", "https://planner.example")
+    monkeypatch.setattr(planner, "PLANNER_MODEL", "private-planner")
+    monkeypatch.setattr(
+        planner,
+        "_chat",
+        AsyncMock(
+            return_value=json.dumps(
+                {"queries": [invented_query], "subquestions": []}
+            )
+        ),
+    )
+
+    plan = await planner.build_research_plan(source_query, "balanced")
+
+    assert invented_query not in plan["queries"]
+    assert all("Windows" not in query for query in plan["queries"])
+    assert all("8080" not in query for query in plan["queries"])
+    assert plan["generated_by"] == "deterministic"
+
+
+@pytest.mark.asyncio
 async def test_configured_planner_groups_model_query_with_matching_intent(monkeypatch):
     planner = pytest.importorskip("planner")
     source_query = "Tell me today's AI news and explain how to install Docker"
@@ -1138,6 +1602,82 @@ async def test_configured_planner_groups_model_query_with_matching_intent(monkey
 
 
 @pytest.mark.asyncio
+async def test_configured_planner_marks_semantic_narrowing_for_canonical_anchor(
+    monkeypatch,
+):
+    planner = pytest.importorskip("planner")
+    monkeypatch.setattr(planner, "PLANNER_BASE_URL", "https://planner.example")
+    monkeypatch.setattr(planner, "PLANNER_MODEL", "private-planner")
+    monkeypatch.setattr(
+        planner,
+        "_chat",
+        AsyncMock(
+            return_value=json.dumps(
+                {"queries": ["OpenAI AI news"], "subquestions": []}
+            )
+        ),
+    )
+
+    plan = await planner.build_research_plan("Find AI news", "balanced")
+    planned_queries = list(
+        zip(plan["queries"], plan["query_intent_ids"], plan["query_roles"])
+    )
+
+    assert len(plan["queries"]) == len(plan["query_roles"])
+    assert ("OpenAI AI news", "intent-1", "semantic_expansion") in planned_queries
+    assert any(
+        intent_id == "intent-1" and role == "deterministic"
+        for _query, intent_id, role in planned_queries
+    )
+    assert plan["generated_by"] == "model:private-planner"
+
+
+@pytest.mark.asyncio
+async def test_configured_planner_keeps_safe_source_form_as_model_query(monkeypatch):
+    planner = pytest.importorskip("planner")
+    monkeypatch.setattr(planner, "PLANNER_BASE_URL", "https://planner.example")
+    monkeypatch.setattr(planner, "PLANNER_MODEL", "private-planner")
+    monkeypatch.setattr(
+        planner,
+        "_chat",
+        AsyncMock(
+            return_value=json.dumps(
+                {"queries": ["official Docker documentation"], "subquestions": []}
+            )
+        ),
+    )
+
+    plan = await planner.build_research_plan("Docker", "balanced")
+
+    assert ("official Docker documentation", "calling_model") in list(
+        zip(plan["queries"], plan["query_roles"])
+    )
+    assert plan["query_roles"] == ["deterministic", "calling_model"]
+
+
+@pytest.mark.asyncio
+async def test_configured_planner_rejects_query_without_canonical_anchor(monkeypatch):
+    planner = pytest.importorskip("planner")
+    monkeypatch.setattr(planner, "PLANNER_BASE_URL", "https://planner.example")
+    monkeypatch.setattr(planner, "PLANNER_MODEL", "private-planner")
+    monkeypatch.setattr(
+        planner,
+        "_chat",
+        AsyncMock(
+            return_value=json.dumps(
+                {"queries": ["AI news"], "subquestions": []}
+            )
+        ),
+    )
+
+    plan = await planner.build_research_plan("???", "balanced")
+
+    assert plan["queries"] == []
+    assert "query_roles" not in plan
+    assert plan["generated_by"] == "deterministic"
+
+
+@pytest.mark.asyncio
 async def test_empty_configured_planner_output_remains_deterministic(monkeypatch):
     planner = pytest.importorskip("planner")
     monkeypatch.setattr(planner, "PLANNER_BASE_URL", "https://planner.example")
@@ -1147,6 +1687,947 @@ async def test_empty_configured_planner_output_remains_deterministic(monkeypatch
     plan = await planner.build_research_plan("How do I install Docker?", "balanced")
 
     assert plan["generated_by"] == "deterministic"
+
+
+@pytest.mark.asyncio
+async def test_calling_model_query_is_primary_with_canonical_fallback(monkeypatch):
+    planner = pytest.importorskip("planner")
+    planner_chat = AsyncMock(return_value='{"queries": ["unused"]}')
+    monkeypatch.setattr(planner, "PLANNER_BASE_URL", "https://planner.example")
+    monkeypatch.setattr(planner, "PLANNER_MODEL", "private-planner")
+    monkeypatch.setattr(planner, "_chat", planner_chat)
+    monkeypatch.setattr(
+        planner,
+        "runtime_retrieval_context",
+        lambda: {"current_date_local": "2026-07-14"},
+    )
+
+    plan = await planner.build_research_plan(
+        "How do I install SillyTavern with Docker on Ubuntu 24.04?",
+        "balanced",
+        proposed_queries=["SillyTavern Docker installation Ubuntu 24.04"],
+    )
+
+    assert plan["generated_by"] == "calling-model+deterministic"
+    assert plan["queries"][0] == "SillyTavern Docker installation Ubuntu 24.04"
+    assert plan["queries"][1] == plan["intent_contexts"]["intent-1"]
+    assert len(plan["queries"]) <= planner.QUERY_BUDGETS["balanced"]
+    planner_chat.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_calling_model_query_preserves_budget_date_and_numeric_constraints(monkeypatch):
+    planner = pytest.importorskip("planner")
+    monkeypatch.setattr(planner, "PLANNER_BASE_URL", "")
+    monkeypatch.setattr(planner, "PLANNER_MODEL", "")
+    monkeypatch.setattr(
+        planner,
+        "runtime_retrieval_context",
+        lambda: {"current_date_local": "2026-07-14"},
+    )
+
+    product_plan = await planner.build_research_plan(
+        "What are the best Android TV boxes under $150 for emulation in 2026?",
+        "balanced",
+        proposed_queries=[
+            "Android TV box benchmarks under $150 emulation performance 2026"
+        ],
+    )
+    nginx_plan = await planner.build_research_plan(
+        "How do I configure Nginx on port 8080?",
+        "balanced",
+        proposed_queries=["Nginx configuration port 8080 guide"],
+    )
+    node_plan = await planner.build_research_plan(
+        "How do I install Node 22?",
+        "balanced",
+        proposed_queries=["Node 22 installation guide"],
+    )
+
+    product_query = product_plan["queries"][0]
+    assert "under $150" in product_query
+    assert "2026" in product_query
+    assert "Android TV" in product_query
+    assert "8080" in nginx_plan["queries"][0]
+    assert "22" in node_plan["queries"][0]
+
+
+@pytest.mark.asyncio
+async def test_calling_model_query_revalidates_after_date_augmentation(monkeypatch):
+    planner = pytest.importorskip("planner")
+    monkeypatch.setattr(planner, "PLANNER_BASE_URL", "")
+    monkeypatch.setattr(planner, "PLANNER_MODEL", "")
+    monkeypatch.setattr(
+        planner,
+        "runtime_retrieval_context",
+        lambda: {"current_date_local": "2026-07-14"},
+    )
+    request = "Tell me today's AI news about Docker"
+    tail = " AI news Docker today"
+    prefix = ("background " * 30)[: 180 - len(tail)].rstrip()
+    proposed_query = prefix + ("x" * (180 - len(tail) - len(prefix))) + tail
+    deterministic = planner.deterministic_plan(request, "balanced")
+
+    plan = await planner.build_research_plan(
+        request,
+        "balanced",
+        proposed_queries=[proposed_query],
+    )
+
+    handling = plan["proposed_query_handling"]
+    assert handling["accepted"] == []
+    assert handling["rejected"][0]["phase"] == "post_transform"
+    assert plan["queries"] == deterministic["queries"]
+    assert plan["queries"][0] == plan["intent_contexts"]["intent-1"]
+    assert all("background background" not in query for query in plan["queries"])
+
+
+@pytest.mark.asyncio
+async def test_calling_model_queries_reject_drift_ambiguity_and_duplicates(monkeypatch):
+    planner = pytest.importorskip("planner")
+    monkeypatch.setattr(planner, "PLANNER_BASE_URL", "")
+    monkeypatch.setattr(planner, "PLANNER_MODEL", "")
+
+    off_topic = await planner.build_research_plan(
+        "How do I install Docker?",
+        "balanced",
+        proposed_queries=["banana cultivation weather"],
+    )
+    duplicate = await planner.build_research_plan(
+        "How do I install Docker?",
+        "balanced",
+        proposed_queries=["install Docker?"],
+    )
+    ambiguous = await planner.build_research_plan(
+        "Find current AI news and explain how to install Docker.",
+        "balanced",
+        proposed_queries=["AI Docker technology overview"],
+    )
+
+    assert off_topic["generated_by"] == "deterministic"
+    assert off_topic["proposed_query_handling"]["rejected"][0]["reason"] == "off_topic"
+    assert duplicate["proposed_query_handling"]["rejected"][0]["reason"] == "duplicate_query"
+    assert not ambiguous["proposed_query_handling"]["accepted"]
+
+
+@pytest.mark.parametrize(
+    ("research_request", "proposed_query"),
+    [
+        ("vegan dinner recipes", "chicken dinner recipes"),
+        ("wireless headphones", "wired headphones"),
+        ("free project management software", "paid project management software"),
+        ("indoor security cameras", "outdoor security cameras"),
+        ("beginner Python tutorials", "advanced Python tutorials"),
+        ("cat food recommendations", "dog food recommendations"),
+        ("Android TV boxes", "Android TV remote apps"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_calling_model_query_rejects_explicit_topic_substitution(
+    monkeypatch,
+    research_request,
+    proposed_query,
+):
+    planner = pytest.importorskip("planner")
+    monkeypatch.setattr(planner, "PLANNER_BASE_URL", "")
+    monkeypatch.setattr(planner, "PLANNER_MODEL", "")
+
+    plan = await planner.build_research_plan(
+        research_request,
+        "balanced",
+        proposed_queries=[proposed_query],
+    )
+
+    handling = plan["proposed_query_handling"]
+    assert handling["accepted"] == []
+    assert handling["rejected"][0]["reason"] == "off_topic"
+    assert plan["queries"][0] == plan["intent_contexts"]["intent-1"]
+
+
+@pytest.mark.parametrize(
+    ("research_request", "proposed_query"),
+    [
+        ("vegan dinner recipes", "plant-based dinner recipes"),
+        ("wireless headphones", "cordless Bluetooth headphones"),
+        ("free project management software", "no-cost project management software"),
+        ("beginner Python tutorials", "introductory Python guides"),
+        ("cat food recommendations", "feline food recommendations"),
+        ("Android TV boxes", "Android TV streaming devices"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_calling_model_query_accepts_equivalent_topic_reformulation(
+    monkeypatch,
+    research_request,
+    proposed_query,
+):
+    planner = pytest.importorskip("planner")
+    monkeypatch.setattr(planner, "PLANNER_BASE_URL", "")
+    monkeypatch.setattr(planner, "PLANNER_MODEL", "")
+
+    plan = await planner.build_research_plan(
+        research_request,
+        "balanced",
+        proposed_queries=[proposed_query],
+    )
+
+    handling = plan["proposed_query_handling"]
+    assert handling["rejected"] == []
+    assert handling["accepted"][0]["proposed_query"] == proposed_query
+    assert plan["queries"][0] == proposed_query
+
+
+@pytest.mark.parametrize(
+    ("research_request", "proposed_query", "expected_reason"),
+    [
+        pytest.param(
+            "How do I install Node 22 on Ubuntu?",
+            "Node 20 installation Ubuntu",
+            "conflicting_constraint",
+            id="product-version",
+        ),
+        pytest.param(
+            "How do I configure Nginx on port 8080?",
+            "Nginx configuration port 80",
+            "conflicting_constraint",
+            id="port",
+        ),
+        pytest.param(
+            "Best Android TV boxes under $150",
+            "Android TV boxes under $200",
+            "conflicting_constraint",
+            id="price",
+        ),
+        pytest.param(
+            "Docker advisories from the past 7 days",
+            "Docker advisories from the past 30 days",
+            "conflicting_constraint",
+            id="relative-window",
+        ),
+        pytest.param(
+            "Best Android TV boxes in 2026",
+            "Best Android TV boxes in 2025",
+            "conflicting_constraint",
+            id="year",
+        ),
+        pytest.param(
+            "Best Android TV boxes under $150",
+            "Android TV boxes under \u20ac150",
+            "conflicting_constraint",
+            id="currency",
+        ),
+        pytest.param(
+            "Best Android TV boxes under $150 for emulation",
+            "Android TV boxes under 150 for emulation",
+            "missing_required_constraint",
+            id="omitted-currency",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_calling_model_query_rejects_conflicting_typed_constraints(
+    monkeypatch,
+    research_request,
+    proposed_query,
+    expected_reason,
+):
+    planner = pytest.importorskip("planner")
+    monkeypatch.setattr(planner, "PLANNER_BASE_URL", "")
+    monkeypatch.setattr(planner, "PLANNER_MODEL", "")
+
+    plan = await planner.build_research_plan(
+        research_request,
+        "balanced",
+        proposed_queries=[proposed_query],
+    )
+
+    handling = plan["proposed_query_handling"]
+    assert handling["accepted"] == []
+    assert handling["rejected"][0]["reason"] == expected_reason
+    assert plan["queries"][0] == plan["intent_contexts"]["intent-1"]
+
+
+@pytest.mark.parametrize(
+    ("research_request", "proposed_query"),
+    [
+        pytest.param(
+            "Install Docker on Ubuntu",
+            "Docker installation Ubuntu port 8080",
+            id="port",
+        ),
+        pytest.param(
+            "Install Docker on Ubuntu",
+            "Docker 27 installation Ubuntu",
+            id="product-version",
+        ),
+        pytest.param(
+            "Find Android TV boxes for emulation",
+            "Android TV boxes for emulation under $150",
+            id="price",
+        ),
+        pytest.param(
+            "Find Docker security advisories",
+            "Docker security advisories from the past 7 days",
+            id="relative-window",
+        ),
+        pytest.param(
+            "Install Docker on Ubuntu",
+            "Docker installation Ubuntu 2026",
+            id="year",
+        ),
+        pytest.param(
+            "Find Docker release news",
+            "Docker release news 2026-07-14",
+            id="explicit-date",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_calling_model_query_rejects_proposal_only_typed_constraints(
+    monkeypatch,
+    research_request,
+    proposed_query,
+):
+    planner = pytest.importorskip("planner")
+    monkeypatch.setattr(planner, "PLANNER_BASE_URL", "")
+    monkeypatch.setattr(planner, "PLANNER_MODEL", "")
+    monkeypatch.setattr(
+        planner,
+        "runtime_retrieval_context",
+        lambda: {"current_date_local": "2026-07-14"},
+    )
+
+    plan = await planner.build_research_plan(
+        research_request,
+        "balanced",
+        proposed_queries=[proposed_query],
+    )
+
+    handling = plan["proposed_query_handling"]
+    assert handling["accepted"] == []
+    assert handling["rejected"][0]["reason"] == "unauthorized_constraint"
+
+
+@pytest.mark.parametrize(
+    ("research_request", "proposed_query"),
+    [
+        (
+            "Tell me today's AI industry news",
+            "AI industry headlines today 2026-07-14",
+        ),
+        (
+            "Tell me yesterday's AI industry news",
+            "AI industry headlines yesterday 2026-07-13",
+        ),
+        (
+            "Find AI events happening tomorrow",
+            "AI events tomorrow 2026-07-15 schedule",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_calling_model_query_accepts_exact_runtime_date_concretization(
+    monkeypatch,
+    research_request,
+    proposed_query,
+):
+    planner = pytest.importorskip("planner")
+    monkeypatch.setattr(planner, "PLANNER_BASE_URL", "")
+    monkeypatch.setattr(planner, "PLANNER_MODEL", "")
+    monkeypatch.setattr(
+        planner,
+        "runtime_retrieval_context",
+        lambda: {"current_date_local": "2026-07-14"},
+    )
+
+    plan = await planner.build_research_plan(
+        research_request,
+        "balanced",
+        proposed_queries=[proposed_query],
+    )
+
+    handling = plan["proposed_query_handling"]
+    assert handling["rejected"] == []
+    assert plan["queries"][0] == proposed_query
+
+
+@pytest.mark.asyncio
+async def test_calling_model_query_rejects_incorrect_runtime_date_concretization(
+    monkeypatch,
+):
+    planner = pytest.importorskip("planner")
+    monkeypatch.setattr(planner, "PLANNER_BASE_URL", "")
+    monkeypatch.setattr(planner, "PLANNER_MODEL", "")
+    monkeypatch.setattr(
+        planner,
+        "runtime_retrieval_context",
+        lambda: {"current_date_local": "2026-07-14"},
+    )
+
+    plan = await planner.build_research_plan(
+        "Tell me today's AI industry news",
+        "balanced",
+        proposed_queries=["AI industry headlines today 2026-07-13"],
+    )
+
+    handling = plan["proposed_query_handling"]
+    assert handling["accepted"] == []
+    assert handling["rejected"][0]["reason"] == "unauthorized_constraint"
+
+
+@pytest.mark.parametrize(
+    ("research_request", "proposed_query"),
+    [
+        (
+            "Find password managers for Linux",
+            "password managers for Linux and Windows",
+        ),
+        (
+            "Find password managers for Windows",
+            "password managers for Windows and Linux",
+        ),
+        (
+            "Find password managers for Ubuntu",
+            "password managers for Ubuntu and Windows",
+        ),
+        (
+            "How do I install Docker?",
+            "Docker installation Windows",
+        ),
+        (
+            "Find password managers",
+            "Android password managers",
+        ),
+        (
+            "Find password managers",
+            "Chrome OS password managers",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_calling_model_query_rejects_unauthorized_platform_qualifiers(
+    monkeypatch,
+    research_request,
+    proposed_query,
+):
+    planner = pytest.importorskip("planner")
+    monkeypatch.setattr(planner, "PLANNER_BASE_URL", "")
+    monkeypatch.setattr(planner, "PLANNER_MODEL", "")
+
+    plan = await planner.build_research_plan(
+        research_request,
+        "balanced",
+        proposed_queries=[proposed_query],
+    )
+
+    handling = plan["proposed_query_handling"]
+    assert handling["accepted"] == []
+    assert handling["rejected"][0]["reason"] == "unauthorized_qualifier"
+
+
+@pytest.mark.parametrize(
+    ("research_request", "proposed_query"),
+    [
+        (
+            "Find password managers for Linux",
+            "Linux password managers official documentation",
+        ),
+        (
+            "Find password managers for Linux",
+            "Linux password manager benchmarks",
+        ),
+        (
+            "Find password managers for Linux",
+            "Linux password manager release notes",
+        ),
+        (
+            "Compare password managers for Linux and Windows",
+            "Linux versus Windows password manager comparison",
+        ),
+        (
+            "Find Android password managers",
+            "Android password managers official documentation",
+        ),
+        (
+            "Compare Docker support on arm64 and x86_64",
+            "Docker arm64 versus x86_64 support comparison",
+        ),
+        (
+            "Find Chrome OS password managers",
+            "ChromeOS password managers official documentation",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_calling_model_query_allows_neutral_evidence_and_platform_comparisons(
+    monkeypatch,
+    research_request,
+    proposed_query,
+):
+    planner = pytest.importorskip("planner")
+    monkeypatch.setattr(planner, "PLANNER_BASE_URL", "")
+    monkeypatch.setattr(planner, "PLANNER_MODEL", "")
+
+    plan = await planner.build_research_plan(
+        research_request,
+        "balanced",
+        proposed_queries=[proposed_query],
+    )
+
+    handling = plan["proposed_query_handling"]
+    assert handling["rejected"] == []
+    assert plan["queries"][0] == proposed_query
+
+
+@pytest.mark.parametrize(
+    ("research_request", "proposed_query"),
+    [
+        (
+            "password managers for families",
+            "password managers for Windows",
+        ),
+        (
+            "accounting software for small businesses",
+            "accounting software for students",
+        ),
+        (
+            "paint colors for low-light bathrooms",
+            "paint colors for sunny offices",
+        ),
+        (
+            "Find free password managers for families",
+            "free password managers for Windows",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_calling_model_query_preserves_distinctive_canonical_roots(
+    monkeypatch,
+    research_request,
+    proposed_query,
+):
+    planner = pytest.importorskip("planner")
+    monkeypatch.setattr(planner, "PLANNER_BASE_URL", "")
+    monkeypatch.setattr(planner, "PLANNER_MODEL", "")
+
+    plan = await planner.build_research_plan(
+        research_request,
+        "balanced",
+        proposed_queries=[proposed_query],
+    )
+
+    handling = plan["proposed_query_handling"]
+    assert handling["accepted"] == []
+    assert handling["rejected"][0]["reason"] == "insufficient_canonical_coverage"
+
+
+@pytest.mark.parametrize(
+    ("research_request", "proposed_query"),
+    [
+        (
+            "Find password managers for Linux",
+            "Linux password managers excluding open source options",
+        ),
+        (
+            "Find Android TV boxes for emulation",
+            "Android TV boxes for emulation without Nvidia Shield",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_calling_model_query_rejects_proposal_only_negative_constraints(
+    monkeypatch,
+    research_request,
+    proposed_query,
+):
+    planner = pytest.importorskip("planner")
+    monkeypatch.setattr(planner, "PLANNER_BASE_URL", "")
+    monkeypatch.setattr(planner, "PLANNER_MODEL", "")
+
+    plan = await planner.build_research_plan(
+        research_request,
+        "balanced",
+        proposed_queries=[proposed_query],
+    )
+
+    handling = plan["proposed_query_handling"]
+    assert handling["accepted"] == []
+    assert handling["rejected"][0]["reason"] == "unauthorized_negative_constraint"
+
+
+@pytest.mark.parametrize(
+    ("research_request", "proposed_query"),
+    [
+        (
+            "How do I install Docker?",
+            "Docker installation must use Snap",
+        ),
+        (
+            "Find Android TV boxes",
+            "Android TV boxes must support Dolby Vision",
+        ),
+        (
+            "Find a router that must support WiFi 7",
+            "WiFi 7 router must support wireless mesh",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_calling_model_query_rejects_proposal_only_positive_constraints(
+    monkeypatch,
+    research_request,
+    proposed_query,
+):
+    planner = pytest.importorskip("planner")
+    monkeypatch.setattr(planner, "PLANNER_BASE_URL", "")
+    monkeypatch.setattr(planner, "PLANNER_MODEL", "")
+
+    plan = await planner.build_research_plan(
+        research_request,
+        "balanced",
+        proposed_queries=[proposed_query],
+    )
+
+    handling = plan["proposed_query_handling"]
+    assert handling["accepted"] == []
+    assert handling["rejected"][0]["reason"] == "unauthorized_positive_constraint"
+
+
+@pytest.mark.parametrize(
+    ("research_request", "proposed_query"),
+    [
+        (
+            "Find a router that must support WiFi 7",
+            "WiFi router without WiFi 7",
+        ),
+        (
+            "Android TV boxes excluding Nvidia Shield",
+            "Android TV boxes including Nvidia Shield",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_calling_model_query_rejects_opposite_constraint_polarity(
+    monkeypatch,
+    research_request,
+    proposed_query,
+):
+    planner = pytest.importorskip("planner")
+    monkeypatch.setattr(planner, "PLANNER_BASE_URL", "")
+    monkeypatch.setattr(planner, "PLANNER_MODEL", "")
+
+    plan = await planner.build_research_plan(
+        research_request,
+        "balanced",
+        proposed_queries=[proposed_query],
+    )
+
+    handling = plan["proposed_query_handling"]
+    assert handling["accepted"] == []
+    assert handling["rejected"][0]["reason"] in {
+        "conflicting_constraint",
+        "missing_required_constraint",
+    }
+
+
+@pytest.mark.parametrize(
+    ("research_request", "proposed_query"),
+    [
+        pytest.param(
+            "Find top 3 Docker Compose alternatives",
+            "best Docker Compose alternatives",
+            id="selection-count-is-output-shaping",
+        ),
+        pytest.param(
+            "Android TV boxes excluding Nvidia Shield",
+            "Android TV boxes without Nvidia Shield",
+            id="equivalent-exclusion",
+        ),
+        pytest.param(
+            "current Docker installation guide",
+            "latest Docker installation documentation",
+            id="current-latest",
+        ),
+        pytest.param(
+            "recent Docker security advisories",
+            "latest Docker security advisories",
+            id="recent-latest",
+        ),
+        pytest.param(
+            "Also, compare PostgreSQL and MySQL",
+            "PostgreSQL versus MySQL comparison",
+            id="comparison-discourse",
+        ),
+        pytest.param(
+            "AI releases on July 14, 2026",
+            "AI releases 2026-07-14",
+            id="equivalent-explicit-date",
+        ),
+        pytest.param(
+            "Best Android TV boxes under $150",
+            "Android TV boxes below 150 USD",
+            id="equivalent-currency-format",
+        ),
+        pytest.param(
+            "Find a router that needs to support WiFi 7",
+            "WiFi 7 router must support WiFi 7",
+            id="equivalent-positive-requirement",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_calling_model_query_accepts_safe_constraint_reformulations(
+    monkeypatch,
+    research_request,
+    proposed_query,
+):
+    planner = pytest.importorskip("planner")
+    monkeypatch.setattr(planner, "PLANNER_BASE_URL", "")
+    monkeypatch.setattr(planner, "PLANNER_MODEL", "")
+    monkeypatch.setattr(
+        planner,
+        "runtime_retrieval_context",
+        lambda: {"current_date_local": "2026-07-14"},
+    )
+
+    plan = await planner.build_research_plan(
+        research_request,
+        "balanced",
+        proposed_queries=[proposed_query],
+    )
+
+    handling = plan["proposed_query_handling"]
+    assert handling["rejected"] == []
+    assert handling["accepted"][0]["proposed_query"] == proposed_query
+    assert handling["accepted"][0]["role"] == "calling_model"
+    assert handling["accepted"][0]["semantic_expansion_terms"] == []
+    assert handling["accepted"][0]["missing_canonical_terms"] == []
+    assert plan["queries"][0] == proposed_query
+
+
+@pytest.mark.parametrize(
+    ("research_request", "proposed_query", "expected_term"),
+    [
+        (
+            "Find password managers",
+            "password managers for families",
+            "families",
+        ),
+        (
+            "Find AI news",
+            "OpenAI AI news",
+            "openai",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_calling_model_semantic_expansions_retain_canonical_anchor(
+    monkeypatch,
+    research_request,
+    proposed_query,
+    expected_term,
+):
+    planner = pytest.importorskip("planner")
+    monkeypatch.setattr(planner, "PLANNER_BASE_URL", "")
+    monkeypatch.setattr(planner, "PLANNER_MODEL", "")
+
+    plan = await planner.build_research_plan(
+        research_request,
+        "balanced",
+        proposed_queries=[proposed_query],
+    )
+
+    accepted = plan["proposed_query_handling"]["accepted"]
+    assert accepted[0]["role"] == "semantic_expansion"
+    assert expected_term in {
+        term.casefold()
+        for term in accepted[0]["semantic_expansion_terms"]
+    }
+    assert plan["queries"][0] == proposed_query
+    assert plan["query_roles"][:2] == [
+        "semantic_expansion",
+        "deterministic",
+    ]
+    assert plan["query_intent_ids"][0] == plan["query_intent_ids"][1]
+    assert plan["queries"][1] == plan["intent_contexts"]["intent-1"]
+
+
+@pytest.mark.asyncio
+async def test_calling_model_query_missing_canonical_form_keeps_anchor(monkeypatch):
+    planner = pytest.importorskip("planner")
+    monkeypatch.setattr(planner, "PLANNER_BASE_URL", "")
+    monkeypatch.setattr(planner, "PLANNER_MODEL", "")
+
+    plan = await planner.build_research_plan(
+        "Find AI news",
+        "balanced",
+        proposed_queries=["AI"],
+    )
+
+    accepted = plan["proposed_query_handling"]["accepted"]
+    assert accepted[0]["role"] == "semantic_expansion"
+    assert accepted[0]["semantic_expansion_terms"] == []
+    assert accepted[0]["missing_canonical_terms"] == ["news"]
+    assert plan["query_roles"][:2] == [
+        "semantic_expansion",
+        "deterministic",
+    ]
+    assert plan["queries"][1] == plan["intent_contexts"]["intent-1"]
+
+
+@pytest.mark.parametrize(
+    "added_scope",
+    [
+        "releases",
+        "news",
+        "installation",
+        "studies",
+        "reports",
+        "papers",
+        "posts",
+        "comparisons",
+    ],
+)
+@pytest.mark.asyncio
+async def test_generic_proposal_only_scope_is_a_semantic_expansion(
+    monkeypatch,
+    added_scope,
+):
+    planner = pytest.importorskip("planner")
+    monkeypatch.setattr(planner, "PLANNER_BASE_URL", "")
+    monkeypatch.setattr(planner, "PLANNER_MODEL", "")
+
+    plan = await planner.build_research_plan(
+        "Docker",
+        "balanced",
+        proposed_queries=[f"Docker {added_scope}"],
+    )
+
+    accepted = plan["proposed_query_handling"]["accepted"]
+    assert accepted[0]["role"] == "semantic_expansion"
+    assert added_scope in accepted[0]["semantic_expansion_terms"]
+    assert plan["query_roles"][:2] == [
+        "semantic_expansion",
+        "deterministic",
+    ]
+
+
+@pytest.mark.parametrize(
+    "proposed_query",
+    [
+        "Docker official documentation",
+        "official Docker documentation",
+        "Docker primary sources",
+        "Docker primary source reporting",
+        "Docker release notes",
+        "Docker GitHub issues",
+        "Docker benchmarks",
+        "Docker specifications",
+        "Docker reviews",
+    ],
+)
+@pytest.mark.asyncio
+async def test_safe_search_form_proposals_remain_calling_model_queries(
+    monkeypatch,
+    proposed_query,
+):
+    planner = pytest.importorskip("planner")
+    monkeypatch.setattr(planner, "PLANNER_BASE_URL", "")
+    monkeypatch.setattr(planner, "PLANNER_MODEL", "")
+
+    plan = await planner.build_research_plan(
+        "Docker",
+        "balanced",
+        proposed_queries=[proposed_query],
+    )
+
+    accepted = plan["proposed_query_handling"]["accepted"]
+    assert accepted[0]["role"] == "calling_model"
+    assert accepted[0]["semantic_expansion_terms"] == []
+    assert accepted[0]["missing_canonical_terms"] == []
+    assert plan["query_roles"][0] == "calling_model"
+    assert plan["queries"][0] == proposed_query
+
+
+@pytest.mark.asyncio
+async def test_equivalent_android_tv_wording_remains_a_model_query(monkeypatch):
+    planner = pytest.importorskip("planner")
+    monkeypatch.setattr(planner, "PLANNER_BASE_URL", "")
+    monkeypatch.setattr(planner, "PLANNER_MODEL", "")
+
+    plan = await planner.build_research_plan(
+        "Android TV boxes",
+        "balanced",
+        proposed_queries=["Android TV streaming devices"],
+    )
+
+    accepted = plan["proposed_query_handling"]["accepted"]
+    assert accepted[0]["role"] == "calling_model"
+    assert accepted[0]["semantic_expansion_terms"] == []
+    assert accepted[0]["missing_canonical_terms"] == []
+
+
+@pytest.mark.asyncio
+async def test_safe_source_form_does_not_hide_meaningful_added_scope(monkeypatch):
+    planner = pytest.importorskip("planner")
+    monkeypatch.setattr(planner, "PLANNER_BASE_URL", "")
+    monkeypatch.setattr(planner, "PLANNER_MODEL", "")
+
+    plan = await planner.build_research_plan(
+        "Docker",
+        "balanced",
+        proposed_queries=["official open source Docker documentation"],
+    )
+
+    accepted = plan["proposed_query_handling"]["accepted"]
+    assert accepted[0]["role"] == "semantic_expansion"
+    assert "open" in {
+        term.casefold() for term in accepted[0]["semantic_expansion_terms"]
+    }
+    assert plan["query_roles"][:2] == [
+        "semantic_expansion",
+        "deterministic",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_local_only_never_accepts_proposed_web_queries(monkeypatch):
+    planner = pytest.importorskip("planner")
+    monkeypatch.setattr(planner, "PLANNER_BASE_URL", "https://planner.example")
+    monkeypatch.setattr(planner, "PLANNER_MODEL", "private-planner")
+    planner_chat = AsyncMock(return_value='{"queries": ["unused"]}')
+    monkeypatch.setattr(planner, "_chat", planner_chat)
+
+    plan = await planner.build_research_plan(
+        "search my stored Docker notes",
+        "local_only",
+        proposed_queries=["Docker documentation"],
+    )
+
+    assert plan["queries"] == []
+    assert plan["generated_by"] == "deterministic"
+    planner_chat.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_quick_mode_keeps_its_single_deterministic_query(monkeypatch):
+    planner = pytest.importorskip("planner")
+    monkeypatch.setattr(planner, "PLANNER_BASE_URL", "")
+    monkeypatch.setattr(planner, "PLANNER_MODEL", "")
+
+    plan = await planner.build_research_plan(
+        "Find current Docker installation guidance",
+        "quick",
+        proposed_queries=["latest Docker official installation documentation"],
+    )
+
+    assert len(plan["queries"]) == 1
+    assert "query_roles" not in plan
+    assert plan["generated_by"] == "deterministic"
+    assert plan["proposed_query_handling"]["accepted"] == []
+    assert plan["proposed_query_handling"]["rejected"][0]["reason"] == (
+        "mode_query_budget_exhausted"
+    )
 
 
 def test_github_repository_normalization_and_validation():

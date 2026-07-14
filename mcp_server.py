@@ -32,6 +32,11 @@ from job_store import (
     request_cancellation,
 )
 from pipelines import build_evidence_pack, compact_investigation_result, explore_url_pipeline, research_pipeline
+from query_hints import (
+    MAX_PROPOSED_SEARCH_QUERIES,
+    PROPOSED_SEARCH_QUERY_MAX_CHARS,
+    normalize_proposed_queries,
+)
 from redaction import redact_sensitive_text
 from searching import normalize_domain
 from shared import (
@@ -86,6 +91,8 @@ mcp = FastMCP(
         "This applies especially to current documentation, installation and setup guidance, troubleshooting unfamiliar errors, "
         "and software or product behavior. "
         "Use research_web for open-ended web research without a specific URL. "
+        "When calling research_web or start_research, keep query as the user's complete task and, when capable, "
+        "formulate concise search-engine queries in proposed_queries; the server validates and augments them before use. "
         "Use investigate_url when the user provides a URL and asks to find, extract, summarize, compare, or verify information on that page. "
         "Use query_memory for already-ingested local research memory. "
         "Use ingest_text when the user provides text that should be stored. "
@@ -142,6 +149,29 @@ JobAction = Literal["status", "result", "cancel"]
 GitHubAction = Literal["search", "inspect", "read"]
 GitHubSearchKind = Literal["issues", "code", "repositories"]
 ResearchSourceLimit = Annotated[int, Field(ge=0, le=8)]
+ProposedSearchQuery = Annotated[
+    str,
+    Field(
+        min_length=1,
+        max_length=PROPOSED_SEARCH_QUERY_MAX_CHARS,
+        description=(
+            "One concise search-engine query formulated from the user's complete task. "
+            "Preserve exact products, versions, dates, errors, locations, and other constraints."
+        ),
+    ),
+]
+ProposedSearchQueries = Annotated[
+    list[ProposedSearchQuery],
+    Field(
+        min_length=1,
+        max_length=MAX_PROPOSED_SEARCH_QUERIES,
+        description=(
+            "Optional queries proposed by the calling model. Keep query as the complete "
+            "authoritative user task. Supply concise, complementary searches rather than "
+            "copies of the full request; omit this field if reliable reformulation is not possible."
+        ),
+    ),
+]
 MemoryResultLimit = Annotated[int, Field(ge=1, le=30)]
 SourceListLimit = Annotated[int, Field(ge=1, le=500)]
 InvestigationCharacterLimit = Annotated[int, Field(ge=10_000, le=750_000)]
@@ -669,6 +699,7 @@ async def research_web(
     namespace: str = DEFAULT_NAMESPACE,
     include_memory: bool = False,
     synthesize: bool = False,
+    proposed_queries: Optional[ProposedSearchQueries] = None,
 ) -> dict:
     """
     Open-ended web research pipeline.
@@ -676,55 +707,67 @@ async def research_web(
     Use this proactively whenever answering requires information that may have changed or should be
     externally verified, even if the user did not explicitly ask to search. Answer stable, timeless
     questions without calling this tool. Use this for open-ended research without a specific URL.
-    Pass the user's complete research question or task, including relevant constraints and desired
-    output; the server converts instruction-style requests into effective search queries internally.
+    Pass the user's complete research question or task in query, including relevant constraints and
+    desired output. Before calling, formulate one or more concise search-engine queries in
+    proposed_queries when you can do so reliably. Do not replace the complete query, merely copy a
+    verbose request into each proposal, or include credentials/private data in a public-web search.
+    The server validates proposals against the complete task, rejects suggestions that lose or
+    contradict constraints, and safely falls back to deterministic query planning when proposals
+    are absent or unsuitable, converting the complete task into effective search queries internally.
     Internally uses SearXNG search, source scoring, direct extraction, optional Crawl4AI/Playwright
     fallbacks, and optional pre-crawl reranking. Fresh extracted evidence is returned immediately;
-    durable Qdrant indexing may continue asynchronously. The evidence array is authoritative.
+    durable Qdrant indexing may continue asynchronously. The evidence array is authoritative. The
+    server performs at most one bounded query repair per unresolved intent when discovery is
+    off-topic. If completion.reason is low_topical_relevance, report the evidence gap
+    instead of repeating the same research_web call. When verify=true and usable evidence lacks corroboration,
+    the server returns partial completion with verification_inconclusive rather than overstating
+    certainty.
 
     Modes: quick, balanced, deep, technical, academic, local_only, web_only.
     Use balanced for ordinary current-information, documentation, and troubleshooting
     requests. Reserve deep for explicitly exhaustive or high-stakes investigations.
+    Quick mode's one-query budget deliberately keeps the deterministic query, and local_only
+    performs no web search. Omit proposed_queries in those modes; use a larger web mode when
+    proposals should be eligible.
     Leave synthesize=False when the calling model will synthesize the returned evidence.
     """
     query = _bounded_text(query, "query", MCP_MAX_QUERY_CHARS)
+    proposed_queries = normalize_proposed_queries(proposed_queries)
     namespace = normalize_namespace(namespace)
     authorization_failure = _authorization_failure(namespace=namespace)
     if authorization_failure:
         return authorization_failure
+    payload = {
+        "query": query,
+        "mode": mode,
+        "max_sources": max_sources,
+        "verify": verify,
+        "namespace": namespace,
+        "include_memory": include_memory,
+        "synthesize": synthesize,
+    }
+    if proposed_queries is not None:
+        payload["proposed_queries"] = proposed_queries
     if JOB_BACKEND == "redis":
         return await run_resilient(
             _enqueue_and_wait(
                 "research_web",
-                {
-                    "query": query,
-                    "mode": mode,
-                    "max_sources": max_sources,
-                    "verify": verify,
-                    "namespace": namespace,
-                    "include_memory": include_memory,
-                    "synthesize": synthesize,
-                },
+                payload,
                 "research_web",
             ),
             "research_web",
         )
 
+    pipeline_kwargs = {
+        **payload,
+        "search_cache_scope": _current_search_cache_scope(),
+        # Authenticated inline calls have no Redis job owner record against
+        # which artifact reads can be authorized. Durable jobs retain source
+        # artifacts because their job IDs are owner-scoped in Redis.
+        "persist_source_artifacts": not _token_authorization_enabled(),
+    }
     result = await run_resilient(
-        research_pipeline(
-            query=query,
-            mode=mode,
-            max_sources=max_sources,
-            verify=verify,
-            namespace=namespace,
-            include_memory=include_memory,
-            synthesize=synthesize,
-            search_cache_scope=_current_search_cache_scope(),
-            # Authenticated inline calls have no Redis job owner record against
-            # which artifact reads can be authorized. Durable jobs retain source
-            # artifacts because their job IDs are owner-scoped in Redis.
-            persist_source_artifacts=not _token_authorization_enabled(),
-        ),
+        research_pipeline(**pipeline_kwargs),
         "research_web",
     )
     return _complete_research_result(result)
@@ -991,17 +1034,23 @@ async def start_research(
     namespace: str = DEFAULT_NAMESPACE,
     include_memory: bool = False,
     synthesize: bool = False,
+    proposed_queries: Optional[ProposedSearchQueries] = None,
 ) -> dict:
     """Start explicitly durable web research and immediately return a job ID.
 
     Prefer research_web for ordinary work. Use this for explicitly deep work or
     clients with short tool timeouts, then call research_job yourself at most once
-    with a bounded wait. Never ask the user to issue a job-control command. Pass
-    the complete research task; server-side planning derives the search queries.
+    with a bounded wait. Never ask the user to issue a job-control command. Keep
+    query as the complete research task. When capable, formulate concise
+    search-engine queries in proposed_queries; the server validates and augments
+    them, and deterministic planning remains the fallback.
+    Quick mode's one-query budget keeps only the deterministic query, while local_only
+    performs no web search; proposed_queries are ineligible in both modes.
     Do not poll repeatedly or submit the same request again.
     Requires JOB_BACKEND=redis.
     """
     query = _bounded_text(query, "query", MCP_MAX_QUERY_CHARS)
+    proposed_queries = normalize_proposed_queries(proposed_queries)
     namespace = normalize_namespace(namespace)
     authorization_failure = _authorization_failure(namespace=namespace)
     if authorization_failure:
@@ -1013,14 +1062,16 @@ async def start_research(
         }
     try:
         payload = {
-                "query": query,
-                "mode": mode,
-                "max_sources": max_sources,
-                "verify": verify,
-                "namespace": namespace,
-                "include_memory": include_memory,
-                "synthesize": synthesize,
-            }
+            "query": query,
+            "mode": mode,
+            "max_sources": max_sources,
+            "verify": verify,
+            "namespace": namespace,
+            "include_memory": include_memory,
+            "synthesize": synthesize,
+        }
+        if proposed_queries is not None:
+            payload["proposed_queries"] = proposed_queries
         owner_id = _current_principal_id()
         job = (
             await enqueue_job("research_web", payload, owner_id=owner_id)

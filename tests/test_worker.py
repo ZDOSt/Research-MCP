@@ -360,6 +360,44 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(metadata["ingestion_attempt_id"], attempt_id)
         self.assertEqual(metadata["ingestion_order_ns"], 123456)
 
+    async def test_dispatch_normalizes_and_forwards_proposed_queries(self):
+        with patch(
+            "pipelines.research_pipeline",
+            AsyncMock(return_value={"query": "q"}),
+        ) as research:
+            await dispatch_job(
+                "research_web",
+                {
+                    "query": "q",
+                    "proposed_queries": [
+                        "  Docker   official docs ",
+                        "Docker official docs?",
+                    ],
+                },
+            )
+
+        self.assertEqual(
+            research.await_args.kwargs["proposed_queries"],
+            ["Docker official docs"],
+        )
+
+    async def test_dispatch_rejects_malformed_proposed_queries(self):
+        for malformed in ("not-a-list", [], ["x" * 181]):
+            with self.subTest(malformed=malformed), self.assertRaises(ValueError):
+                await dispatch_job(
+                    "research_web",
+                    {"query": "q", "proposed_queries": malformed},
+                )
+
+    async def test_legacy_dispatch_omits_proposed_queries(self):
+        with patch(
+            "pipelines.research_pipeline",
+            AsyncMock(return_value={"query": "q"}),
+        ) as research:
+            await dispatch_job("research_web", {"query": "q"})
+
+        self.assertNotIn("proposed_queries", research.await_args.kwargs)
+
     async def test_investigation_ingests_redirected_source_identity(self):
         requested_url = "https://start.example/path"
         final_url = "https://docs.example/final"

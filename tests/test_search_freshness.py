@@ -69,6 +69,41 @@ def test_academic_intent_is_inferred_without_requiring_the_client_to_set_mode():
 
 @pytest.mark.parametrize(
     "query",
+    [
+        "today's AI news",
+        "what is the best Android TV box alternative",
+        "current Docker installation guide",
+        "most powerful Android TV box",
+        "Python asyncio docs",
+        "weather New York",
+    ],
+)
+def test_clearly_english_queries_use_english_search_policy(query):
+    assert infer_search_policy(query).language == "en"
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "Was ist die beste Android TV Box?",
+        "Quelle est la meilleure box Android TV?",
+        "mejor caja Android TV",
+        "guide installation Docker",
+        "meilleur guide installation Docker",
+    ],
+)
+def test_non_english_or_ambiguous_queries_preserve_automatic_language(query):
+    assert infer_search_policy(query).language == "auto"
+
+
+def test_explicit_language_override_wins_over_english_inference():
+    policy = infer_search_policy("English documentation language:fr")
+
+    assert policy.language == "fr"
+
+
+@pytest.mark.parametrize(
+    "query",
     ["best paper shredder", "how to make a paper airplane", "study desk buying guide"],
 )
 def test_weak_academic_words_do_not_force_science_search(query):
@@ -320,6 +355,12 @@ def test_invalid_explicit_date_does_not_fall_back_to_the_runtime_date(query):
             date(2024, 3, 31),
         ),
         (
+            "AI news from July 10 to July 12 2026",
+            "publication_range",
+            date(2026, 7, 10),
+            date(2026, 7, 12),
+        ),
+        (
             "AI news in 2024",
             "publication_range",
             date(2024, 1, 1),
@@ -560,6 +601,11 @@ def test_relative_publication_date_parsing_is_bounded_to_supplied_clock():
 
 
 def test_strict_date_discards_known_stale_results_but_retains_undated_fallbacks():
+    policy = infer_search_policy(
+        "today's AI news 2026-07-13",
+        current_date="2026-07-13",
+        timezone_name="UTC",
+    )
     results = compact_search_results(
         {
             "results": [
@@ -583,6 +629,7 @@ def test_strict_date_discards_known_stale_results_but_retains_undated_fallbacks(
             ]
         },
         "today's AI news 2026-07-13",
+        policy=policy,
     )
 
     assert isinstance(results, SearchResults)
@@ -620,6 +667,11 @@ def test_strict_date_is_compared_in_the_configured_research_timezone():
 
 
 def test_canonical_duplicate_keeps_later_exact_date_metadata():
+    policy = infer_search_policy(
+        "today's AI news 2026-07-13",
+        current_date="2026-07-13",
+        timezone_name="UTC",
+    )
     results = compact_search_results(
         {
             "results": [
@@ -637,6 +689,7 @@ def test_canonical_duplicate_keeps_later_exact_date_metadata():
             ]
         },
         "today's AI news 2026-07-13",
+        policy=policy,
     )
 
     assert len(results) == 1
@@ -741,9 +794,12 @@ async def test_searx_request_applies_policy_and_surfaces_engine_diagnostics(monk
     assert captured[0]["params"] == {
         "q": "today's AI news 2026-07-13",
         "format": "json",
-        "language": "auto",
+        "language": "en",
         "engines": "reuters,bing news",
         "time_range": "day",
+    }
+    assert captured[0]["headers"] == {
+        "Accept-Language": "en-US,en;q=0.9,*;q=0.5"
     }
     assert all("categories" not in request["params"] for request in captured)
     assert results.diagnostics["search_policy"]["target_date"] == "2026-07-13"

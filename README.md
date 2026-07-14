@@ -190,15 +190,40 @@ when a token policy restricts its `namespaces` patterns.
 
 | Tool | Purpose and important behavior |
 | --- | --- |
-| `research_web` | Run open-ended research. Pass the complete task; server-side planning derives compact complementary searches while retaining exact errors, versions, URLs, products, and dates. Modes are `quick` (12-second target), `balanced` (30), `web_only` (25), `technical` (45), `academic` (50), `deep` (180/background-oriented), and `local_only`. Search queries and source extraction run under one bounded latency budget and return the best available evidence at expiry. `evidence` is the authoritative fresh result; `results` and `memory_results` are optional vector-memory matches and may be empty. Source indexing continues independently after the response. With Redis, same-owner duplicate active requests are coalesced and wait for the existing result rather than launching duplicate work. |
+| `research_web` | Run open-ended research. Pass the complete task in `query`; capable calling models may also supply 1-5 concise, optional `proposed_queries` of at most 180 characters each. The server validates suggestions and retains deterministic search anchors. Modes are `quick` (12-second target), `balanced` (30), `web_only` (25), `technical` (45), `academic` (50), `deep` (180/background-oriented), and `local_only`. Search queries and source extraction run under one bounded latency budget and return the best available evidence at expiry. `evidence` is the authoritative fresh result; `results` and `memory_results` are optional vector-memory matches and may be empty. Source indexing continues independently after the response. With Redis, same-owner duplicate active requests are coalesced and wait for the existing result rather than launching duplicate work. |
 | `investigate_url` | Investigate one public HTTP(S) URL with crawl, rendered-browser, scrolling, clicking, and network-data fallbacks. Modes are `auto`, `targeted`, `balanced`, and `exhaustive`; optional flags control ingestion, raw text, and diagnostics. |
-| `start_research` | Queue explicitly deep durable `research_web` work and return a job ID immediately. Ordinary work should use `research_web`. A model may follow with one bounded `research_job` call itself; users should not be asked to run job-control commands. It requires `JOB_BACKEND=redis`, which Compose configures. |
+| `start_research` | Queue explicitly deep durable `research_web` work and return a job ID immediately. It accepts the same complete `query` and optional `proposed_queries` planning inputs. Ordinary work should use `research_web`. A model may follow with one bounded `research_job` call itself; users should not be asked to run job-control commands. It requires `JOB_BACKEND=redis`, which Compose configures. |
 | `research_job` | Operate on a durable job with `action=status`, `result`, or `cancel`. Status and result use bounded long polling (`wait_seconds`, default 15) to avoid busy loops. `include_full_result=false` returns compact Redis metadata, including persistence acceptance, instead of loading the complete artifact. Cancellation is cooperative and may not be instantaneous. |
 | `get_research_artifact` | Read a returned source artifact, or a job-result path obtained through compact job metadata, as bounded text. Completed full results omit their duplicate job-result path because the payload is already present. `max_chars` is clamped to 1,000-250,000 characters. |
 | `query_memory` | Search Qdrant memory in a namespace, with `top_k` clamped to 1-30, and return reranked evidence. |
 | `ingest_text` | Store supplied text in a namespace. Common credentials and tokens are redacted by default. Under token policies, `redact_secrets=false` requires the separate `memory:write:unredacted` scope. |
 | `manage_sources` | `list`, inspect `stats`, or `delete` an ingested source within a namespace. Deletion removes its Qdrant chunks, not job artifact files. |
 | `github_research` | Read-only GitHub API access. `search` searches `issues`, `code`, or `repositories`; `inspect` returns repository metadata and a prioritized recursive file tree; `read` returns a file or directory listing at an optional ref. |
+
+### Query planning
+
+For `research_web` and `start_research`, the calling model may formulate concise
+search suggestions in `proposed_queries`, but the complete user task in `query`
+remains authoritative. The server normalizes and deduplicates suggestions,
+checks that each one aligns with a canonical intent, rejects off-topic,
+ambiguous, missing-constraint, or conflicting-constraint proposals, and keeps
+deterministic queries as bounded anchors and fallbacks. Accepted proposals still
+share the selected mode's existing query budget. A proposal that adds a narrower
+semantic scope or omits part of the canonical search intent is treated as a
+guarded expansion: it runs concurrently with that intent's deterministic anchor,
+and expansion-only results cannot by themselves mark the original intent
+resolved. Search-form additions
+such as official documentation, primary sources, release notes, GitHub issues,
+benchmarks, specifications, and reviews remain normal calling-model queries.
+Because `quick` mode has a
+one-query budget, it deliberately keeps only the deterministic anchor; use a
+larger mode such as `balanced` or `technical` when proposals should be eligible.
+`local_only` performs no web search and therefore never uses proposed queries.
+
+Omitting `proposed_queries` preserves the previous deterministic planning path,
+so older MCP clients continue to work unchanged. MCP clients commonly cache tool
+schemas; reconnect or restart the client after upgrading the server so the new
+optional field becomes available to the calling model.
 
 For `github_research`, `repository` accepts `owner/name` or a GitHub repository
 URL. Anonymous access is rate-limited. Set a least-privilege `GITHUB_TOKEN` for
@@ -258,7 +283,11 @@ or establish factual truth. The returned `verification` object states this
 explicitly. Planner synthesis validates that every `[E#]` citation points to
 available evidence, but it also does not automatically validate factual
 entailment. Clients should treat these features as corroboration aids and keep
-uncertainty visible when evidence is incomplete or conflicts.
+uncertainty visible when evidence is incomplete or conflicts. When usable
+evidence exists but requested corroboration does not find cross-source topical
+overlap, `completion.status` is `partial` and `completion.reasons` includes
+`verification_inconclusive`; this describes an evidence limitation, not proof
+that the evidence is false.
 
 ## Durable jobs and artifacts
 
@@ -520,11 +549,22 @@ users configured through that token share its budget. Use separate entries in
 `MCP_AUTH_TOKENS_JSON` when independent client budgets are required.
 
 Within one admitted job, the first query for each planned intent runs with at
-most `SEARCH_QUERY_CONCURRENCY` queries in flight. One reserve query is used only
-for an intent whose primary query lacks independent source coverage. Each query
-uses explicit staged SearXNG engine groups and stops once
-`SEARCH_STAGE_MIN_RESULTS` is satisfied. `SEARCH_MAX_ENGINE_STAGES` bounds normal
+most `SEARCH_QUERY_CONCURRENCY` queries in flight. Normal modes use at most one
+reserve query per unresolved intent; `deep` mode may use up to four. A reserve
+query runs only when the intent's earlier queries lack relevant, independent
+source coverage.
+Each query uses explicit staged SearXNG engine groups and stops only after
+`SEARCH_STAGE_MIN_RESULTS` includes the relevant fraction configured by
+`SEARCH_STAGE_MIN_RELEVANT_RATIO`. `SEARCH_RELEVANCE_MIN_SCORE` controls the
+bounded lexical relevance gate. For each unresolved intent whose discovered
+results are off-topic, the worker runs at most one shorter internal repair
+query, rejects remaining noise, and returns `completion.status=insufficient`
+with reason `low_topical_relevance` when no intent has usable evidence instead
+of asking the MCP client to retry. `SEARCH_MAX_ENGINE_STAGES` bounds normal
 modes; `SEARCH_DEEP_MAX_ENGINE_STAGES` permits broader durable research.
+Clearly English search queries use an English SearXNG language preference;
+explicit `language:xx` controls still win, while ambiguous and non-English
+queries retain automatic language selection.
 
 Workers cache exact normalized public-web discovery results in Redis for
 `SEARCH_CACHE_TTL_SECONDS`, scoped to the MCP client principal. Entries remain

@@ -84,6 +84,25 @@ def _configure_pipeline(
     monkeypatch.setattr(pipelines, "build_research_plan", plan)
     monkeypatch.setattr(pipelines, "searxng_search", search)
     monkeypatch.setattr(pipelines, "crawl_and_ingest_limited", crawl)
+    # These tests isolate crawl scheduling. Relevance admission has dedicated
+    # pipeline coverage and must not make synthetic scheduler fixtures topical.
+    monkeypatch.setattr(
+        pipelines,
+        "_filter_relevant_search_candidates",
+        lambda values, _query, *, reranking_status, allow_reranker_rejection=True: (
+            values,
+            {
+                "status": "sufficient" if values else "insufficient",
+                "evaluated_candidates": len(values),
+                "accepted_candidates": len(values),
+                "rejected_candidates": 0,
+                "deterministic_rejections": 0,
+                "reranker_rejections": 0,
+                "distinct_relevant_owners": len(values),
+                "reranker_signal_used": False,
+            },
+        ),
+    )
 
     async def persist_crawled_source(result, *_args, **_kwargs):
         return result
