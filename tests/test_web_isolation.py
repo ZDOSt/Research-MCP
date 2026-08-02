@@ -583,6 +583,9 @@ class ComposeIsolationTests(unittest.TestCase):
                 "bing",
                 "mojeek",
                 "qwant",
+                "bing images",
+                "qwant images",
+                "wikicommons.images",
                 "bing news",
                 "mojeek news",
                 "qwant news",
@@ -617,6 +620,7 @@ class ComposeIsolationTests(unittest.TestCase):
                 "bing",
                 "mojeek",
                 "qwant",
+                "qwant images",
                 "mojeek news",
                 "qwant news",
                 "openalex",
@@ -680,6 +684,10 @@ class ComposeIsolationTests(unittest.TestCase):
         self.assertEqual(
             gateway_environment["MCP_SYNC_JOB_WAIT_SECONDS"],
             "${MCP_SYNC_JOB_WAIT_SECONDS:-60}",
+        )
+        self.assertEqual(
+            gateway_environment["RESEARCH_ASSISTANT_SYNC_WAIT_SECONDS"],
+            "${RESEARCH_ASSISTANT_SYNC_WAIT_SECONDS:-240}",
         )
         self.assertEqual(
             gateway_environment["RESEARCH_ADMISSION_MAX_ACTIVE"],
@@ -841,12 +849,63 @@ class ComposeIsolationTests(unittest.TestCase):
         self.assertIn("crawl4ai_egress_proxy.py /app/egress_proxy.py", stage)
         self.assertIn("socks5_client.py /app/socks5_client.py", stage)
 
-    def test_worker_does_not_receive_mcp_or_github_credentials(self):
+    def test_worker_receives_only_the_credentials_needed_for_unified_research(self):
         worker_environment = self.services["research-worker"]["environment"]
+        persistence_environment = self.services["persistence-worker"]["environment"]
         self.assertNotIn("MCP_AUTH_TOKEN", worker_environment)
         self.assertNotIn("MCP_AUTH_TOKENS_JSON", worker_environment)
-        self.assertNotIn("GITHUB_TOKEN", worker_environment)
-        self.assertNotIn("GITHUB_ALLOWED_REPOSITORIES", worker_environment)
+        self.assertEqual(worker_environment["GITHUB_TOKEN"], "${GITHUB_TOKEN:-}")
+        self.assertEqual(
+            worker_environment["GITHUB_ALLOWED_REPOSITORIES"],
+            "${GITHUB_ALLOWED_REPOSITORIES:-}",
+        )
+        for setting in (
+            "GITHUB_API_URL",
+            "GITHUB_API_VERSION",
+            "GITHUB_ALLOW_INSECURE_HTTP",
+            "GITHUB_MAX_FILE_CHARS",
+            "GITHUB_MAX_RESPONSE_BYTES",
+            "GITHUB_REDACT_SECRETS",
+            "GITHUB_TIMEOUT_SECONDS",
+        ):
+            self.assertIn(setting, worker_environment)
+        self.assertNotIn("GITHUB_TOKEN", persistence_environment)
+        self.assertNotIn("GITHUB_ALLOWED_REPOSITORIES", persistence_environment)
+
+    def test_unified_tool_and_internal_model_settings_reach_only_their_owners(self):
+        gateway_environment = self.services["mcp-gateway"]["environment"]
+        research_environment = self.services["research-worker"]["environment"]
+        persistence_environment = self.services["persistence-worker"]["environment"]
+
+        self.assertEqual(
+            gateway_environment["MCP_TOOL_PROFILE"],
+            "${MCP_TOOL_PROFILE:-all}",
+        )
+        self.assertNotIn("RESEARCH_MODEL_API_KEY", gateway_environment)
+        self.assertNotIn("RESEARCH_MODEL_API_KEY", persistence_environment)
+        self.assertEqual(
+            research_environment["MCP_TOOL_PROFILE"],
+            "${MCP_TOOL_PROFILE:-all}",
+        )
+        self.assertEqual(
+            research_environment["RESEARCH_MODEL_API_KEY"],
+            "${RESEARCH_MODEL_API_KEY:-}",
+        )
+        for setting in (
+            "RESEARCH_AGENT_MAX_EVIDENCE",
+            "RESEARCH_AGENT_MAX_EXPLICIT_URLS",
+            "RESEARCH_AGENT_MAX_FOLLOW_UP_ROUNDS",
+            "RESEARCH_AGENT_MAX_IMAGES",
+            "RESEARCH_AGENT_PLAN_TIMEOUT_SECONDS",
+            "RESEARCH_AGENT_REVIEW_TIMEOUT_SECONDS",
+            "RESEARCH_AGENT_SYNTHESIS_TIMEOUT_SECONDS",
+            "RESEARCH_MODEL_ALLOW_INSECURE_HTTP",
+            "RESEARCH_MODEL_BASE_URL",
+            "RESEARCH_MODEL_MAX_RESPONSE_BYTES",
+            "RESEARCH_MODEL_NAME",
+            "RESEARCH_MODEL_TIMEOUT_SECONDS",
+        ):
+            self.assertIn(setting, research_environment)
 
     def test_only_broker_bridges_sandbox_to_external_egress(self):
         bridging_services = []

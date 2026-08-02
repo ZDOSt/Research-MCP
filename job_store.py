@@ -367,7 +367,7 @@ class RedisJobStore:
             record = _decode_mapping(raw_record)
             record_owner = record.get("owner_id") or None
             reusable = (
-                record.get("kind") == "research_web"
+                record.get("kind") in {"research_web", "research_assistant"}
                 and record_owner == owner_id
                 and record.get("status") in {QUEUED, RUNNING}
             )
@@ -454,13 +454,13 @@ class RedisJobStore:
             and self.research_admission_window_seconds > 0
         )
         admission_anonymous_denied = (
-            kind_value == "research_web"
+            kind_value in {"research_web", "research_assistant"}
             and owner_id_value is None
             and self.research_admission_anonymous == "deny"
         )
         admission_keys = (
             self._research_admission_keys(owner_id_value)
-            if kind_value == "research_web"
+            if kind_value in {"research_web", "research_assistant"}
             and (
                 admission_active_enabled
                 or admission_window_enabled

@@ -699,6 +699,12 @@ def test_canonical_duplicate_keeps_later_exact_date_metadata():
 
 
 def test_news_ranking_preserves_searx_rank_and_does_not_globally_boost_docs():
+    policy = infer_search_policy(
+        "latest AI news",
+        mode="balanced",
+        current_date="2026-07-13",
+        timezone_name="UTC",
+    )
     results = compact_search_results(
         {
             "results": [
@@ -723,6 +729,7 @@ def test_news_ranking_preserves_searx_rank_and_does_not_globally_boost_docs():
         },
         "latest AI news",
         mode="balanced",
+        policy=policy,
     )
 
     assert results[0]["url"].startswith("https://www.reuters.com/")

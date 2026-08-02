@@ -7,6 +7,11 @@ use_default_settings:
       - bing
       - mojeek
       - qwant
+      # Image discovery. Keep this set intentionally small; the MCP returns
+      # metadata and source links without proxying or downloading images.
+      - bing images
+      - qwant images
+      - wikicommons.images
       # Current events.
       - bing news
       - mojeek news
@@ -56,6 +61,8 @@ engines:
   - name: mojeek
     disabled: false
   - name: qwant
+    disabled: false
+  - name: qwant images
     disabled: false
   - name: mojeek news
     disabled: false

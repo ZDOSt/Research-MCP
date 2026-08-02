@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from artifact_store import ArtifactStore
 import shared
+import worker
 from worker import (
     _INTERNAL_ATTEMPT_ID,
     _INTERNAL_ATTEMPT_ORDER_NS,
@@ -147,6 +148,20 @@ class FakeWorkerStore:
 
 
 class WorkerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_unified_healthcheck_fails_when_internal_model_is_unconfigured(self):
+        with patch.dict(
+            os.environ,
+            {"JOB_BACKEND": "redis", "MCP_TOOL_PROFILE": "unified"},
+            clear=False,
+        ), patch(
+            "planner.research_model_configured",
+            return_value=False,
+        ), patch.object(worker, "get_job_store") as get_store:
+            healthy = await worker.worker_healthcheck()
+
+        self.assertFalse(healthy)
+        get_store.assert_not_called()
+
     async def asyncSetUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.artifacts = ArtifactStore(self.temp_dir.name)
@@ -359,6 +374,94 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
         metadata = ingest.await_args.args[0].metadata
         self.assertEqual(metadata["ingestion_attempt_id"], attempt_id)
         self.assertEqual(metadata["ingestion_order_ns"], 123456)
+
+    async def test_dispatch_forwards_unified_assistant_job_context(self):
+        attempt_id = "d" * 64
+        with patch(
+            "research_agent.run_research_assistant",
+            AsyncMock(return_value={"status": "complete"}),
+        ) as assistant:
+            result = await dispatch_job(
+                "research_assistant",
+                {
+                    "request": "Find the current installation guide",
+                    "mode": "technical",
+                    "namespace": "docs",
+                    "research_run_id": "run-id",
+                    "_github_access_policy": {
+                        "allowed": True,
+                        "repositories": ["example/project"],
+                    },
+                    _INTERNAL_ATTEMPT_ID: attempt_id,
+                    _INTERNAL_ATTEMPT_ORDER_NS: 987654,
+                    _INTERNAL_SEARCH_CACHE_SCOPE: "scope-id",
+                },
+            )
+
+        self.assertEqual(result["status"], "complete")
+        assistant.assert_awaited_once_with(
+            request="Find the current installation guide",
+            mode="technical",
+            namespace="docs",
+            research_run_id="run-id",
+            defer_persistence=True,
+            ingestion_attempt_id=attempt_id,
+            ingestion_order_ns=987654,
+            search_cache_scope="scope-id",
+            github_access_policy={
+                "allowed": True,
+                "repositories": ["example/project"],
+            },
+        )
+
+    async def test_dispatch_runs_authorized_github_work_and_marks_it_untrusted(self):
+        with patch.dict(os.environ, {"GITHUB_TOKEN": ""}, clear=False), patch(
+            "github_connector.inspect_github_repository",
+            AsyncMock(return_value={"type": "repository", "files": []}),
+        ) as inspect:
+            result = await dispatch_job(
+                "github_research",
+                {
+                    "action": "inspect",
+                    "repository": "example/project",
+                    "max_results": 1000,
+                    "_github_access_policy": {
+                        "allowed": True,
+                        "repositories": ["example/project"],
+                    },
+                },
+            )
+
+        inspect.assert_awaited_once_with(
+            repository="example/project",
+            ref=None,
+            max_files=1000,
+        )
+        self.assertEqual(result["content_trust"], "untrusted_external_content")
+
+    async def test_dispatch_denies_github_repository_outside_server_allowlist(self):
+        environment = {
+            "GITHUB_TOKEN": "server-secret",
+            "GITHUB_ALLOWED_REPOSITORIES": "example/allowed",
+        }
+        with patch.dict(os.environ, environment, clear=False), patch(
+            "github_connector.inspect_github_repository",
+            AsyncMock(return_value={"type": "repository"}),
+        ) as inspect:
+            result = await dispatch_job(
+                "github_research",
+                {
+                    "action": "inspect",
+                    "repository": "example/forbidden",
+                    "_github_access_policy": {
+                        "allowed": True,
+                        "repositories": ["example/forbidden"],
+                    },
+                },
+            )
+
+        self.assertEqual(result["error"], "forbidden")
+        inspect.assert_not_awaited()
 
     async def test_dispatch_normalizes_and_forwards_proposed_queries(self):
         with patch(

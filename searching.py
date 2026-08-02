@@ -16,11 +16,20 @@ from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
-from typing import Any, Dict
+from typing import Any, Dict, Mapping
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
+
+from egress_policy import (
+    DEFAULT_ALLOWED_PORTS,
+    DestinationPolicyError,
+    parse_allowed_ports,
+    parse_denied_networks,
+    resolve_public_addresses,
+)
+from redaction import redact_url_credentials
 
 try:
     import redis.asyncio as redis_async
@@ -65,6 +74,16 @@ SEARCH_CACHE_REDIS_TIMEOUT_SECONDS = max(
 SEARCH_CACHE_MAX_PAYLOAD_BYTES = max(
     4096,
     min(4194304, int(os.getenv("SEARCH_CACHE_MAX_PAYLOAD_BYTES", "262144"))),
+)
+IMAGE_URL_DNS_TIMEOUT_SECONDS = max(
+    0.1,
+    min(10.0, float(os.getenv("SAFE_EGRESS_DNS_TIMEOUT_SECONDS", "5"))),
+)
+IMAGE_URL_ALLOWED_PORTS = parse_allowed_ports(
+    os.getenv("SAFE_EGRESS_ALLOWED_PORTS", DEFAULT_ALLOWED_PORTS)
+)
+IMAGE_URL_DENIED_NETWORKS = parse_denied_networks(
+    os.getenv("SAFE_EGRESS_DENY_CIDRS", "")
 )
 SEARCH_ENGINE_FAILURE_THRESHOLD = max(
     1,
@@ -312,6 +331,7 @@ _ALLOWED_SEARX_ENGINES = frozenset(
     for stage in stages
     for engine in stage
 )
+_IMAGE_ENGINES = ("bing images", "qwant images", "wikicommons.images")
 
 _RATE_LIMIT_REASON_RE = re.compile(
     r"(?:rate[ -]?limit|too many requests|http\s*429|captcha|robot check)",
@@ -2780,6 +2800,197 @@ async def searxng_search(
                 attempt_diagnostics={"error": "search deadline exceeded"},
             )
         raise
+
+
+def _safe_result_url(value: object) -> str | None:
+    raw = str(value or "").strip()
+    if not raw or len(raw) > 8192:
+        return None
+    _, credential_redactions = redact_url_credentials(raw)
+    if credential_redactions:
+        return None
+    try:
+        parsed = urlsplit(raw)
+    except ValueError:
+        return None
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        return None
+    hostname = parsed.hostname.casefold().rstrip(".")
+    if not hostname:
+        return None
+    try:
+        address = ipaddress.ip_address(hostname.strip("[]"))
+    except ValueError:
+        # Reject alternate numeric IPv4 spellings (octal/hex/short forms)
+        # instead of treating them as ordinary DNS names.
+        if re.fullmatch(
+            r"(?i)(?:0x[0-9a-f]+|[0-9]+)(?:\.(?:0x[0-9a-f]+|[0-9]+))*",
+            hostname,
+        ):
+            return None
+        if "." not in hostname or hostname.endswith(
+            (
+                ".corp",
+                ".home",
+                ".home.arpa",
+                ".internal",
+                ".invalid",
+                ".lan",
+                ".local",
+                ".localdomain",
+                ".localhost",
+            )
+        ):
+            return None
+    else:
+        if not address.is_global:
+            return None
+    try:
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    except ValueError:
+        return None
+    if port not in IMAGE_URL_ALLOWED_PORTS:
+        return None
+    return raw
+
+
+async def _dns_safe_result_url(value: object) -> str | None:
+    safe = _safe_result_url(value)
+    if not safe:
+        return None
+    parsed = urlsplit(safe)
+    try:
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        await resolve_public_addresses(
+            parsed.hostname or "",
+            port,
+            allowed_ports=IMAGE_URL_ALLOWED_PORTS,
+            denied_networks=IMAGE_URL_DENIED_NETWORKS,
+            dns_timeout_seconds=IMAGE_URL_DNS_TIMEOUT_SECONDS,
+        )
+    except (DestinationPolicyError, TimeoutError, OSError, ValueError):
+        return None
+    return safe
+
+
+def compact_image_results(data: Mapping[str, Any], max_results: int = 6) -> list[dict[str, Any]]:
+    max_results = max(1, min(int(max_results), 12))
+    output = []
+    seen = set()
+    for raw in data.get("results") or []:
+        if not isinstance(raw, dict):
+            continue
+        image_url = _safe_result_url(raw.get("img_src") or raw.get("image_url"))
+        source_url = _safe_result_url(raw.get("url"))
+        if not image_url or not source_url:
+            continue
+        key = image_url.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        thumbnail_url = _safe_result_url(
+            raw.get("thumbnail_src") or raw.get("thumbnail")
+        )
+        item = {
+            "title": strip_text(str(raw.get("title") or ""))[:500],
+            "image_url": image_url,
+            "source_url": source_url,
+            "thumbnail_url": thumbnail_url,
+            "engine": strip_text(str(raw.get("engine") or ""))[:100],
+            "content_trust": "untrusted_external_content",
+            "retrieval_context": runtime_retrieval_context(),
+        }
+        if raw.get("resolution") is not None:
+            item["resolution"] = strip_text(str(raw.get("resolution")))[:100]
+        output.append(item)
+        if len(output) >= max_results:
+            break
+    return output
+
+
+async def searxng_image_search(query: str, max_results: int = 6) -> list[dict[str, Any]]:
+    """Return bounded image discovery metadata without fetching image content."""
+    query = strip_text(str(query or ""))[:500]
+    if not query:
+        raise ValueError("image query must not be empty")
+    max_results = max(1, min(int(max_results), 12))
+    base_url = SEARXNG_URL.rstrip("/")
+    parsed = urlsplit(base_url)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError(
+            "SEARXNG_URL must be an HTTP(S) base URL without credentials, query, or fragment"
+        )
+
+    params = {
+        "q": _escape_searx_control_tokens(query),
+        "format": "json",
+        "categories": "images",
+        "engines": ",".join(_IMAGE_ENGINES),
+        "safesearch": "1",
+    }
+    async with asyncio.timeout(SEARXNG_TIMEOUT_SECONDS):
+        async with httpx.AsyncClient(timeout=SEARXNG_TIMEOUT_SECONDS) as client:
+            async with client.stream(
+                "GET",
+                f"{base_url}/search",
+                params=params,
+            ) as response:
+                response.raise_for_status()
+                content_length = response.headers.get("content-length")
+                if content_length and int(content_length) > SEARXNG_MAX_RESPONSE_BYTES:
+                    raise ValueError("SearXNG image response exceeded the configured size limit")
+                body = bytearray()
+                async for chunk in response.aiter_bytes():
+                    if len(body) + len(chunk) > SEARXNG_MAX_RESPONSE_BYTES:
+                        raise ValueError("SearXNG image response exceeded the configured size limit")
+                    body.extend(chunk)
+
+    try:
+        data = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("SearXNG returned invalid image-search JSON") from exc
+    if not isinstance(data, dict):
+        raise ValueError("SearXNG returned an invalid image-search response")
+    candidates = compact_image_results(data, max_results=min(12, max_results * 2))
+    validated = await asyncio.gather(
+        *(_validate_image_result(item) for item in candidates),
+        return_exceptions=True,
+    )
+    return [
+        item
+        for item in validated
+        if isinstance(item, dict)
+    ][:max_results]
+
+
+async def _validate_image_result(item: Mapping[str, Any]) -> dict[str, Any] | None:
+    image_url, source_url, thumbnail_url = await asyncio.gather(
+        _dns_safe_result_url(item.get("image_url")),
+        _dns_safe_result_url(item.get("source_url")),
+        _dns_safe_result_url(item.get("thumbnail_url"))
+        if item.get("thumbnail_url")
+        else asyncio.sleep(0, result=None),
+    )
+    if not image_url or not source_url:
+        return None
+    output = dict(item)
+    output["image_url"] = image_url
+    output["source_url"] = source_url
+    output["thumbnail_url"] = thumbnail_url
+    output["url_policy"] = "public_dns_validated_at_retrieval"
+    return output
 
 
 async def _staged_searxng_search(

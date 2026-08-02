@@ -461,6 +461,33 @@ class RedisJobStoreTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(other_owner["owner_id"], "client-b")
 
+    async def test_unified_and_advanced_research_share_one_owner_admission_budget(self):
+        store = RedisJobStore(
+            redis_client=self.redis,
+            queue_name="test:admission-cross-kind",
+            result_ttl_seconds=120,
+            ingestion_waitaof_timeout_ms=0,
+            research_admission_max_active=1,
+            research_admission_max_new_jobs=0,
+        )
+        await store.create_job(
+            "research_web",
+            {"query": "first"},
+            owner_id="client-a",
+            coalesce_active=True,
+        )
+
+        with self.assertRaises(ResearchAdmissionLimitedError) as raised:
+            await store.create_job(
+                "research_assistant",
+                {"request": "second"},
+                owner_id="client-a",
+                coalesce_active=True,
+            )
+
+        self.assertEqual(raised.exception.reason, "active_limit")
+        self.assertEqual(raised.exception.active_jobs, 1)
+
     async def test_running_cancellation_counts_until_job_is_terminal(self):
         store = RedisJobStore(
             redis_client=self.redis,

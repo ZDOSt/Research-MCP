@@ -1,0 +1,12 @@
+services:
+  research-worker:
+    networks:
+      - backend
+      - egress
+      - search-control
+      - research-model
+
+networks:
+  research-model:
+    external: true
+    name: ${RESEARCH_MODEL_NETWORK:?set RESEARCH_MODEL_NETWORK to the external Docker network containing the model service}

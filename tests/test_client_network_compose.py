@@ -84,11 +84,46 @@ class ClientNetworkComposeTests(unittest.TestCase):
 
     def test_documented_compose_file_retains_client_network_override(self):
         readme = (PROJECT_ROOT / "README.md").read_text("utf-8")
+        environment_example = (PROJECT_ROOT / ".env.example").read_text("utf-8")
         self.assertIn(
             "COMPOSE_FILE=docker-compose.yml:docker-compose.client-network.yml",
             readme,
         )
         self.assertIn("COMPOSE_PATH_SEPARATOR=:", readme)
+        combined = (
+            "COMPOSE_FILE=docker-compose.yml:docker-compose.client-network.yml:"
+            "docker-compose.model-network.yml"
+        )
+        self.assertIn(combined, readme)
+        self.assertIn(combined, environment_example)
+
+
+class ModelNetworkComposeTests(unittest.TestCase):
+    def test_only_research_worker_joins_external_model_network(self):
+        override = yaml.safe_load(
+            (PROJECT_ROOT / "docker-compose.model-network.yml").read_text("utf-8")
+        )
+
+        self.assertEqual(set(override["services"]), {"research-worker"})
+        self.assertIn(
+            "research-model",
+            override["services"]["research-worker"]["networks"],
+        )
+        self.assertTrue(override["networks"]["research-model"]["external"])
+        self.assertIn(
+            "RESEARCH_MODEL_NETWORK",
+            override["networks"]["research-model"]["name"],
+        )
+
+    def test_documented_compose_file_retains_model_network_override(self):
+        readme = (PROJECT_ROOT / "README.md").read_text("utf-8")
+        environment_example = (PROJECT_ROOT / ".env.example").read_text("utf-8")
+        model_only = (
+            "COMPOSE_FILE=docker-compose.yml:docker-compose.model-network.yml"
+        )
+
+        self.assertIn(model_only, readme)
+        self.assertIn(model_only, environment_example)
 
 
 if __name__ == "__main__":

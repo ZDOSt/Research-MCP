@@ -1,10 +1,17 @@
 # Research MCP
 
-Research MCP gives any Streamable HTTP MCP client a private set of high-level
-tools for web research, focused URL investigation, read-only GitHub research,
-and persistent semantic memory. The gateway authenticates and queues work;
-separate workers perform search, bounded page extraction, browser automation,
-background ingestion, retrieval, and optional reranking.
+Research MCP gives any Streamable HTTP MCP client one private, high-level
+`research_assistant` tool. The client passes the complete request once; the
+server-side research model plans focused queries, searches and browses in
+parallel, inspects supplied URLs and GitHub when relevant, optionally discovers
+images, performs one bounded evidence-gap follow-up, and returns a finished
+citation-coverage-checked Markdown answer. The gateway exposes MCP only; it does not
+provide an OpenAI-compatible chat endpoint.
+
+The existing evidence, URL, GitHub, memory, and durable-job tools remain
+available through an `advanced` tool profile. Separate workers perform bounded
+page extraction, browser automation, background ingestion, retrieval, and
+optional reranking.
 
 ## Run with Docker Compose
 
@@ -17,7 +24,8 @@ lower the worker limits or provide swap if other services share the host. Each
 optional Crawl4AI or reranker profile adds up to 4 GB. The first build downloads
 Chromium and the first indexing job downloads the configured embedding model.
 
-All settings have runnable defaults, so the base stack starts with one command:
+The base Compose defaults retain the existing `all` tool profile for upgrades,
+so a checkout without a copied `.env` can start with one command:
 
 ```console
 docker compose up -d
@@ -27,17 +35,40 @@ The MCP endpoint is `http://127.0.0.1:8001/mcp`. It uses streamable HTTP. Only
 that gateway port is published; Redis, Qdrant, SearXNG, and workers remain on
 private Docker networks.
 
+New installations copy `.env.example`, which selects
+`MCP_TOOL_PROFILE=unified` and exposes `research_assistant` plus
+`research_job`. For upgrade compatibility, an older `.env` with no profile
+setting falls back to `all` so existing clients do not lose tools. Configure a
+private OpenAI-compatible server-side model before using `research_assistant`:
+
+```dotenv
+RESEARCH_MODEL_BASE_URL=https://your-model-endpoint.example/v1
+RESEARCH_MODEL_NAME=your-model-name
+RESEARCH_MODEL_API_KEY=your-private-key
+```
+
+This endpoint is an internal dependency used only by the research worker; it is
+not exposed to MCP clients. Use `RESEARCH_MODEL_ALLOW_INSECURE_HTTP=true` only
+for a trusted private HTTP endpoint. The standard Compose deployment fails
+closed when `MCP_TOOL_PROFILE=unified` has no configured model: the research
+worker remains unhealthy and the dependent gateway does not start. Configure
+the model before startup, or set `MCP_TOOL_PROFILE=advanced` to use the
+evidence-only tools without an internal model. Direct inline/non-Compose calls
+can instead return `configuration_required` when the model is absent.
+
 When `MCP_AUTH_TOKEN` or `MCP_AUTH_TOKENS_JSON` is set, MCP clients must send an
 `Authorization: Bearer TOKEN` header on gateway requests. An empty policy
 leaves only the loopback endpoint unauthenticated for local development; the
 gateway refuses an unauthenticated non-loopback bind by default.
 
 For a durable non-local installation, create `.env` from `.env.example`, set a
-random `SEARXNG_SECRET` and `MCP_AUTH_TOKEN`, review the resource limits, and
-terminate TLS at a reverse proxy in front of the gateway.
+random `SEARXNG_SECRET` and `MCP_AUTH_TOKEN`, configure `RESEARCH_MODEL_*`,
+review the resource limits, and terminate TLS at a reverse proxy in front of the
+gateway.
 
 ```console
 cp .env.example .env
+# Edit .env and configure RESEARCH_MODEL_* before continuing.
 docker compose up -d --build --wait
 docker compose ps
 ```
@@ -46,6 +77,7 @@ PowerShell equivalent:
 
 ```powershell
 Copy-Item .env.example .env
+# Edit .env and configure RESEARCH_MODEL_* before continuing.
 docker compose up -d --build --wait
 docker compose ps
 ```
@@ -86,7 +118,59 @@ echo "CRAWL4AI_API_TOKEN=$(openssl rand -hex 32)"
 ```
 
 Put the generated values in `.env` as `SEARXNG_SECRET`, `MCP_AUTH_TOKEN`, and
-`CRAWL4AI_API_TOKEN`; use a different value for each credential.
+`CRAWL4AI_API_TOKEN`; use a different value for each credential. Also set
+`RESEARCH_MODEL_BASE_URL`, `RESEARCH_MODEL_NAME`, and, when required,
+`RESEARCH_MODEL_API_KEY`. The research model must support OpenAI-compatible
+`/chat/completions`; it is independent of the model configured in the frontend.
+When that model is another same-host Docker service, no host port is required.
+Create a dedicated external network:
+
+```console
+docker network create research-model
+```
+
+Declare that network in the model provider's own Compose file so the attachment
+survives container recreation. Add `research-model` alongside any networks the
+model service already uses:
+
+```yaml
+services:
+  your-model-service:
+    networks:
+      - default
+      - research-model
+
+networks:
+  research-model:
+    external: true
+    name: research-model
+```
+
+For a one-time test with an already-running container,
+`docker network connect research-model YOUR_MODEL_CONTAINER` is sufficient, but
+that manual attachment must be repeated after the model container is recreated.
+
+Then set `RESEARCH_MODEL_NETWORK=research-model`, point
+`RESEARCH_MODEL_BASE_URL` at the model container name and internal port, and set
+`RESEARCH_MODEL_ALLOW_INSECURE_HTTP=true` only for that trusted private Docker
+network. Add the model-only file set to `.env`:
+
+```dotenv
+COMPOSE_FILE=docker-compose.yml:docker-compose.model-network.yml
+COMPOSE_PATH_SEPARATOR=:
+```
+
+Only after those values are present, validate and start the stack:
+
+```console
+docker compose config --quiet
+docker compose up -d --build --wait
+```
+
+Alternatively, leave `COMPOSE_FILE` unset and keep
+`-f docker-compose.yml -f docker-compose.model-network.yml` on every Compose
+command.
+
 Set `RESEARCH_TIMEZONE` to the primary user's IANA timezone, such as
 `America/New_York`, so relative-date searches and results use the expected
 local calendar date. It defaults to `UTC`.
@@ -120,12 +204,27 @@ research.example.com {
 Allow only SSH, HTTP, and HTTPS through the VPS firewall. The remote MCP URL is
 then `https://research.example.com/mcp`; the client must still send the bearer
 token. The proxy must allow long-lived streaming responses and retain the
-`Authorization` header. To update later:
+`Authorization` header. To update later, preserve any enabled Compose profiles
+and explicitly choose the tool profile. Existing deployments should either
+configure `RESEARCH_MODEL_*` and set `MCP_TOOL_PROFILE=unified`, or leave the
+compatibility value `all` until their clients have migrated:
 
 ```console
 git pull --ff-only
 docker compose up -d --build --wait
 ```
+
+Add `--profile crawl4ai` and/or `--profile reranker` only for optional services
+that are already enabled and should remain enabled. For example, preserve both
+profiles with:
+
+```console
+docker compose --profile crawl4ai --profile reranker up -d --build --wait
+```
+
+Profile flags are required to recreate and rebuild those profile-gated services
+during an update, but including a flag also enables that service if it was not
+previously running.
 
 Back up the Qdrant, Redis, and artifact named volumes before destructive Docker
 maintenance. `docker compose down` preserves them; `docker compose down
@@ -135,6 +234,7 @@ maintenance. `docker compose down` preserves them; `docker compose down
 
 ```text
 MCP client -> mcp-gateway -> Redis primary queue -> research-worker
+                                              |-> private research model
                                               |-> SearXNG -> public web
                                               |-> direct bounded fetch -> public web
                                               |-> Unix socket -> isolated PDF parser (no network)
@@ -153,7 +253,7 @@ The default stack includes:
 | Service | Role | Host exposure |
 | --- | --- | --- |
 | `mcp-gateway` | MCP protocol, validation, queue submission, result polling | `127.0.0.1:8001` |
-| `research-worker` | Search, crawl, extraction, browser automation, and current evidence | None |
+| `research-worker` | Internal planning/writing model calls, search, crawl, extraction, browser automation, and current evidence | None |
 | `persistence-worker` | Independently index one extracted source per durable child job | None |
 | `redis` | Durable primary/persistence queues and result state | None |
 | `qdrant` | Persistent vector memory | None |
@@ -184,12 +284,17 @@ artifacts across replacement.
 
 ## MCP tools
 
-The gateway exposes the following tools. `namespace` values create logical
-partitions in Qdrant memory. They also become an MCP authorization boundary
-when a token policy restricts its `namespaces` patterns.
+`MCP_TOOL_PROFILE` controls discovery. New installs select `unified` in
+`.env.example`, exposing only `research_assistant` and `research_job`, which
+minimizes tool-choice errors in frontends. When the setting is absent, the
+compatibility fallback is `all`. `advanced` exposes the original specialized tools and
+`research_job`; `all` exposes both surfaces. Restart the gateway after changing
+the profile because MCP clients commonly cache tool schemas. `namespace` values
+create logical Qdrant partitions and authorization boundaries.
 
 | Tool | Purpose and important behavior |
 | --- | --- |
+| `research_assistant` | Complete a current, external, technical, URL, GitHub, image, or general research request in one call. Pass the complete user request and normally use `mode=auto`. It requires a configured `RESEARCH_MODEL_*` endpoint and returns `answer_markdown`, validated `citations`, optional image metadata, `confidence`, `limitations`, and a bounded `research_summary`. |
 | `research_web` | Run open-ended research. Pass the complete task in `query`; capable calling models may also supply 1-5 concise, optional `proposed_queries` of at most 180 characters each. The server validates suggestions and retains deterministic search anchors. Modes are `quick` (12-second target), `balanced` (30), `web_only` (25), `technical` (45), `academic` (50), `deep` (180/background-oriented), and `local_only`. Search queries and source extraction run under one bounded latency budget and return the best available evidence at expiry. `evidence` is the authoritative fresh result; `results` and `memory_results` are optional vector-memory matches and may be empty. Source indexing continues independently after the response. With Redis, same-owner duplicate active requests are coalesced and wait for the existing result rather than launching duplicate work. |
 | `investigate_url` | Investigate one public HTTP(S) URL with crawl, rendered-browser, scrolling, clicking, and network-data fallbacks. Modes are `auto`, `targeted`, `balanced`, and `exhaustive`; optional flags control ingestion, raw text, and diagnostics. |
 | `start_research` | Queue explicitly deep durable `research_web` work and return a job ID immediately. It accepts the same complete `query` and optional `proposed_queries` planning inputs. Ordinary work should use `research_web`. A model may follow with one bounded `research_job` call itself; users should not be asked to run job-control commands. It requires `JOB_BACKEND=redis`, which Compose configures. |
@@ -200,9 +305,67 @@ when a token policy restricts its `namespaces` patterns.
 | `manage_sources` | `list`, inspect `stats`, or `delete` an ingested source within a namespace. Deletion removes its Qdrant chunks, not job artifact files. |
 | `github_research` | Read-only GitHub API access. `search` searches `issues`, `code`, or `repositories`; `inspect` returns repository metadata and a prioritized recursive file tree; `read` returns a file or directory listing at an optional ref. |
 
-### Query planning
+### Unified orchestration
 
-For `research_web` and `start_research`, the calling model may formulate concise
+`research_assistant(request, mode="auto")` accepts the complete private request.
+Before any content crosses the configured research-model boundary, the server
+redacts credential patterns, signed/session URL values, common PII,
+private-context phrases, addresses, and host paths. Only normalized, bounded,
+planner-minimized queries cross public search boundaries.
+The deterministic failure path uses only a small public-topic vocabulary rather
+than copying the complete request. Explicit public URLs are retained exactly in
+execution-only state so signed query ordering and encoding remain intact; only
+redacted canonical forms are returned or persisted. Relevant web, URL, GitHub, and image operations run
+concurrently. The normal research pipeline still performs source selection,
+reranking when enabled, page extraction, and browser fallbacks.
+
+Privacy filtering is heuristic: it recognizes credential patterns, common PII,
+and private identifiers with recognizable context. An arbitrary project name or
+other identifier without such context cannot be reliably distinguished from a
+public product name, so callers should still avoid placing secrets or sensitive
+identifiers in research requests and should use a trusted research-model
+endpoint.
+
+After acquisition, the model reviews the bounded evidence once. It may request
+at most one focused follow-up round, controlled by
+`RESEARCH_AGENT_MAX_FOLLOW_UP_ROUNDS`. It then writes from numbered evidence
+only. Citation IDs, paragraph/list-item coverage, and lexical evidence alignment
+are validated before IDs are converted to clickable source links. Model-authored
+links, images, active URL schemes, and raw HTML are removed. One citation-repair
+attempt is allowed before synthesis fails closed. These checks reduce unsupported
+claims but do not establish semantic entailment or factual truth.
+Planning, review, and synthesis have independent 30, 20, and 60 second defaults.
+
+Image discovery uses a small SearXNG image-engine set and returns titles,
+resolution metadata, and validated source-page links. Direct image and thumbnail
+URLs are omitted from MCP responses so clients cannot auto-fetch an image host
+after its DNS changes. The MCP does not fetch, proxy, or store image bytes.
+Unsafe, private, loopback, credential-bearing, alternate-numeric, and DNS-private
+candidate URLs are discarded at retrieval time. Frontends must still apply their
+own URL/SSRF policy to ordinary source and citation links.
+
+The server returns:
+
+- `answer_markdown`: the finished answer the frontend should present directly.
+- `citations`: the cited source records used by that answer.
+- `images`: optional bounded image metadata when the request calls for images.
+- `confidence` and `limitations`: evidence-coverage signals, not truth guarantees.
+- `research_summary`: plan, acquisition counts, bounded follow-up diagnostics,
+  redaction count, and elapsed time.
+
+MCP cannot intercept an ordinary chat turn or force a frontend model to call a
+tool. The tool name, description, and server instructions strongly direct capable
+clients to call `research_assistant` once when external information is needed,
+but the initial call remains a frontend responsibility. Once called, the server
+owns the investigation and returns the finished answer; the frontend does not
+coordinate subtools. Frontend model credentials and hidden model state are not
+portable through MCP, so the internal model requires its own server-side
+configuration.
+
+### Advanced query planning
+
+For the `advanced` profile's `research_web` and `start_research`, the calling
+model may formulate concise
 search suggestions in `proposed_queries`, but the complete user task in `query`
 remains authoritative. The server normalizes and deduplicates suggestions,
 checks that each one aligns with a canonical intent, rejects off-topic,
@@ -432,6 +595,23 @@ MCP_CLIENT_ALIAS=research-mcp
 MCP_AUTH_TOKEN=a-long-random-secret
 ```
 
+When the research model also runs on its dedicated external Docker network,
+retain both overrides by listing all three files in order:
+
+```dotenv
+COMPOSE_FILE=docker-compose.yml:docker-compose.client-network.yml:docker-compose.model-network.yml
+COMPOSE_PATH_SEPARATOR=:
+MCP_CLIENT_NETWORK=the-existing-client-network
+RESEARCH_MODEL_NETWORK=research-model
+```
+
+The equivalent commands without `COMPOSE_FILE` are:
+
+```console
+docker compose -f docker-compose.yml -f docker-compose.client-network.yml -f docker-compose.model-network.yml config --quiet
+docker compose -f docker-compose.yml -f docker-compose.client-network.yml -f docker-compose.model-network.yml up -d --build --wait
+```
+
 The named network must already exist and the MCP client must also join it. The
 alias must be unique on that network. Keep `MCP_BIND_ADDRESS=127.0.0.1` so the
 base deployment remains safe if the override is later removed. The override
@@ -457,10 +637,11 @@ Configure the client for Streamable HTTP at
 `http://research-mcp:8001/mcp`, or replace the hostname with the value of
 `MCP_CLIENT_ALIAS`. Plain HTTP is appropriate only for a trusted, same-host
 Docker network; use a TLS reverse proxy across hosts or untrusted networks.
-Client tool-call timeouts should exceed `MCP_SYNC_JOB_WAIT_SECONDS`. Clients
-with shorter limits can use `start_research`; the assistant may make one bounded
-`research_job` continuation itself and should never ask the user to issue a
-tool-control command or busy-poll within one model turn.
+Client tool-call timeouts should exceed
+`RESEARCH_ASSISTANT_SYNC_WAIT_SECONDS` (240 seconds by default) when using
+`research_assistant`. Clients with shorter limits should select the `advanced`
+profile and use `start_research` followed by one bounded `research_job` call;
+the unified profile intentionally does not expose those lower-level tools.
 
 LibreChat also blocks private MCP destinations by default. Allow the exact
 private socket rather than disabling SSRF protection:
@@ -643,8 +824,9 @@ Important invariants:
 - Successful job artifacts are pruned after `ARTIFACT_RETENTION_SECONDS` by
   default. Set it to `0` only when another process owns artifact lifecycle, and
   keep the Redis result TTL at least as long as artifact retention.
-- Treat `.env` as a secret when it contains `MCP_AUTH_TOKEN`, `GITHUB_TOKEN`, or
-  `PLANNER_API_KEY`; it is excluded from the container build context.
+- Treat `.env` as a secret when it contains `MCP_AUTH_TOKEN`, `GITHUB_TOKEN`,
+  `PLANNER_API_KEY`, or `RESEARCH_MODEL_API_KEY`; it is excluded from the
+  container build context.
 - Image defaults are exact tags. For a controlled production rollout, mirror
   them and optionally replace tags with digest-pinned image references.
 - The supplied Crawl4AI profile is deliberately inside the browser sandbox. An

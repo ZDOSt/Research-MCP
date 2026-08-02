@@ -1,12 +1,86 @@
+import json
+import os
+import subprocess
+import sys
+from types import SimpleNamespace
+from unittest.mock import patch
+
 import pytest
 
 import mcp_server
 
 
+def test_current_github_access_policy_forwards_only_bounded_non_secret_claims():
+    token = SimpleNamespace(
+        scopes=["ignored:fallback"],
+        claims={
+            "scopes": "research,github:read",
+            "github_repositories": [
+                "owner/repository",
+                "owner/repository",
+                "other/project",
+                "",
+            ],
+            "access_token": "must-not-be-forwarded",
+        },
+    )
+    with patch.object(
+        mcp_server, "_token_authorization_enabled", return_value=True
+    ), patch.object(mcp_server, "_current_access_token", return_value=token):
+        policy = mcp_server._current_github_access_policy()
+
+    assert policy == {
+        "allowed": True,
+        "repositories": ["owner/repository", "other/project"],
+    }
+    assert "access_token" not in policy
+
+
 @pytest.mark.asyncio
-async def test_all_public_tools_expose_bounded_client_schemas():
+async def test_compatibility_default_exposes_all_bounded_client_schemas():
     tools = {tool.name: tool for tool in await mcp_server.mcp.list_tools()}
-    assert set(tools) == {
+    assert {"research_assistant", "research_job", "research_web"}.issubset(tools)
+
+    assistant = tools["research_assistant"].parameters["properties"]
+    assert assistant["request"]["minLength"] == 1
+    assert assistant["request"]["maxLength"] == mcp_server.MCP_MAX_QUERY_CHARS
+    assert assistant["mode"]["enum"] == [
+        "auto",
+        "quick",
+        "balanced",
+        "deep",
+        "technical",
+        "academic",
+    ]
+    assert tools["research_job"].parameters["properties"]["action"]["enum"] == [
+        "status",
+        "result",
+        "cancel",
+    ]
+
+
+def _tools_for_profile(profile):
+    code = (
+        "import asyncio,json,mcp_server; "
+        "tools=asyncio.run(mcp_server.mcp.list_tools()); "
+        "print(json.dumps({t.name:{'parameters':t.parameters,'description':t.description} for t in tools}))"
+    )
+    environment = dict(os.environ)
+    environment["MCP_TOOL_PROFILE"] = profile
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=os.path.dirname(os.path.dirname(__file__)),
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return json.loads(completed.stdout.strip().splitlines()[-1])
+
+
+def test_advanced_and_all_profiles_control_tool_discovery():
+    advanced = _tools_for_profile("advanced")
+    advanced_names = {
         "get_research_artifact",
         "github_research",
         "ingest_text",
@@ -17,8 +91,12 @@ async def test_all_public_tools_expose_bounded_client_schemas():
         "research_web",
         "start_research",
     }
+    assert set(advanced) == advanced_names
+    assert set(_tools_for_profile("all")) == advanced_names | {"research_assistant"}
 
-    research = tools["research_web"].parameters["properties"]
+    tools = advanced
+
+    research = tools["research_web"]["parameters"]["properties"]
     assert research["mode"]["enum"] == [
         "quick",
         "balanced",
@@ -34,7 +112,7 @@ async def test_all_public_tools_expose_bounded_client_schemas():
         "type": "integer",
     }
     for tool_name in ("research_web", "start_research"):
-        parameters = tools[tool_name].parameters
+        parameters = tools[tool_name]["parameters"]
         proposed_schema = next(
             branch
             for branch in parameters["properties"]["proposed_queries"]["anyOf"]
@@ -46,68 +124,63 @@ async def test_all_public_tools_expose_bounded_client_schemas():
         assert proposed_schema["items"]["maxLength"] == 180
         assert "proposed_queries" not in parameters.get("required", [])
 
-    investigation = tools["investigate_url"].parameters["properties"]
+    investigation = tools["investigate_url"]["parameters"]["properties"]
     assert investigation["mode"]["enum"] == ["auto", "targeted", "balanced", "exhaustive"]
     assert investigation["max_chars"]["minimum"] == 10_000
     assert investigation["max_chars"]["maximum"] == 750_000
 
-    assert tools["query_memory"].parameters["properties"]["top_k"]["maximum"] == 30
-    assert tools["manage_sources"].parameters["properties"]["action"]["enum"] == [
+    assert tools["query_memory"]["parameters"]["properties"]["top_k"]["maximum"] == 30
+    assert tools["manage_sources"]["parameters"]["properties"]["action"]["enum"] == [
         "list",
         "stats",
         "delete",
     ]
-    assert tools["research_job"].parameters["properties"]["action"]["enum"] == [
+    assert tools["research_job"]["parameters"]["properties"]["action"]["enum"] == [
         "status",
         "result",
         "cancel",
     ]
-    assert tools["github_research"].parameters["properties"]["action"]["enum"] == [
+    assert tools["github_research"]["parameters"]["properties"]["action"]["enum"] == [
         "search",
         "inspect",
         "read",
     ]
-    assert tools["github_research"].parameters["properties"]["kind"]["enum"] == [
+    assert tools["github_research"]["parameters"]["properties"]["kind"]["enum"] == [
         "issues",
         "code",
         "repositories",
     ]
-    artifact_chars = tools["get_research_artifact"].parameters["properties"]["max_chars"]
+    artifact_chars = tools["get_research_artifact"]["parameters"]["properties"]["max_chars"]
     assert artifact_chars["minimum"] == 1_000
     assert artifact_chars["maximum"] == 250_000
 
 
+def test_invalid_tool_profile_fails_fast_with_clear_error():
+    environment = dict(os.environ)
+    environment["MCP_TOOL_PROFILE"] = "invalid"
+    completed = subprocess.run(
+        [sys.executable, "-c", "import mcp_server"],
+        cwd=os.path.dirname(os.path.dirname(__file__)),
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode != 0
+    assert "MCP_TOOL_PROFILE must be unified, advanced, or all" in completed.stderr
+
+
 @pytest.mark.asyncio
-async def test_tool_discovery_promotes_proactive_research_without_redundant_artifact_reads():
+async def test_unified_tool_discovery_promotes_one_completed_research_call():
     tools = {tool.name: tool for tool in await mcp_server.mcp.list_tools()}
 
     instructions = mcp_server.mcp.instructions
-    assert "may have changed or needs external verification" in instructions
-    assert "even when the user did not explicitly ask to search" in instructions
-    assert "answer stable, timeless questions directly" in instructions
-    assert "duplicate job-result artifact path is intentionally omitted" in instructions
+    assert "Use research_assistant once" in instructions
+    assert "citation-coverage-checked answer" in instructions
+    assert "MCP cannot force a client model to call tools" in instructions
 
-    research_description = tools["research_web"].description
-    assert "Use this proactively" in research_description
-    assert "may have changed" in research_description
-    assert "did not explicitly ask to search" in research_description
-    assert "complete research question or task" in research_description
-    assert "effective search queries internally" in research_description
-    assert "formulate one or more concise search-engine queries" in research_description
-    assert "validates proposals against the complete task" in research_description
-    assert "Quick mode's one-query budget" in research_description
-    assert "Omit proposed_queries in those modes" in research_description
-    assert "one bounded query repair" in research_description
-    assert "low_topical_relevance" in research_description
-    assert "instead of repeating the same research_web call" in research_description
-
-    start_description = tools["start_research"].description
-    assert "complete research task" in start_description
-    assert "proposed_queries are ineligible in both modes" in start_description
-    assert "Pass Keep" not in start_description
-
-    artifact_description = tools["get_research_artifact"].description
-    assert "intentionally omit their" in artifact_description
-    assert "duplicate job-result artifact path" in artifact_description
-    assert "specifically needed source artifact" in artifact_description
-    assert "include_full_result=False" in artifact_description
+    description = tools["research_assistant"].description
+    assert "Complete a research request in one high-level call" in description
+    assert "user's complete" in description
+    assert "one bounded evidence-gap" in description
+    assert "Present answer_markdown directly" in description

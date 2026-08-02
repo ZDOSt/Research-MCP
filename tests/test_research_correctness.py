@@ -1247,7 +1247,7 @@ async def test_synthesis_rejects_invalid_citations_and_reports_validated_ids(
     assert await planner.synthesize_report("q", evidence) is None
 
     async def valid_chat(*_args, **_kwargs):
-        return "Supported claim [E1]"
+        return "Fact supported by the source [E1]"
 
     monkeypatch.setattr(planner, "_chat", valid_chat)
     report = await planner.synthesize_report("q", evidence)

@@ -1,5 +1,6 @@
 import re
 from typing import List, Tuple
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 
 SECRET_PATTERNS: List[Tuple[re.Pattern[str], str]] = [
@@ -15,13 +16,13 @@ SECRET_PATTERNS: List[Tuple[re.Pattern[str], str]] = [
     ),
     (
         re.compile(
-            r'''(?i)(["'](?:password|passwd|secret|token|api[_-]?key|access[_-]?key|client[_-]?secret|(?:access|auth|refresh|id)[_-]?token|[a-z0-9.-]+[_-](?:password|passwd|secret|token|api[_-]?key|access[_-]?key)|x[_-]?amz[_-]?signature|x[_-]?goog[_-]?signature|signature|sig)["']\s*:\s*["'])(?!\$\{|<|example|changeme)([^"']{4,})(["'])'''
+            r'''(?i)(["'](?:password|passwd|secret|token|api[_-]?key|access[_-]?key|client[_-]?secret|(?:access|auth|refresh|id)[_-]?token|(?:j|php)?session[_-]?id|phpsessid|session(?:[_-]?(?:id|key|token))?|sid|[a-z0-9.-]+[_-](?:password|passwd|secret|token|api[_-]?key|access[_-]?key|session(?:[_-]?id)?)|x[_-]?amz[_-]?signature|x[_-]?goog[_-]?signature|signature|sig)["']\s*:\s*["'])(?!\$\{|<|example|changeme)([^"']{4,})(["'])'''
         ),
         r"\1[REDACTED]\3",
     ),
     (
         re.compile(
-            r"(?i)([?&](?:access[_-]?token|auth[_-]?token|refresh[_-]?token|id[_-]?token|api[_-]?key|client[_-]?secret|[a-z0-9.-]+[_-](?:password|passwd|secret|token|api[_-]?key|access[_-]?key)|x[_-]?amz[_-]?signature|x[_-]?goog[_-]?signature|signature|sig|password|passwd|secret|token)=)(?!\$\{|%24%7B|<|example|changeme)([^\s&#\"'<>]{4,})"
+            r"(?i)([?&](?:access[_-]?token|auth[_-]?token|refresh[_-]?token|id[_-]?token|api[_-]?key|client[_-]?secret|(?:j|php)?session[_-]?id|phpsessid|session(?:[_-]?(?:id|key|token))?|sid|[a-z0-9.-]+[_-](?:password|passwd|secret|token|api[_-]?key|access[_-]?key|session(?:[_-]?id)?)|x[_-]?amz[_-]?signature|x[_-]?goog[_-]?signature|signature|sig|password|passwd|secret|token)=)(?!\$\{|%24%7B|<|example|changeme)([^\s&#\"'<>]{4,})"
         ),
         r"\1[REDACTED]",
     ),
@@ -52,6 +53,144 @@ SECRET_PATTERNS: List[Tuple[re.Pattern[str], str]] = [
     ),
 ]
 
+SENSITIVE_URL_QUERY_KEYS = frozenset(
+    {
+        "access_key",
+        "access_token",
+        "api_key",
+        "apikey",
+        "auth",
+        "auth_token",
+        "authorization",
+        "client_secret",
+        "code",
+        "credential",
+        "id_token",
+        "key",
+        "password",
+        "passwd",
+        "oauth_token",
+        "refresh_token",
+        "secret",
+        "session",
+        "session_id",
+        "session_key",
+        "session_token",
+        "sessionid",
+        "sig",
+        "signature",
+        "sid",
+        "token",
+        "jsessionid",
+        "phpsessionid",
+        "phpsessid",
+        "x_amz_credential",
+        "x_amz_security_token",
+        "x_amz_signature",
+        "x_goog_credential",
+        "x_goog_signature",
+    }
+)
+
+_SENSITIVE_URL_QUERY_KEYS_COMPACT = frozenset(
+    re.sub(r"[^a-z0-9]", "", value.casefold())
+    for value in SENSITIVE_URL_QUERY_KEYS
+)
+
+
+def _is_sensitive_url_query_key(value: str) -> bool:
+    normalized = value.casefold().replace("-", "_")
+    compact = re.sub(r"[^a-z0-9]", "", value.casefold())
+    return (
+        normalized in SENSITIVE_URL_QUERY_KEYS
+        or compact in _SENSITIVE_URL_QUERY_KEYS_COMPACT
+        or normalized.startswith("session_")
+        or compact.startswith("session")
+        or normalized.endswith(
+            (
+                "_token",
+                "_secret",
+                "_password",
+                "_signature",
+                "_credential",
+                "_session",
+                "_session_id",
+                "_sessionid",
+            )
+        )
+        or compact.endswith(
+            ("token", "secret", "password", "signature", "credential", "sessionid")
+        )
+    )
+
+
+_URL_PARAMETER_ASSIGNMENT_RE = re.compile(
+    r"(?i)(?P<prefix>^|[;&])(?P<key>[A-Z0-9_.\[\]-]+)=(?P<value>[^;&]*)"
+)
+
+PUBLIC_QUERY_PATTERNS: List[Tuple[re.Pattern[str], str]] = [
+    (re.compile(r"(?<!\d)\d{3}-\d{2}-\d{4}(?!\d)"), "[REDACTED_ID]"),
+    (
+        re.compile(r"(?<!\d)(?:\d{1,3}\.){3}\d{1,3}(?!\d)"),
+        "[REDACTED_ADDRESS]",
+    ),
+    (
+        re.compile(
+            r"(?i)\b\d{1,6}\s+(?:[A-Z0-9][A-Z0-9.'-]*\s+){0,5}"
+            r"(?:avenue|ave|boulevard|blvd|court|ct|drive|dr|highway|hwy|"
+            r"lane|ln|parkway|pkwy|place|pl|road|rd|street|st|terrace|ter|way)"
+            r"(?:\s+(?:apartment|apt|suite|unit)\s*[A-Z0-9-]+)?\b"
+        ),
+        "[REDACTED_ADDRESS]",
+    ),
+    (
+        re.compile(
+            r"(?<!\w)(?:\+\d{1,3}[ .-]?)?(?:\(\d{2,4}\)|\d{2,4})[ .-]\d{3,4}[ .-]\d{4}(?!\w)"
+        ),
+        "[REDACTED_PHONE]",
+    ),
+    (
+        re.compile(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b"),
+        "[REDACTED_EMAIL]",
+    ),
+    (
+        re.compile(
+            r"(?i)\b(?:internal|private|confidential)\s+"
+            r"(?:project|customer|client|tenant|host|server|system|repository|"
+            r"repo|codebase)\s+"
+            r"[^\W_][\w .'-]{1,80}?"
+            r"(?=\s+(?:and|at|but|for|from|on|to|with)\b|[,;:!?]|\s*$)"
+        ),
+        "[REDACTED_PRIVATE_CONTEXT]",
+    ),
+    (
+        re.compile(
+            r"(?i)\b(?:codename|customer|client|tenant|account|ticket|incident|case)"
+            r"\s+(?:(?:id|identifier|name|number)\s+)?"
+            r"[^\W_][\w .'-]{1,80}?"
+            r"(?=\s+(?:and|at|but|for|from|on|to|with)\b|[,;:!?]|\s*$)"
+        ),
+        "[REDACTED_PRIVATE_CONTEXT]",
+    ),
+    (
+        re.compile(r"(?i)(?<![A-Z0-9])(?:[A-Z]:\\|/(?:home|root|srv|var|opt|etc|users)/)[^\s\"']+"),
+        "[REDACTED_PATH]",
+    ),
+    (
+        re.compile(r"(?<![A-Fa-f0-9])[A-Fa-f0-9]{8}(?:-[A-Fa-f0-9]{4}){3}-[A-Fa-f0-9]{12}(?![A-Fa-f0-9])"),
+        "[REDACTED_ID]",
+    ),
+]
+
+_HTTP_URL_IN_TEXT_RE = re.compile(r"https?://[^\s<>\]\[(){}\"']+", re.I)
+_MODEL_INLINE_SECRET_RE = re.compile(
+    r"(?i)(?<![A-Z0-9_.-])"
+    r"((?:[A-Z0-9_.\[\]-]*(?:PASSWORD|PASSWD|SECRET|TOKEN|API[_-]?KEY|ACCESS[_-]?KEY)"
+    r"[A-Z0-9_.\[\]-]*|CLIENT[_-]?SECRET|SESSION(?:[_-]?(?:ID|KEY|TOKEN))?|SID)"
+    r"\s*[=:]\s*)"
+    r"(?!\$\{|<|example|changeme|\[REDACTED)([^\s,;#\"'<>]{6,})"
+)
+
 
 def redact_sensitive_text(text: str) -> tuple[str, int]:
     output = text or ""
@@ -60,3 +199,91 @@ def redact_sensitive_text(text: str) -> tuple[str, int]:
         output, replacements = pattern.subn(replacement, output)
         count += replacements
     return output, count
+
+
+def redact_public_query_text(text: str) -> tuple[str, int]:
+    """Remove credentials and common private identifiers before public search."""
+    output, count = redact_sensitive_text(text)
+    for pattern, replacement in PUBLIC_QUERY_PATTERNS:
+        output, replacements = pattern.subn(replacement, output)
+        count += replacements
+    return output, count
+
+
+def redact_url_credentials(value: str) -> tuple[str, int]:
+    """Return an HTTP(S) URL with credential-like query values removed."""
+    raw = str(value or "").strip()
+    try:
+        parsed = urlsplit(raw)
+    except ValueError:
+        return raw, 0
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+        return raw, 0
+    path, path_redactions = re.subn(
+        r"(?i)(;(?:asp\.net[_-]?)?"
+        r"(?:j?sessionid|phpsessid|phpsessionid|"
+        r"session(?:[_-]?(?:id|key|token))?|sid)=)"
+        r"[^;/]+",
+        r"\1[REDACTED]",
+        parsed.path,
+    )
+    redactions = path_redactions
+
+    def redact_parameter_assignment(match: re.Match[str]) -> str:
+        nonlocal redactions
+        item_value = match.group("value")
+        if (
+            _is_sensitive_url_query_key(match.group("key"))
+            and item_value
+            and item_value != "[REDACTED]"
+        ):
+            item_value = "[REDACTED]"
+            redactions += 1
+        return f"{match.group('prefix')}{match.group('key')}={item_value}"
+
+    query = _URL_PARAMETER_ASSIGNMENT_RE.sub(
+        redact_parameter_assignment,
+        parsed.query,
+    )
+    items = []
+    for key, item_value in parse_qsl(query, keep_blank_values=True):
+        if _is_sensitive_url_query_key(key) and item_value != "[REDACTED]":
+            item_value = "[REDACTED]"
+            redactions += 1
+        item_value = _URL_PARAMETER_ASSIGNMENT_RE.sub(
+            redact_parameter_assignment,
+            item_value,
+        )
+        items.append((key, item_value))
+    return (
+        urlunsplit(
+            (
+                parsed.scheme.lower(),
+                parsed.netloc,
+                path,
+                urlencode(items, doseq=True),
+                "",
+            )
+        ),
+        redactions,
+    )
+
+
+def redact_model_input_text(text: str) -> tuple[str, int]:
+    """Remove secrets and common private identifiers at the model boundary."""
+    output = text or ""
+    url_redactions = 0
+
+    def redact_embedded_url(match: re.Match[str]) -> str:
+        nonlocal url_redactions
+        redacted, count = redact_url_credentials(match.group(0))
+        url_redactions += count
+        return redacted
+
+    output = _HTTP_URL_IN_TEXT_RE.sub(redact_embedded_url, output)
+    output, text_redactions = redact_public_query_text(output)
+    output, inline_redactions = _MODEL_INLINE_SECRET_RE.subn(
+        r"\1[REDACTED]",
+        output,
+    )
+    return output, url_redactions + text_redactions + inline_redactions

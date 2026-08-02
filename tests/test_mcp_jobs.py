@@ -867,6 +867,38 @@ class MCPJobIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["error"], "forbidden")
         search.assert_not_awaited()
 
+    async def test_redis_github_research_queues_client_policy_without_credentials(self):
+        server = load_mcp_server(auth_token="top-secret")
+        token = types.SimpleNamespace(
+            client_id="client-a",
+            scopes=["research", "github:read"],
+            claims={
+                "scopes": ["research", "github:read"],
+                "namespaces": ["*"],
+                "github_repositories": ["owner/allowed"],
+                "access_token": "must-not-be-queued",
+            },
+        )
+        queued = AsyncMock(return_value={"status": "complete"})
+        with patch.object(server, "_current_access_token", return_value=token), patch.object(
+            server, "_enqueue_and_wait", queued
+        ):
+            result = await server.github_research(
+                "inspect",
+                repository="owner/allowed",
+                max_results=1000,
+            )
+
+        self.assertEqual(result["status"], "complete")
+        kind, payload, tool_name = queued.await_args.args
+        self.assertEqual((kind, tool_name), ("github_research", "github_research"))
+        self.assertEqual(
+            payload["_github_access_policy"],
+            {"allowed": True, "repositories": ["owner/allowed"]},
+        )
+        self.assertNotIn("access_token", str(payload))
+        self.assertEqual(payload["max_results"], 1000)
+
     async def test_unknown_github_action_is_validated_before_authorization(self):
         server = load_mcp_server(auth_token="top-secret")
         with patch.object(server, "_authorization_failure") as authorize:
