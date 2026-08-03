@@ -13,7 +13,6 @@ use_default_settings:
       - qwant images
       - wikicommons.images
       # Current events.
-      - bing news
       - mojeek news
       - qwant news
       - reuters

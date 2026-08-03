@@ -37,6 +37,7 @@ _INTERNAL_ATTEMPT_ORDER_NS = "_research_job_attempt_order_ns"
 _INTERNAL_JOB_ID = "_research_job_id"
 _INTERNAL_SEARCH_CACHE_SCOPE = "_research_search_cache_scope"
 _INTERNAL_GITHUB_ACCESS_POLICY = "_github_access_policy"
+_INTERNAL_ASSISTANT_TIME_BUDGET = "_research_assistant_time_budget_seconds"
 _MAX_QDRANT_ORDER = 2**63 - 1
 _INGESTING_JOB_KINDS = {
     "investigate_url",
@@ -162,6 +163,37 @@ def _optional_int(payload: Mapping[str, Any], key: str, default: int) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(f"{key} must be an integer")
     return value
+
+
+def _optional_float(
+    payload: Mapping[str, Any],
+    key: str,
+    default: Optional[float] = None,
+) -> Optional[float]:
+    value = payload.get(key, default)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{key} must be a number")
+    value = float(value)
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{key} must be a positive finite number")
+    return value
+
+
+def _queued_seconds(job: Mapping[str, Any]) -> float:
+    # Requeues refresh enqueued_at. created_at retains the original gateway
+    # admission time, which is the start of the interactive response budget.
+    value = str(job.get("created_at") or job.get("enqueued_at") or "").strip()
+    if not value:
+        return 0.0
+    try:
+        enqueued_at = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if enqueued_at.tzinfo is None:
+            enqueued_at = enqueued_at.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return 0.0
+    return max(0.0, (datetime.now(timezone.utc) - enqueued_at).total_seconds())
 
 
 def _optional_string(
@@ -290,6 +322,10 @@ async def dispatch_job(kind: str, payload: Mapping[str, Any]) -> Any:
                 _INTERNAL_SEARCH_CACHE_SCOPE,
             ),
             github_access_policy=_github_access_policy(payload),
+            time_budget_seconds=_optional_float(
+                payload,
+                _INTERNAL_ASSISTANT_TIME_BUDGET,
+            ),
         )
 
     if kind == "github_research":
@@ -1104,11 +1140,37 @@ class JobWorker:
         payload.pop("ingestion_order_ns", None)
         payload.pop(_INTERNAL_JOB_ID, None)
         payload.pop(_INTERNAL_SEARCH_CACHE_SCOPE, None)
+        gateway_budget = _optional_float(
+            payload,
+            _INTERNAL_ASSISTANT_TIME_BUDGET,
+        )
+        payload.pop(_INTERNAL_ASSISTANT_TIME_BUDGET, None)
         payload[_INTERNAL_JOB_ID] = job_id
         payload[_INTERNAL_ATTEMPT_ID] = ingestion_attempt_id
         payload[_INTERNAL_ATTEMPT_ORDER_NS] = ingestion_order_ns
         if kind in {"research_web", "research_assistant", "investigate_url"}:
             payload["research_run_id"] = job_id
+        if kind == "research_assistant" and payload.get("mode") != "deep":
+            configured_budget = _env_float(
+                "RESEARCH_ASSISTANT_INTERACTIVE_TIMEOUT_SECONDS",
+                36.0,
+                minimum=1.0,
+            )
+            synchronous_wait = _env_float(
+                "RESEARCH_ASSISTANT_SYNC_WAIT_SECONDS",
+                45.0,
+                minimum=1.0,
+            )
+            configured_budget = min(
+                configured_budget,
+                max(1.0, synchronous_wait - 5.0),
+            )
+            if gateway_budget is not None:
+                configured_budget = min(configured_budget, gateway_budget)
+            payload[_INTERNAL_ASSISTANT_TIME_BUDGET] = max(
+                1.0,
+                configured_budget - _queued_seconds(job),
+            )
         may_have_ingested = _job_may_ingest(kind, payload)
         owner_id = str(job.get("owner_id") or "").strip()
         scope_identity = f"owner\x00{owner_id}" if owner_id else "anonymous"

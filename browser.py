@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 import httpx
 from playwright.async_api import async_playwright
 
-from crawler import BROWSER_HEADERS, validate_url_safety
+from crawler import BROWSER_HEADERS, validate_proxy_url_safety
 from extractors import extract_table_like_rows, html_to_text, parse_maybe_json_text, unique_preserve_order
 from redaction import redact_sensitive_text
 
@@ -741,7 +741,7 @@ async def _playwright_explore_page_inner(
     profile: str = "targeted",
     timeout_ms: int = 60000,
 ) -> dict:
-    await validate_url_safety(url)
+    await validate_proxy_url_safety(url)
 
     labels = unique_preserve_order(str(label)[:120] for label in (labels or [])[:50])
     task = str(task or "")[:4000]
@@ -821,7 +821,7 @@ async def _playwright_explore_page_inner(
                 return
 
             try:
-                await asyncio.wait_for(validate_url_safety(request_url), timeout=5.0)
+                await asyncio.wait_for(validate_proxy_url_safety(request_url), timeout=5.0)
             except Exception as exc:
                 message = (
                     f"Blocked unsafe browser request to {safe_diagnostic_url(request_url)}: "
@@ -975,7 +975,7 @@ async def _playwright_explore_page_inner(
 
             title = await page.title()
             final_url = page.url
-            await validate_url_safety(final_url)
+            await validate_proxy_url_safety(final_url)
 
             try:
                 initial_text = await page.evaluate(
@@ -1014,7 +1014,7 @@ async def _playwright_explore_page_inner(
                 if result.get("url"):
                     final_url = result["url"]
                 if result.get("navigation_changed"):
-                    await validate_url_safety(final_url)
+                    await validate_proxy_url_safety(final_url)
                     raise RuntimeError("Automated reveal action changed page navigation; stopped exploration")
                 append_dom_text(result.get("text"))
 
@@ -1048,7 +1048,7 @@ async def _playwright_explore_page_inner(
                 pass
 
             final_url = page.url
-            await validate_url_safety(final_url)
+            await validate_proxy_url_safety(final_url)
 
             if capture_tasks:
                 done, pending = await asyncio.wait(capture_tasks, timeout=5)

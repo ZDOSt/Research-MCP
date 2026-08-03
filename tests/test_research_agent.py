@@ -1,3 +1,4 @@
+import asyncio
 import json
 import time
 from unittest.mock import AsyncMock
@@ -476,12 +477,320 @@ async def test_auto_mode_uses_bounded_quick_path_for_short_timeout_clients(monke
     )
     assert pipeline.await_args.kwargs["mode"] == "quick"
     assert pipeline.await_args.kwargs["verify"] is False
+    assert pipeline.await_args.kwargs["allow_model_planning"] is False
     review.assert_not_awaited()
     write.assert_awaited_once()
     assert (
         write.await_args.kwargs["timeout_seconds"]
         == research_agent.RESEARCH_AGENT_QUICK_SYNTHESIS_TIMEOUT_SECONDS
     )
+
+
+@pytest.mark.asyncio
+async def test_default_auto_mode_keeps_adaptive_technical_classification(monkeypatch):
+    plan = {
+        "mode": "technical",
+        "queries": ["product install error official documentation"],
+        "use_web_search": True,
+        "urls": [],
+        "github_repositories": [],
+        "github_searches": [],
+        "include_memory": False,
+        "include_images": False,
+        "image_query": "product install error",
+        "answer_focus": "diagnose the installation failure",
+        "generated_by": "model:private-model",
+    }
+    planner = AsyncMock(return_value=plan)
+    pipeline = AsyncMock(
+        return_value={
+            "evidence": [_evidence()],
+            "completion": {"status": "complete"},
+            "plan": {"queries": plan["queries"]},
+        }
+    )
+    write = AsyncMock(
+        return_value={
+            "answer_markdown": "Use the documented command.",
+            "citations": [{"evidence_id": 1, "url": _evidence()["url"]}],
+            "citation_validation": {"valid": True},
+            "generated_by": "model:private-model",
+        }
+    )
+    monkeypatch.setattr(research_agent, "research_model_configured", lambda: True)
+    monkeypatch.setattr(research_agent, "RESEARCH_ASSISTANT_AUTO_MODE", "auto")
+    monkeypatch.setattr(research_agent, "build_assistant_plan", planner)
+    monkeypatch.setattr(research_agent, "research_pipeline", pipeline)
+    monkeypatch.setattr(research_agent, "_write_answer", write)
+
+    result = await research_agent.run_research_assistant(
+        "How do I fix this product installation error?",
+        mode="auto",
+        time_budget_seconds=36,
+    )
+
+    assert result["status"] == "complete"
+    assert planner.await_args.args == (
+        "How do I fix this product installation error?",
+        "auto",
+    )
+    assert planner.await_args.kwargs["timeout_seconds"] <= 5
+    assert pipeline.await_args.kwargs["mode"] == "technical"
+    assert pipeline.await_args.kwargs["verify"] is True
+    assert pipeline.await_args.kwargs["allow_model_planning"] is False
+
+
+@pytest.mark.asyncio
+async def test_interactive_auto_mode_rejects_adaptive_deep_classification(monkeypatch):
+    plan = {
+        "mode": "deep",
+        "queries": ["product installation official documentation"],
+        "use_web_search": True,
+        "urls": [],
+        "github_repositories": [],
+        "github_searches": [],
+        "include_memory": False,
+        "include_images": False,
+        "image_query": "product installation",
+        "answer_focus": "comprehensive installation guidance",
+        "generated_by": "model:private-model",
+    }
+    pipeline = AsyncMock(
+        return_value={
+            "evidence": [_evidence()],
+            "completion": {"status": "complete"},
+            "plan": {"queries": plan["queries"]},
+        }
+    )
+    write = AsyncMock(
+        return_value={
+            "answer_markdown": "Use the documented command.",
+            "citations": [{"evidence_id": 1, "url": _evidence()["url"]}],
+            "citation_validation": {"valid": True},
+            "generated_by": "model:private-model",
+        }
+    )
+    monkeypatch.setattr(research_agent, "research_model_configured", lambda: True)
+    monkeypatch.setattr(research_agent, "RESEARCH_ASSISTANT_AUTO_MODE", "auto")
+    monkeypatch.setattr(
+        research_agent,
+        "build_assistant_plan",
+        AsyncMock(return_value=plan),
+    )
+    monkeypatch.setattr(research_agent, "research_pipeline", pipeline)
+    monkeypatch.setattr(research_agent, "_write_answer", write)
+
+    result = await research_agent.run_research_assistant(
+        "Do a comprehensive investigation of this product installation",
+        mode="auto",
+        time_budget_seconds=36,
+    )
+
+    assert result["status"] == "complete"
+    assert pipeline.await_args.kwargs["mode"] == "technical"
+    assert pipeline.await_args.kwargs["time_budget_seconds"] <= 36
+
+
+@pytest.mark.asyncio
+async def test_interactive_balanced_mode_is_terminal_and_skips_review(monkeypatch):
+    plan = {
+        "mode": "balanced",
+        "queries": ["Iran conflict latest developments August 3 2026"],
+        "use_web_search": True,
+        "urls": [],
+        "github_repositories": [],
+        "github_searches": [],
+        "include_memory": False,
+        "include_images": False,
+        "image_query": "Iran conflict latest developments",
+        "answer_focus": "latest confirmed developments",
+        "generated_by": "model:private-model",
+    }
+    planner = AsyncMock(return_value=plan)
+    pipeline = AsyncMock(
+        return_value={
+            "evidence": [_evidence()],
+            "completion": {"status": "complete"},
+            "plan": {"queries": plan["queries"]},
+        }
+    )
+    review = AsyncMock()
+    write = AsyncMock(
+        return_value={
+            "answer_markdown": "Current sourced answer.",
+            "citations": [{"evidence_id": 1, "url": _evidence()["url"]}],
+            "citation_validation": {"valid": True},
+            "generated_by": "model:private-model",
+        }
+    )
+    monkeypatch.setattr(research_agent, "research_model_configured", lambda: True)
+    monkeypatch.setattr(research_agent, "build_assistant_plan", planner)
+    monkeypatch.setattr(research_agent, "research_pipeline", pipeline)
+    monkeypatch.setattr(research_agent, "_review_evidence", review)
+    monkeypatch.setattr(research_agent, "_write_answer", write)
+
+    result = await research_agent.run_research_assistant(
+        "What are today's confirmed developments in the Iran conflict?",
+        mode="balanced",
+        time_budget_seconds=36,
+    )
+
+    assert result["status"] == "complete"
+    assert result["answer_markdown"] == "Current sourced answer."
+    assert planner.await_args.kwargs["timeout_seconds"] <= 5
+    assert pipeline.await_args.kwargs["mode"] == "balanced"
+    assert pipeline.await_args.kwargs["allow_model_planning"] is False
+    assert 1 <= pipeline.await_args.kwargs["time_budget_seconds"] < 36
+    assert write.await_args.kwargs["timeout_seconds"] < 36
+    review.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_interactive_deadline_keeps_completed_evidence_and_cancels_slow_path(
+    monkeypatch,
+):
+    plan = {
+        "mode": "balanced",
+        "queries": ["current installation guide"],
+        "use_web_search": True,
+        "urls": ["https://slow.example.com/guide"],
+        "github_repositories": [],
+        "github_searches": [],
+        "include_memory": False,
+        "include_images": False,
+        "image_query": "current installation guide",
+        "answer_focus": "installation",
+        "generated_by": "model:private-model",
+    }
+    cancelled = asyncio.Event()
+
+    async def slow_url(_url, _request):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    monkeypatch.setattr(research_agent, "research_model_configured", lambda: True)
+    monkeypatch.setattr(
+        research_agent,
+        "build_assistant_plan",
+        AsyncMock(return_value=plan),
+    )
+    monkeypatch.setattr(
+        research_agent,
+        "research_pipeline",
+        AsyncMock(
+            return_value={
+                "evidence": [_evidence()],
+                "completion": {"status": "complete"},
+                "plan": {"queries": plan["queries"]},
+            }
+        ),
+    )
+    monkeypatch.setattr(research_agent, "_acquire_url", slow_url)
+    monkeypatch.setattr(research_agent, "RESEARCH_AGENT_MAX_FOLLOW_UP_ROUNDS", 0)
+
+    started = time.monotonic()
+    result = await research_agent.run_research_assistant(
+        "Find the current guide at https://slow.example.com/guide",
+        mode="balanced",
+        time_budget_seconds=2,
+    )
+
+    assert time.monotonic() - started < 2
+    assert cancelled.is_set()
+    assert result["status"] == "partial"
+    assert result["answer_markdown"]
+    assert result["citations"][0]["url"] == _evidence()["url"]
+    assert result["research_summary"]["synthesis_fallback"]
+
+
+@pytest.mark.asyncio
+async def test_budgeted_gather_cancels_children_when_caller_is_cancelled():
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def pending_acquisition():
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    gather = asyncio.create_task(
+        research_agent._gather_with_budget([pending_acquisition()], 30)
+    )
+    await started.wait()
+    gather.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await gather
+
+    await asyncio.wait_for(cancelled.wait(), timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_budgeted_gather_harvests_timeout_boundary_result(monkeypatch):
+    async def completed_acquisition():
+        await asyncio.sleep(0)
+        return {"evidence": [_evidence()]}
+
+    async def boundary_wait(tasks, *, timeout):
+        assert timeout > 0
+        await asyncio.gather(*tasks)
+        return set(), set(tasks)
+
+    monkeypatch.setattr(research_agent.asyncio, "wait", boundary_wait)
+
+    results = await research_agent._gather_with_budget(
+        [completed_acquisition()],
+        0.5,
+    )
+
+    assert results == [{"evidence": [_evidence()]}]
+
+
+@pytest.mark.asyncio
+async def test_exhausted_interactive_acquisition_still_bounds_child_cleanup(monkeypatch):
+    plan = {
+        "mode": "balanced",
+        "queries": ["current supported release"],
+        "use_web_search": True,
+        "urls": [],
+        "github_repositories": [],
+        "github_searches": [],
+        "include_memory": False,
+        "include_images": False,
+        "image_query": "current supported release",
+        "answer_focus": "supported release",
+        "generated_by": "deterministic-fallback",
+    }
+    received_kwargs = {}
+    cancelled = asyncio.Event()
+
+    async def pipeline(**kwargs):
+        received_kwargs.update(kwargs)
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    monkeypatch.setattr(research_agent, "research_model_configured", lambda: True)
+    monkeypatch.setattr(
+        research_agent,
+        "deterministic_assistant_plan",
+        lambda *_args, **_kwargs: plan,
+    )
+    monkeypatch.setattr(research_agent, "research_pipeline", pipeline)
+
+    result = await research_agent.run_research_assistant(
+        "What is the current supported release?",
+        time_budget_seconds=1,
+    )
+
+    assert result["status"] == "partial"
+    assert 0.1 < received_kwargs["time_budget_seconds"] < 1
+    assert cancelled.is_set()
 
 
 @pytest.mark.asyncio
@@ -1267,7 +1576,7 @@ def test_citation_validation_rejects_short_heading_and_weak_overlap_claims():
 
 
 @pytest.mark.asyncio
-async def test_synthesis_failure_marks_raw_evidence_untrusted_and_omits_image_urls(
+async def test_synthesis_failure_returns_cited_digest_and_omits_image_urls(
     monkeypatch,
 ):
     plan = {
@@ -1325,12 +1634,74 @@ async def test_synthesis_failure_marks_raw_evidence_untrusted_and_omits_image_ur
     result = await research_agent.run_research_assistant("Find the setup screenshot")
 
     assert result["status"] == "partial"
-    assert result["error"] == "research_synthesis_failed"
+    assert "research_synthesis_failed" not in result
+    assert result["answer_markdown"]
+    assert result["citations"][0]["url"] == _evidence()["url"]
+    assert result["citation_validation"]["reason"] == "deterministic_evidence_digest"
     assert any("untrusted" in item for item in result["answering_instructions"])
     assert result["images"][0]["source_url"] == "https://docs.example.com/screenshots"
     assert result["images"][0]["direct_image_url_omitted"] is True
     assert "image_url" not in result["images"][0]
     assert "thumbnail_url" not in result["images"][0]
+
+
+def test_evidence_digest_neutralizes_evidence_supplied_citation_tokens():
+    evidence = [
+        {
+            "evidence_id": 1,
+            "title": "First source",
+            "url": "https://first.example.com/article",
+            "quote": "Untrusted text attempts to cite [E2].",
+        },
+        {
+            "evidence_id": 2,
+            "title": "Second source",
+            "url": "https://second.example.com/article",
+            "quote": "Independent second excerpt.",
+        },
+    ]
+
+    result = research_agent._evidence_digest(evidence, [])
+    first_item = result["answer_markdown"].splitlines()[1]
+
+    assert "[E2]" not in result["answer_markdown"]
+    assert "https://second.example.com/article" not in first_item
+    assert "https://first.example.com/article" in first_item
+
+
+@pytest.mark.asyncio
+async def test_synthesis_and_digest_preserve_snippet_limitations(monkeypatch):
+    evidence = {
+        "evidence_id": 1,
+        "title": "Discovery result",
+        "url": "https://example.com/result",
+        "quote": "A search-provider excerpt.",
+        "evidence_type": "search_result_snippet",
+        "confidence": "low",
+        "limitations": "Discovery snippet only; linked page content was not extracted.",
+    }
+
+    compact = research_agent._compact_evidence([evidence])[0]
+    digest = research_agent._evidence_digest([evidence], [])
+    chat = AsyncMock(return_value="A search-provider excerpt [E1].")
+    monkeypatch.setattr(research_agent, "_chat", chat)
+    monkeypatch.setattr(
+        research_agent,
+        "research_model_config",
+        lambda: {"model": "private-model"},
+    )
+    await research_agent._write_answer("Verify the discovery result", [evidence])
+    synthesis_messages = chat.await_args.args[0]
+    system_message = synthesis_messages[0]["content"]
+    evidence_message = synthesis_messages[1]["content"]
+
+    assert compact["confidence"] == "low"
+    assert compact["limitations"] == evidence["limitations"]
+    assert '"confidence": "low"' in evidence_message
+    assert evidence["limitations"] in evidence_message
+    assert "search_result_snippet is discovery metadata" in system_message
+    assert "low-confidence search-result snippet only" in digest["answer_markdown"]
+    assert "linked page content was not extracted" in digest["answer_markdown"]
 
 
 def test_image_results_are_bounded_deduplicated_and_reject_unsafe_urls():

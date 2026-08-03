@@ -32,6 +32,7 @@ RUN mkdir -p /home/appuser/.cache/ms-playwright \
     && cp -r /root/.cache/ms-playwright/chromium_headless_shell-* /home/appuser/.cache/ms-playwright/ \
     && chown -R appuser:appuser /home/appuser/.cache/ms-playwright
 COPY --chown=0:0 --chmod=0444 socks5_client.py /app/socks5_client.py
+COPY --chown=0:0 --chmod=0444 egress_policy.py /app/egress_policy.py
 COPY --chown=0:0 --chmod=0444 crawl4ai_egress_proxy.py /app/egress_proxy.py
 USER appuser
 

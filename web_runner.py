@@ -29,7 +29,7 @@ from crawler import (
     CRAWL4AI_TOTAL_TIMEOUT_SECONDS,
     UnsafeURLError,
     _read_limited_response,
-    validate_url_safety,
+    validate_proxy_url_safety,
 )
 from redaction import redact_sensitive_text
 
@@ -209,7 +209,7 @@ def _crawl_urls(payload: dict[str, Any]) -> list[str]:
 async def prepare_crawl_payload(payload: dict[str, Any]) -> dict[str, Any]:
     urls = _crawl_urls(payload)
     for url in urls:
-        await validate_url_safety(url)
+        await validate_proxy_url_safety(url)
 
     forwarded_payload = dict(payload)
     browser_config = forwarded_payload.get("browser_config")

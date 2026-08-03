@@ -176,11 +176,13 @@ async def test_unified_tool_discovery_promotes_one_completed_research_call():
 
     instructions = mcp_server.mcp.instructions
     assert "Use research_assistant once" in instructions
-    assert "citation-coverage-checked answer" in instructions
+    assert "citation-checked answer" in instructions
+    assert "interactive deadline" in instructions
     assert "MCP cannot force a client model to call tools" in instructions
 
     description = tools["research_assistant"].description
     assert "Complete a research request in one high-level call" in description
     assert "user's complete" in description
-    assert "one bounded evidence-gap" in description
+    assert "server-owned interactive deadline" in description
+    assert "cited partial evidence" in description
     assert "Present answer_markdown directly" in description

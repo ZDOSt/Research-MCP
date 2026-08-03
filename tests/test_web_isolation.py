@@ -231,7 +231,7 @@ class RunnerBoundaryTests(unittest.IsolatedAsyncioTestCase):
             },
         }
         with patch(
-            "web_runner.validate_url_safety",
+            "web_runner.validate_proxy_url_safety",
             new=AsyncMock(return_value="https://example.com"),
         ):
             forwarded = await web_runner.prepare_crawl_payload(payload)
@@ -246,6 +246,14 @@ class RunnerBoundaryTests(unittest.IsolatedAsyncioTestCase):
             payload["crawler_config"]["proxy_config"],
             {"server": "http://attacker.invalid"},
         )
+
+    async def test_runner_prevalidates_public_urls_without_local_dns(self):
+        with patch("socket.getaddrinfo", side_effect=AssertionError("unexpected local DNS")):
+            forwarded = await web_runner.prepare_crawl_payload(
+                {"urls": ["https://docs.example.com/install"]}
+            )
+
+        self.assertEqual(forwarded["urls"], ["https://docs.example.com/install"])
 
     def test_runner_sends_dedicated_crawl4ai_bearer_token(self):
         with patch.object(web_runner, "WEB_RUNNER_CRAWL4AI_API_TOKEN", "crawler-secret"):
@@ -687,7 +695,6 @@ class ComposeIsolationTests(unittest.TestCase):
                 "bing images",
                 "qwant images",
                 "wikicommons.images",
-                "bing news",
                 "mojeek news",
                 "qwant news",
                 "reuters",
@@ -791,6 +798,18 @@ class ComposeIsolationTests(unittest.TestCase):
             "${RESEARCH_ASSISTANT_SYNC_WAIT_SECONDS:-45}",
         )
         self.assertEqual(
+            gateway_environment["RESEARCH_ASSISTANT_INTERACTIVE_TIMEOUT_SECONDS"],
+            "${RESEARCH_ASSISTANT_INTERACTIVE_TIMEOUT_SECONDS:-36}",
+        )
+        self.assertEqual(
+            worker_environment["RESEARCH_ASSISTANT_INTERACTIVE_TIMEOUT_SECONDS"],
+            "${RESEARCH_ASSISTANT_INTERACTIVE_TIMEOUT_SECONDS:-36}",
+        )
+        self.assertEqual(
+            worker_environment["RESEARCH_ASSISTANT_SYNC_WAIT_SECONDS"],
+            "${RESEARCH_ASSISTANT_SYNC_WAIT_SECONDS:-45}",
+        )
+        self.assertEqual(
             gateway_environment["MCP_CLIENT_TIMEOUT_SECONDS"],
             "${MCP_CLIENT_TIMEOUT_SECONDS:-60}",
         )
@@ -800,7 +819,7 @@ class ComposeIsolationTests(unittest.TestCase):
         )
         self.assertEqual(
             worker_environment["RESEARCH_ASSISTANT_AUTO_MODE"],
-            "${RESEARCH_ASSISTANT_AUTO_MODE:-quick}",
+            "${RESEARCH_ASSISTANT_AUTO_MODE:-auto}",
         )
         self.assertEqual(
             gateway_environment["RESEARCH_ADMISSION_MAX_ACTIVE"],
@@ -912,6 +931,14 @@ class ComposeIsolationTests(unittest.TestCase):
         )
         self.assertEqual(service["environment"]["CRAWL4AI_EGRESS_SOCKS_PORT"], "1080")
         self.assertEqual(
+            service["environment"]["SAFE_EGRESS_ALLOWED_PORTS"],
+            "${SAFE_EGRESS_ALLOWED_PORTS:-80,443,8080,8443}",
+        )
+        self.assertEqual(
+            service["environment"]["SAFE_EGRESS_DENY_CIDRS"],
+            "${SAFE_EGRESS_DENY_CIDRS:-}",
+        )
+        self.assertEqual(
             service["depends_on"]["safe-egress"]["condition"],
             "service_healthy",
         )
@@ -960,6 +987,7 @@ class ComposeIsolationTests(unittest.TestCase):
         self.assertLess(run_index, copy_index)
         self.assertLess(copy_index, appuser_index)
         self.assertIn("crawl4ai_egress_proxy.py /app/egress_proxy.py", stage)
+        self.assertIn("egress_policy.py /app/egress_policy.py", stage)
         self.assertIn("socks5_client.py /app/socks5_client.py", stage)
 
     def test_worker_receives_only_the_credentials_needed_for_unified_research(self):

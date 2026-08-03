@@ -16,11 +16,10 @@ import httpx
 from egress_policy import (
     DEFAULT_ALLOWED_PORTS,
     DestinationPolicyError,
-    normalize_destination_host,
     parse_allowed_ports,
     parse_denied_networks,
     resolve_public_addresses,
-    validate_destination_port,
+    validate_http_url_without_dns,
     validate_public_address,
 )
 from extractors import extract_title_from_html, html_to_text, parse_maybe_json_text
@@ -38,7 +37,6 @@ BROWSER_HEADERS = {
     "Pragma": "no-cache",
 }
 
-ALLOWED_URL_SCHEMES = {"http", "https"}
 REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
 MAX_REDIRECTS = 10
 SAFE_EGRESS_ALLOWED_PORTS = parse_allowed_ports(
@@ -247,27 +245,11 @@ def _safe_error_detail(exc: Exception, max_chars: int = 1000) -> str:
 
 
 def _normalized_url_host(url: str) -> tuple[str, int]:
-    if not isinstance(url, str) or not url.strip():
-        raise UnsafeURLError("URL must be a non-empty string")
-
-    try:
-        parsed = urlsplit(url.strip())
-        port = parsed.port
-    except ValueError as exc:
-        raise UnsafeURLError(f"Invalid URL: {_safe_error_detail(exc)}") from exc
-
-    scheme = parsed.scheme.lower()
-    if scheme not in ALLOWED_URL_SCHEMES:
-        raise UnsafeURLError("Only http and https URLs are allowed")
-    if not parsed.hostname:
-        raise UnsafeURLError("URL must include a hostname")
-    if parsed.username is not None or parsed.password is not None:
-        raise UnsafeURLError("URLs containing credentials are not allowed")
-
-    host = normalize_destination_host(parsed.hostname, SAFE_EGRESS_DENY_NETWORKS)
-    destination_port = port if port is not None else (443 if scheme == "https" else 80)
-    validate_destination_port(destination_port, SAFE_EGRESS_ALLOWED_PORTS)
-    return host, destination_port
+    return validate_http_url_without_dns(
+        url,
+        allowed_ports=SAFE_EGRESS_ALLOWED_PORTS,
+        denied_networks=SAFE_EGRESS_DENY_NETWORKS,
+    )
 
 
 def _validate_public_ip(address: str) -> None:
@@ -315,6 +297,12 @@ async def _resolve_public_addresses(url: str) -> tuple[str, int, tuple[str, ...]
 async def validate_url_safety(url: str) -> str:
     """Validate scheme, hostname, and every resolved address for an outbound URL."""
     await _resolve_public_addresses(url)
+    return url
+
+
+async def validate_proxy_url_safety(url: str) -> str:
+    """Prevalidate a URL whose DNS and connection are enforced by safe-egress."""
+    _normalized_url_host(url)
     return url
 
 

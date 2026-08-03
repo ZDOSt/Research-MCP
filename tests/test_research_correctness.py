@@ -722,7 +722,9 @@ async def test_default_modes_do_not_ingest_low_confidence_direct_content(
     async def fake_plan(query, selected_mode):
         return {"query": query, "mode": selected_mode, "queries": [query]}
 
-    async def fake_search(query, max_results, mode, policy=None):
+    async def fake_search(
+        query, max_results, mode, policy=None, time_budget_seconds=None
+    ):
         return [
             {
                 "title": "Challenge page",

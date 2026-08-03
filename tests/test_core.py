@@ -1263,7 +1263,9 @@ async def test_research_pipeline_retries_compact_query_after_zero_results(monkey
     async def fake_plan(query, mode):
         return {"query": query, "mode": mode, "queries": ["verbose instruction query"]}
 
-    async def fake_search(query, max_results, mode, policy=None):
+    async def fake_search(
+        query, max_results, mode, policy=None, time_budget_seconds=None
+    ):
         calls.append(query)
         if query == "verbose instruction query":
             return []
@@ -1332,7 +1334,9 @@ async def test_research_pipeline_does_not_recover_from_a_search_backend_error(
     async def fake_plan(query, mode):
         return {"query": query, "mode": mode, "queries": ["initial query"]}
 
-    async def fake_search(query, max_results, mode, policy=None):
+    async def fake_search(
+        query, max_results, mode, policy=None, time_budget_seconds=None
+    ):
         calls.append(query)
         raise RuntimeError("search unavailable")
 
@@ -1359,7 +1363,9 @@ async def test_research_pipeline_attempts_one_recovery_for_invalid_raw_results(
     async def fake_plan(query, mode):
         return {"query": query, "mode": mode, "queries": ["initial query"]}
 
-    async def fake_search(query, max_results, mode, policy=None):
+    async def fake_search(
+        query, max_results, mode, policy=None, time_budget_seconds=None
+    ):
         calls.append(query)
         return [{"url": ""}]
 
@@ -1751,6 +1757,31 @@ async def test_empty_configured_planner_output_remains_deterministic(monkeypatch
     plan = await planner.build_research_plan("How do I install Docker?", "balanced")
 
     assert plan["generated_by"] == "deterministic"
+
+
+@pytest.mark.asyncio
+async def test_preplanned_queries_skip_redundant_model_planning(monkeypatch):
+    planner = pytest.importorskip("planner")
+    planner_chat = AsyncMock(return_value='{"queries": ["unused"]}')
+    monkeypatch.setattr(planner, "PLANNER_BASE_URL", "https://planner.example")
+    monkeypatch.setattr(planner, "PLANNER_MODEL", "private-planner")
+    monkeypatch.setattr(planner, "_chat", planner_chat)
+
+    request = "How do I install Docker on Ubuntu 24.04?"
+    deterministic = planner.deterministic_plan(request, "balanced")
+    plan = await planner.build_research_plan(
+        request,
+        "balanced",
+        proposed_queries=[deterministic["queries"][0]],
+        allow_model_planning=False,
+    )
+
+    assert plan["queries"] == deterministic["queries"]
+    assert plan["generated_by"] == "deterministic"
+    assert plan["proposed_query_handling"]["rejected"][0]["reason"] == (
+        "duplicate_query"
+    )
+    planner_chat.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -2761,7 +2792,9 @@ async def test_research_pipeline_deduplicates_queries_and_scopes_retrieval(monke
     async def fake_plan(query, mode):
         return {"query": query, "mode": mode, "queries": [query, f"{query} docs"]}
 
-    async def fake_search(query, max_results, mode, policy=None):
+    async def fake_search(
+        query, max_results, mode, policy=None, time_budget_seconds=None
+    ):
         return [
             {
                 "title": "Official docs",

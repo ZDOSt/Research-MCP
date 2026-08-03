@@ -12,6 +12,7 @@ import worker
 from worker import (
     _INTERNAL_ATTEMPT_ID,
     _INTERNAL_ATTEMPT_ORDER_NS,
+    _INTERNAL_ASSISTANT_TIME_BUDGET,
     _INTERNAL_JOB_ID,
     _INTERNAL_SEARCH_CACHE_SCOPE,
     _claimed_attempt_context,
@@ -412,7 +413,76 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
                 "allowed": True,
                 "repositories": ["example/project"],
             },
+            time_budget_seconds=None,
         )
+
+    async def test_interactive_assistant_budget_accounts_for_queue_age(self):
+        job_id = uuid.uuid4().hex
+        store = FakeWorkerStore(
+            {
+                "job_id": job_id,
+                "kind": "research_assistant",
+                "payload": {
+                    "request": "Find the current installation guide",
+                    "mode": "balanced",
+                    _INTERNAL_ASSISTANT_TIME_BUDGET: 20,
+                },
+            }
+        )
+        dispatched_payload = None
+
+        async def dispatch(_kind, payload):
+            nonlocal dispatched_payload
+            dispatched_payload = payload
+            return {"status": "complete", "answer_markdown": "answer"}
+
+        job_worker = JobWorker(
+            store=store,
+            artifacts=self.artifacts,
+            dispatcher=dispatch,
+            worker_id="test-worker",
+            poll_interval=0.01,
+        )
+        with patch.dict(
+            os.environ,
+            {
+                "RESEARCH_ASSISTANT_INTERACTIVE_TIMEOUT_SECONDS": "36",
+                "RESEARCH_ASSISTANT_SYNC_WAIT_SECONDS": "45",
+            },
+        ), patch.object(worker, "_queued_seconds", return_value=11.5):
+            self.assertTrue(await job_worker.run_once(timeout=0.01))
+
+        self.assertAlmostEqual(
+            dispatched_payload[_INTERNAL_ASSISTANT_TIME_BUDGET],
+            8.5,
+        )
+
+    async def test_deep_assistant_does_not_receive_interactive_budget(self):
+        job_id = uuid.uuid4().hex
+        store = FakeWorkerStore(
+            {
+                "job_id": job_id,
+                "kind": "research_assistant",
+                "payload": {"request": "Run deep research", "mode": "deep"},
+            }
+        )
+        dispatched_payload = None
+
+        async def dispatch(_kind, payload):
+            nonlocal dispatched_payload
+            dispatched_payload = payload
+            return {"status": "complete", "answer_markdown": "answer"}
+
+        job_worker = JobWorker(
+            store=store,
+            artifacts=self.artifacts,
+            dispatcher=dispatch,
+            worker_id="test-worker",
+            poll_interval=0.01,
+        )
+        self.assertTrue(await job_worker.run_once(timeout=0.01))
+
+        self.assertNotIn(_INTERNAL_ASSISTANT_TIME_BUDGET, dispatched_payload)
 
     async def test_dispatch_runs_authorized_github_work_and_marks_it_untrusted(self):
         with patch.dict(os.environ, {"GITHUB_TOKEN": ""}, clear=False), patch(

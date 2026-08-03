@@ -882,3 +882,241 @@ async def test_generic_only_overlap_does_not_stop_later_engine_stage(monkeypatch
     assert stages[0]["topical_relevance"]["relevant_count"] == 0
     assert stages[1]["coverage_sufficient"] is True
     assert stages[1]["topical_relevance"]["relevant_count"] >= 3
+
+
+@pytest.mark.asyncio
+async def test_staged_search_returns_completed_wave_when_later_stage_hits_deadline(
+    monkeypatch,
+):
+    calls = 0
+
+    async def stage_request(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return {
+                "results": [
+                    {
+                        "title": "Official installation guide",
+                        "url": "https://docs.example.com/install",
+                        "content": "Current product installation steps and requirements.",
+                    }
+                ]
+            }
+        await asyncio.Event().wait()
+
+    async def eligible(engines):
+        return list(engines), []
+
+    async def circuit_update(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(
+        searching,
+        "_engine_stages",
+        lambda _policy, _mode: (("bing",), ("mojeek",)),
+    )
+    monkeypatch.setattr(searching, "_eligible_engines", eligible)
+    monkeypatch.setattr(searching, "_searxng_stage_request", stage_request)
+    monkeypatch.setattr(searching, "_record_engine_success", circuit_update)
+    monkeypatch.setattr(searching, "_record_engine_failure", circuit_update)
+    policy = searching.infer_search_policy(
+        "official product installation guide",
+        "quick",
+    )
+
+    started = time.monotonic()
+    results = await searching._staged_searxng_search(
+        "official product installation guide",
+        outbound_query="official product installation guide",
+        max_results=2,
+        mode="quick",
+        policy=policy,
+        base_url="http://searxng:8080",
+        deadline=time.monotonic() + 0.2,
+    )
+
+    assert time.monotonic() - started < 0.6
+    assert [item["url"] for item in results] == [
+        "https://docs.example.com/install"
+    ]
+    assert results.diagnostics["deadline_exhausted"] is True
+    assert results.diagnostics["acquisition_status"] == "partial"
+    assert results.diagnostics["search_stages"][-1]["status"] == "deadline_exhausted"
+
+
+@pytest.mark.asyncio
+async def test_completed_results_survive_health_bookkeeping_deadline(monkeypatch):
+    async def stage_request(*_args, **_kwargs):
+        return {
+            "results": [
+                {
+                    "title": "Official installation guide",
+                    "url": "https://docs.example.com/install",
+                    "content": "Current product installation steps and requirements.",
+                }
+            ]
+        }
+
+    async def stalled_health_update(*_args, **_kwargs):
+        await asyncio.Event().wait()
+
+    async def eligible(engines):
+        return list(engines), []
+
+    monkeypatch.setattr(
+        searching,
+        "_engine_stages",
+        lambda _policy, _mode: (("bing",),),
+    )
+    monkeypatch.setattr(searching, "_eligible_engines", eligible)
+    monkeypatch.setattr(searching, "_searxng_stage_request", stage_request)
+    monkeypatch.setattr(
+        searching,
+        "_record_engine_success",
+        stalled_health_update,
+    )
+    policy = searching.infer_search_policy(
+        "official product installation guide",
+        "quick",
+    )
+
+    results = await searching._staged_searxng_search(
+        "official product installation guide",
+        outbound_query="official product installation guide",
+        max_results=4,
+        mode="quick",
+        policy=policy,
+        base_url="http://searxng:8080",
+        deadline=time.monotonic() + 0.2,
+    )
+
+    assert [item["url"] for item in results] == [
+        "https://docs.example.com/install"
+    ]
+    assert results.diagnostics["deadline_exhausted"] is True
+    assert results.diagnostics["acquisition_status"] == "partial"
+
+
+def test_quick_search_budget_exceeds_one_searxng_engine_timeout():
+    assert searching.RESEARCH_MODE_CONFIG["quick"]["search_budget"] > 6
+
+
+@pytest.mark.asyncio
+async def test_slow_cache_reads_do_not_consume_the_search_deadline(monkeypatch):
+    cache_reads = 0
+
+    async def slow_cache_get(_key):
+        nonlocal cache_reads
+        cache_reads += 1
+        await asyncio.Event().wait()
+
+    async def staged(*_args, **_kwargs):
+        return searching.SearchResults(
+            [
+                {
+                    "title": "Official installation guide",
+                    "url": "https://docs.example.com/install",
+                    "snippet": "Current supported installation procedure.",
+                }
+            ],
+            diagnostics={"acquisition_status": "succeeded"},
+        )
+
+    monkeypatch.setattr(searching, "_cache_get", slow_cache_get)
+    monkeypatch.setattr(searching, "_staged_searxng_search", staged)
+    monkeypatch.setattr(searching, "_cacheable_results", lambda *_args: False)
+
+    started = time.monotonic()
+    results = await searching.searxng_search(
+        "official installation guide",
+        max_results=1,
+        time_budget_seconds=0.25,
+    )
+
+    assert time.monotonic() - started < 0.2
+    assert cache_reads == 2
+    assert results[0]["url"] == "https://docs.example.com/install"
+
+
+@pytest.mark.asyncio
+async def test_slow_cache_write_cannot_erase_acquired_results(monkeypatch):
+    async def no_cache(_key):
+        return None
+
+    async def staged(*_args, **_kwargs):
+        return searching.SearchResults(
+            [
+                {
+                    "title": "Current release notes",
+                    "url": "https://vendor.example.com/releases",
+                    "snippet": "Current supported release details.",
+                }
+            ],
+            diagnostics={"acquisition_status": "succeeded"},
+        )
+
+    async def slow_cache_set(_key, _results):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(searching, "_cache_get", no_cache)
+    monkeypatch.setattr(searching, "_staged_searxng_search", staged)
+    monkeypatch.setattr(searching, "_cacheable_results", lambda *_args: True)
+    monkeypatch.setattr(searching, "_cache_set", slow_cache_set)
+
+    started = time.monotonic()
+    results = await searching.searxng_search(
+        "current release notes",
+        max_results=1,
+        time_budget_seconds=0.15,
+    )
+
+    assert time.monotonic() - started < 0.4
+    assert results[0]["url"] == "https://vendor.example.com/releases"
+    assert results.diagnostics["cache"]["status"] == "miss"
+
+
+@pytest.mark.asyncio
+async def test_later_eligibility_timeout_preserves_completed_engine_wave(monkeypatch):
+    eligibility_calls = 0
+
+    async def eligible(engines):
+        nonlocal eligibility_calls
+        eligibility_calls += 1
+        if eligibility_calls >= 5:
+            await asyncio.Event().wait()
+        return list(engines), []
+
+    async def stage_request(*_args, **_kwargs):
+        return {
+            "results": [
+                {
+                    "title": "Official setup guide",
+                    "url": "https://docs.example.com/setup",
+                    "content": "Current installation requirements and setup steps.",
+                }
+            ]
+        }
+
+    async def circuit_update(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(
+        searching,
+        "_engine_stages",
+        lambda _policy, _mode: (("bing",), ("mojeek",)),
+    )
+    monkeypatch.setattr(searching, "_eligible_engines", eligible)
+    monkeypatch.setattr(searching, "_searxng_stage_request", stage_request)
+    monkeypatch.setattr(searching, "_record_engine_success", circuit_update)
+    monkeypatch.setattr(searching, "_record_engine_failure", circuit_update)
+
+    results = await searching.searxng_search(
+        "official setup guide",
+        max_results=2,
+        time_budget_seconds=0.2,
+    )
+
+    assert [item["url"] for item in results] == ["https://docs.example.com/setup"]
+    assert results.diagnostics["deadline_exhausted"] is True
+    assert results.diagnostics["acquisition_status"] == "partial"

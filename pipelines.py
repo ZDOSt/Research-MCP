@@ -649,14 +649,21 @@ async def _run_search_batch_bounded(
         return [TimeoutError("research search budget exhausted") for _ in queries]
 
     semaphore = asyncio.Semaphore(SEARCH_QUERY_CONCURRENCY)
+    search_deadline = time.monotonic() + timeout_seconds
 
     async def run_search(query: str, policy: object) -> object:
         async with semaphore:
+            remaining = search_deadline - time.monotonic()
+            if remaining <= 0.15:
+                raise TimeoutError("research search budget exhausted")
             search_kwargs = {
                 "query": query,
                 "max_results": max_results,
                 "mode": mode,
                 "policy": policy,
+                # Give staged search a short return margin so it can preserve
+                # completed engine waves before this batch cancels stragglers.
+                "time_budget_seconds": remaining - 0.15,
             }
             if cache_scope:
                 search_kwargs["cache_scope"] = cache_scope
@@ -677,9 +684,11 @@ async def _run_search_batch_bounded(
     outcomes: list[object] = [
         TimeoutError("research search budget exhausted") for _ in queries
     ]
-    try:
-        done, _ = await asyncio.wait(tasks, timeout=max(0.0, timeout_seconds))
-        for task in done:
+    harvested: set[asyncio.Task] = set()
+
+    def harvest(completed: set[asyncio.Task]) -> None:
+        for task in completed - harvested:
+            harvested.add(task)
             index = task_indexes[task]
             try:
                 outcomes[index] = task.result()
@@ -687,9 +696,27 @@ async def _run_search_batch_bounded(
                 outcomes[index] = TimeoutError("research search was cancelled")
             except Exception as exc:
                 outcomes[index] = exc
+
+    try:
+        done, _ = await asyncio.wait(
+            tasks,
+            timeout=max(0.0, search_deadline - time.monotonic()),
+        )
+        # A task can finish after asyncio.wait takes its timeout snapshot but
+        # before control returns here. Re-harvest that boundary so a valid
+        # response is not reported as a timeout.
+        done.update(task for task in tasks if task.done())
+        harvest(done)
         return outcomes
     finally:
-        await _cancel_tasks_bounded(tasks, timeout_seconds=0.1)
+        harvest({task for task in tasks if task.done()})
+        await _cancel_tasks_bounded(
+            tasks,
+            timeout_seconds=min(
+                0.1,
+                max(0.0, search_deadline - time.monotonic()),
+            ),
+        )
 
 
 def _validated_query_roles(
@@ -2699,6 +2726,8 @@ async def _research_pipeline_impl(
     ingestion_order_ns: Optional[int] = None,
     search_cache_scope: Optional[str] = None,
     proposed_queries: Optional[List[str]] = None,
+    allow_model_planning: bool = True,
+    time_budget_seconds: Optional[float] = None,
 ) -> dict:
     start = time.monotonic()
     proposed_queries = normalize_proposed_queries(proposed_queries)
@@ -2711,17 +2740,34 @@ async def _research_pipeline_impl(
     total_budget_seconds = float(
         config.get("total_budget", max(1.0, crawl_budget_seconds + 30.0))
     )
+    bounded_by_caller = time_budget_seconds is not None
+    if time_budget_seconds is not None:
+        total_budget_seconds = min(
+            total_budget_seconds,
+            max(0.1, float(time_budget_seconds)),
+        )
+        crawl_budget_seconds = min(crawl_budget_seconds, total_budget_seconds)
     terminal_reserve_seconds = (
         min(
             2.0,
-            max(0.0, total_budget_seconds * 0.05),
+            max(
+                0.05 if bounded_by_caller else 0.0,
+                total_budget_seconds * 0.05,
+            ),
         )
-        if defer_persistence
+        if defer_persistence or bounded_by_caller
         else 0.0
     )
-    research_deadline = start + max(
-        1.0,
+    acquisition_budget_seconds = max(
+        0.0 if bounded_by_caller else 1.0,
         total_budget_seconds - terminal_reserve_seconds,
+    )
+    research_deadline = start + acquisition_budget_seconds
+    request_deadline = start + total_budget_seconds if bounded_by_caller else None
+    response_reserve_seconds = (
+        min(0.05, terminal_reserve_seconds / 2)
+        if request_deadline is not None
+        else 0.0
     )
     planner_budget_seconds = min(
         float(config.get("planner_budget", 5.0)),
@@ -2732,13 +2778,28 @@ async def _research_pipeline_impl(
             raise TimeoutError
         async with asyncio.timeout(planner_budget_seconds):
             if proposed_queries is None:
-                plan = await build_research_plan(query, mode)
+                if allow_model_planning:
+                    plan = await build_research_plan(query, mode)
+                else:
+                    plan = await build_research_plan(
+                        query,
+                        mode,
+                        allow_model_planning=False,
+                    )
             else:
-                plan = await build_research_plan(
-                    query,
-                    mode,
-                    proposed_queries=proposed_queries,
-                )
+                if allow_model_planning:
+                    plan = await build_research_plan(
+                        query,
+                        mode,
+                        proposed_queries=proposed_queries,
+                    )
+                else:
+                    plan = await build_research_plan(
+                        query,
+                        mode,
+                        proposed_queries=proposed_queries,
+                        allow_model_planning=False,
+                    )
     except TimeoutError:
         plan = deterministic_plan(query, mode)
         plan["planner_fallback"] = "interactive planner budget exhausted"
@@ -3599,17 +3660,21 @@ async def _research_pipeline_impl(
             2.0,
             max(0.0, research_deadline - time.monotonic()),
         )
-        if staging_budget > 0:
-            done, pending = await asyncio.wait(
-                staging_tasks,
-                timeout=staging_budget,
-            )
-        else:
-            done, pending = set(), set(staging_tasks)
-        done.update(task for task in staging_tasks if task.done())
-        pending = set(staging_tasks) - done
-        if pending:
-            await _cancel_tasks_bounded(list(pending), timeout_seconds=0)
+        try:
+            if staging_budget > 0:
+                done, pending = await asyncio.wait(
+                    staging_tasks,
+                    timeout=staging_budget,
+                )
+            else:
+                done, pending = set(), set(staging_tasks)
+            done.update(task for task in staging_tasks if task.done())
+            pending = set(staging_tasks) - done
+            if pending:
+                await _cancel_tasks_bounded(list(pending), timeout_seconds=0)
+        except asyncio.CancelledError:
+            await _cancel_tasks_bounded(staging_tasks, timeout_seconds=0)
+            raise
         staging_outcomes = []
         for task in staging_tasks:
             if task in pending:
@@ -3741,13 +3806,23 @@ async def _research_pipeline_impl(
 
         if persistence_timed_out:
             if ingestion_attempt_id:
+                invalidation_timeout = (
+                    max(
+                        0.0,
+                        request_deadline
+                        - time.monotonic()
+                        - response_reserve_seconds,
+                    )
+                    if request_deadline is not None
+                    else min(
+                        5.0,
+                        max(1.0, persistence_budget / 10),
+                    )
+                )
                 invalidation = await _invalidate_ingestion_attempt_bounded(
                     ingestion_attempt_id,
                     reason="research_persistence_timed_out",
-                    timeout_seconds=min(
-                        5.0,
-                        max(1.0, persistence_budget / 10),
-                    ),
+                    timeout_seconds=invalidation_timeout,
                 )
             else:
                 invalidation = {
@@ -3934,10 +4009,7 @@ async def _research_pipeline_impl(
         },
         "latency_budget": {
             "seconds": total_budget_seconds,
-            "acquisition_seconds": max(
-                1.0,
-                total_budget_seconds - terminal_reserve_seconds,
-            ),
+            "acquisition_seconds": acquisition_budget_seconds,
             "reserved_terminal_seconds": terminal_reserve_seconds,
             "exhausted": latency_exhausted,
             "policy": "return_best_available_evidence",
@@ -4099,8 +4171,25 @@ async def research_pipeline(
     ingestion_order_ns: Optional[int] = None,
     search_cache_scope: Optional[str] = None,
     proposed_queries: Optional[List[str]] = None,
+    allow_model_planning: bool = True,
+    time_budget_seconds: Optional[float] = None,
 ) -> dict:
     """Run research under one ingestion attempt that can be revoked on cancellation."""
+    cancellation_deadline = None
+    if time_budget_seconds is not None:
+        effective_mode = mode if mode in RESEARCH_MODE_CONFIG else "balanced"
+        effective_config = RESEARCH_MODE_CONFIG[effective_mode]
+        configured_crawl_budget = float(effective_config["crawl_budget"])
+        configured_total_budget = float(
+            effective_config.get(
+                "total_budget",
+                max(1.0, configured_crawl_budget + 30.0),
+            )
+        )
+        cancellation_deadline = time.monotonic() + min(
+            configured_total_budget,
+            max(0.1, float(time_budget_seconds)),
+        )
     effective_attempt_id = ingestion_attempt_id or uuid.uuid4().hex
     normalized_namespace = normalize_namespace(namespace)
     try:
@@ -4119,28 +4208,43 @@ async def research_pipeline(
             ingestion_order_ns=ingestion_order_ns,
             search_cache_scope=search_cache_scope,
             proposed_queries=proposed_queries,
+            allow_model_planning=allow_model_planning,
+            time_budget_seconds=time_budget_seconds,
         )
     except asyncio.CancelledError as cancellation:
         if not defer_persistence and mode != "local_only" and max_sources != 0:
-            invalidation_task = asyncio.create_task(
-                invalidate_ingestion_attempt_impl(
-                    effective_attempt_id,
-                    reason="research_request_cancelled",
-                )
-            )
-            try:
-                outcomes = await _await_owned_tasks([invalidation_task])
-            except asyncio.CancelledError:
-                outcomes = [
-                    invalidation_task.exception()
-                    if invalidation_task.done() and not invalidation_task.cancelled()
-                    else None
-                ]
-            for outcome in outcomes:
-                if isinstance(outcome, Exception):
-                    logger.error(
-                        "Could not invalidate cancelled research ingestion %s: %s",
-                        effective_attempt_id[:16],
-                        _safe_error_detail(outcome),
+            if cancellation_deadline is not None:
+                try:
+                    await _invalidate_ingestion_attempt_bounded(
+                        effective_attempt_id,
+                        reason="research_request_cancelled",
+                        timeout_seconds=max(
+                            0.0,
+                            cancellation_deadline - time.monotonic(),
+                        ),
                     )
+                except asyncio.CancelledError:
+                    pass
+            else:
+                invalidation_task = asyncio.create_task(
+                    invalidate_ingestion_attempt_impl(
+                        effective_attempt_id,
+                        reason="research_request_cancelled",
+                    )
+                )
+                try:
+                    outcomes = await _await_owned_tasks([invalidation_task])
+                except asyncio.CancelledError:
+                    outcomes = [
+                        invalidation_task.exception()
+                        if invalidation_task.done() and not invalidation_task.cancelled()
+                        else None
+                    ]
+                for outcome in outcomes:
+                    if isinstance(outcome, Exception):
+                        logger.error(
+                            "Could not invalidate cancelled research ingestion %s: %s",
+                            effective_attempt_id[:16],
+                            _safe_error_detail(outcome),
+                        )
         raise cancellation

@@ -87,8 +87,8 @@ def _server_instructions() -> str:
         "Use research_assistant once for any request that depends on current or externally "
         "verified information, web pages, documentation, repositories, unfamiliar errors, "
         "images, or research. Pass the user's complete request. The server plans, searches, "
-        "browses, verifies, and writes a citation-coverage-checked answer internally; present its "
-        "answer_markdown directly and do not launch redundant research calls. "
+        "browses, verifies, and writes a citation-checked answer internally under one interactive "
+        "deadline; present its answer_markdown directly and do not launch redundant research calls. "
         "A client must still make the initial MCP tool call; MCP cannot force a client model "
         "to call tools. "
     )
@@ -162,6 +162,14 @@ RESEARCH_ASSISTANT_SYNC_WAIT_SECONDS = _client_bounded_wait(
     "RESEARCH_ASSISTANT_SYNC_WAIT_SECONDS",
     45,
 )
+RESEARCH_ASSISTANT_INTERACTIVE_TIMEOUT_SECONDS = min(
+    max(
+        1.0,
+        float(os.getenv("RESEARCH_ASSISTANT_INTERACTIVE_TIMEOUT_SECONDS", "36")),
+    ),
+    max(1.0, RESEARCH_ASSISTANT_SYNC_WAIT_SECONDS - 5.0),
+)
+_INTERNAL_ASSISTANT_TIME_BUDGET = "_research_assistant_time_budget_seconds"
 MCP_JOB_POLL_SECONDS = max(0.1, float(os.getenv("MCP_JOB_POLL_SECONDS", "0.5")))
 MCP_JOB_LONG_POLL_SECONDS = max(
     0.0,
@@ -735,16 +743,40 @@ async def _enqueue_and_wait(
     effective_wait = MCP_SYNC_JOB_WAIT_SECONDS if wait_seconds is None else wait_seconds
     deadline = time.monotonic() + max(0.0, effective_wait)
     last_status = str(job.get("status") or "queued")
+    final_poll = False
     try:
-        while time.monotonic() < deadline:
-            status = await get_job_status(job["job_id"])
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                async with asyncio.timeout(remaining):
+                    status = await get_job_status(job["job_id"])
+            except TimeoutError:
+                break
             if status and status.get("status"):
                 last_status = str(status["status"])
             if status and status.get("status") in {"succeeded", "failed", "cancelled"}:
-                return await _load_completed_job(job["job_id"])
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    async with asyncio.timeout(remaining):
+                        return await _load_completed_job(job["job_id"])
+                except TimeoutError:
+                    break
+            if final_poll:
+                break
             remaining = deadline - time.monotonic()
-            if remaining > 0:
-                await asyncio.sleep(min(MCP_JOB_POLL_SECONDS, remaining))
+            if remaining <= 0:
+                break
+            if remaining <= MCP_JOB_POLL_SECONDS:
+                # Leave a small, in-deadline window for one final status read.
+                final_poll = True
+                final_window = min(0.1, max(0.01, remaining * 0.25))
+                await asyncio.sleep(max(0.0, remaining - final_window))
+            else:
+                await asyncio.sleep(MCP_JOB_POLL_SECONDS)
     except JobQueueFullError as exc:
         return {
             "error": "job_queue_full",
@@ -792,14 +824,18 @@ async def research_assistant(
     technical guidance, products, news, or images. Pass the user's complete
     request, including constraints and desired output. The server-configured
     research model interprets the goal, creates focused searches, selects and
-    browses sources concurrently, performs at most one bounded evidence-gap
-    follow-up, and returns a finished citation-coverage-checked Markdown answer.
+    browses sources concurrently, and returns a finished citation-checked
+    Markdown answer. Auto, quick, balanced, technical, and academic calls are
+    bounded by a server-owned interactive deadline; slow paths are harvested as
+    cited partial evidence instead of requiring a second frontend tool call.
 
     Do not pre-plan subtools, split the request into multiple calls, or call this
     again after a completed response. Present answer_markdown directly. Use auto
-    for the server-configured bounded default, or explicitly request quick,
-    balanced, deep, technical, or academic research. This tool requires RESEARCH_MODEL_BASE_URL and
-    RESEARCH_MODEL_NAME on the server; model credentials are never tool inputs.
+    for the server-configured default, or request quick, balanced, technical, or
+    academic research within that same interactive deadline. Deep is the
+    explicitly durable/background-oriented mode. This tool requires
+    RESEARCH_MODEL_BASE_URL and RESEARCH_MODEL_NAME on the server; model
+    credentials are never tool inputs.
     """
     request = _bounded_text(request, "request", MCP_MAX_QUERY_CHARS)
     from research_agent import run_research_assistant
@@ -809,6 +845,12 @@ async def research_assistant(
     if authorization_failure:
         return authorization_failure
     payload = {"request": request, "mode": mode, "namespace": namespace}
+    if mode != "deep":
+        # Send the gateway's client-bounded value to the worker. The worker
+        # treats this only as an upper bound and subtracts time spent queued.
+        payload[_INTERNAL_ASSISTANT_TIME_BUDGET] = (
+            RESEARCH_ASSISTANT_INTERACTIVE_TIMEOUT_SECONDS
+        )
     github_access_policy = _current_github_access_policy()
     if github_access_policy is not None:
         payload["_github_access_policy"] = github_access_policy
@@ -830,6 +872,11 @@ async def research_assistant(
             search_cache_scope=_current_search_cache_scope(),
             persist_source_artifacts=not _token_authorization_enabled(),
             github_access_policy=github_access_policy,
+            time_budget_seconds=(
+                None
+                if mode == "deep"
+                else RESEARCH_ASSISTANT_INTERACTIVE_TIMEOUT_SECONDS
+            ),
         ),
         "research_assistant",
     )

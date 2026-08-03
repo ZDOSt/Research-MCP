@@ -16,7 +16,7 @@ from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
-from typing import Any, Dict, Mapping
+from typing import Any, Awaitable, Callable, Dict, Mapping
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -178,7 +178,10 @@ RESEARCH_MODE_CONFIG = {
         "search_results": 6,
         "top_k": 4,
         "planner_budget": 1,
-        "search_budget": 5,
+        # SearXNG permits an engine request to run for six seconds. Keep enough
+        # margin to collect that first wave instead of cancelling a valid JSON
+        # response at the five-second boundary.
+        "search_budget": 7.5,
         "crawl_budget": 10,
         "total_budget": 12,
     },
@@ -307,7 +310,11 @@ _ENGINE_STAGES = {
         ("startpage", "mojeek"),
     ),
     "news": (
-        ("reuters", "bing news"),
+        # The pinned SearXNG release's Bing News adapter raises when Bing omits
+        # a thumbnail. Use the general Bing adapter for the broad first wave;
+        # Reuters and the second-stage news adapters still supply news-specific
+        # discovery and publication metadata.
+        ("reuters", "bing"),
         ("qwant news", "mojeek news"),
         ("bing", "qwant"),
         ("startpage", "mojeek"),
@@ -556,6 +563,42 @@ async def _cache_set(key: str, results: SearchResults) -> None:
         )
     except (RedisError, OSError, TimeoutError):
         _disable_redis_cache_temporarily()
+
+
+async def _cache_get_before_deadline(
+    key: str,
+    deadline: float,
+) -> dict[str, Any] | None:
+    """Treat cache lookup as optional work within the search deadline."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return None
+    budget = min(
+        SEARCH_CACHE_REDIS_TIMEOUT_SECONDS,
+        max(0.01, remaining * 0.1),
+        remaining,
+    )
+    try:
+        async with asyncio.timeout(budget):
+            return await _cache_get(key)
+    except TimeoutError:
+        return None
+
+
+async def _cache_set_before_deadline(
+    key: str,
+    results: SearchResults,
+    deadline: float,
+) -> None:
+    """Persist opportunistically without allowing cache I/O to erase results."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return
+    try:
+        async with asyncio.timeout(remaining):
+            await _cache_set(key, results)
+    except TimeoutError:
+        return
 
 
 def _cached_results(
@@ -2727,7 +2770,18 @@ async def searxng_search(
     current_date: date | str | None = None,
     timezone_name: str | None = None,
     cache_scope: str | None = None,
+    time_budget_seconds: float | None = None,
 ) -> SearchResults:
+    started = time.monotonic()
+    effective_timeout = SEARXNG_TIMEOUT_SECONDS
+    if time_budget_seconds is not None:
+        effective_timeout = min(
+            effective_timeout,
+            max(0.1, float(time_budget_seconds)),
+        )
+    hard_deadline = started + effective_timeout
+    return_margin = min(0.25, max(0.01, effective_timeout * 0.1))
+    staged_deadline = hard_deadline - return_margin
     policy = policy or infer_search_policy(
         query,
         mode,
@@ -2757,53 +2811,20 @@ async def searxng_search(
         base_url,
         cache_scope,
     )
-    cached = await _cache_get(cache_key)
+    cached = await _cache_get_before_deadline(cache_key, staged_deadline)
     stale = cached
     if cached is not None:
         age = time.time() - float(cached["cached_at"])
         if age <= SEARCH_CACHE_TTL_SECONDS:
             return _cached_results(cached, "fresh")
 
+    lock = _cache_key_lock(cache_key)
     try:
-        async with asyncio.timeout(SEARXNG_TIMEOUT_SECONDS):
-            async with _cache_key_lock(cache_key):
-                # Coalesce normalized duplicate requests in this process. The
-                # first waiter populates Redis/local cache for every follower.
-                cached_after_wait = await _cache_get(cache_key)
-                if cached_after_wait is not None:
-                    age = time.time() - float(cached_after_wait["cached_at"])
-                    if age <= SEARCH_CACHE_TTL_SECONDS:
-                        return _cached_results(cached_after_wait, "fresh_coalesced")
-                    stale = cached_after_wait
-
-                results = await _staged_searxng_search(
-                    query,
-                    outbound_query=outbound_query,
-                    max_results=max_results,
-                    mode=mode,
-                    policy=policy,
-                    base_url=base_url,
-                )
-                if results and _cacheable_results(results, max_results):
-                    results.diagnostics["cache"] = {"status": "miss"}
-                    await _cache_set(cache_key, results)
-                    return results
-                if results:
-                    results.diagnostics["cache"] = {"status": "bypassed_partial"}
-                    return results
-                if (
-                    stale is not None
-                    and stale.get("results")
-                    and results.diagnostics.get("acquisition_status") == "failed"
-                    and results.diagnostics.get("failure_class") == "transient"
-                ):
-                    return _cached_results(
-                        stale,
-                        "stale_fallback",
-                        attempt_diagnostics=results.diagnostics,
-                    )
-                results.diagnostics["cache"] = {"status": "miss"}
-                return results
+        lock_budget = staged_deadline - time.monotonic()
+        if lock_budget <= 0:
+            raise TimeoutError("SearXNG search deadline exceeded")
+        async with asyncio.timeout(lock_budget):
+            await lock.acquire()
     except TimeoutError:
         if stale is not None and stale.get("results"):
             return _cached_results(
@@ -2812,6 +2833,59 @@ async def searxng_search(
                 attempt_diagnostics={"error": "search deadline exceeded"},
             )
         raise
+
+    try:
+        # Coalesce normalized duplicate requests in this process. The first
+        # waiter populates Redis/local cache for every follower.
+        cached_after_wait = await _cache_get_before_deadline(
+            cache_key,
+            staged_deadline,
+        )
+        if cached_after_wait is not None:
+            age = time.time() - float(cached_after_wait["cached_at"])
+            if age <= SEARCH_CACHE_TTL_SECONDS:
+                return _cached_results(cached_after_wait, "fresh_coalesced")
+            stale = cached_after_wait
+
+        results = await _staged_searxng_search(
+            query,
+            outbound_query=outbound_query,
+            max_results=max_results,
+            mode=mode,
+            policy=policy,
+            base_url=base_url,
+            deadline=staged_deadline,
+        )
+        failed_transiently = (
+            results.diagnostics.get("acquisition_status") == "failed"
+            and results.diagnostics.get("failure_class") == "transient"
+        )
+        if not results and stale is not None and stale.get("results") and failed_transiently:
+            return _cached_results(
+                stale,
+                "stale_fallback",
+                attempt_diagnostics=results.diagnostics,
+            )
+        if (
+            not results
+            and results.diagnostics.get("deadline_exhausted") is True
+            and failed_transiently
+        ):
+            # A staged deadline is useful only when it lets us return a
+            # completed earlier wave. Without one, preserve the timeout
+            # contract so callers can classify and recover from the failure.
+            raise TimeoutError("SearXNG search deadline exceeded")
+        if results and _cacheable_results(results, max_results):
+            results.diagnostics["cache"] = {"status": "miss"}
+            await _cache_set_before_deadline(cache_key, results, hard_deadline)
+            return results
+        if results:
+            results.diagnostics["cache"] = {"status": "bypassed_partial"}
+            return results
+        results.diagnostics["cache"] = {"status": "miss"}
+        return results
+    finally:
+        lock.release()
 
 
 def _safe_result_url(value: object) -> str | None:
@@ -3005,6 +3079,26 @@ async def _validate_image_result(item: Mapping[str, Any]) -> dict[str, Any] | No
     return output
 
 
+async def _await_before_deadline(
+    operation: Callable[[], Awaitable[Any]],
+    deadline: float | None,
+) -> Any:
+    awaitable = operation()
+    if deadline is None:
+        return await awaitable
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        cancel = getattr(awaitable, "cancel", None)
+        close = getattr(awaitable, "close", None)
+        if callable(cancel):
+            cancel()
+        elif callable(close):
+            close()
+        raise TimeoutError
+    async with asyncio.timeout(remaining):
+        return await awaitable
+
+
 async def _staged_searxng_search(
     query: str,
     *,
@@ -3013,6 +3107,7 @@ async def _staged_searxng_search(
     mode: str,
     policy: SearchPolicy,
     base_url: str,
+    deadline: float | None = None,
 ) -> SearchResults:
     aggregate_data: dict[str, Any] = {"results": []}
     stage_diagnostics: list[dict[str, Any]] = []
@@ -3022,105 +3117,163 @@ async def _staged_searxng_search(
     responsive_engines = 0
     transient_failures = 0
     configuration_failures = 0
+    deadline_exhausted = False
+
+    def mark_deadline(
+        diagnostic: dict[str, Any],
+        stage_started: float,
+        *,
+        after_response: bool = False,
+    ) -> None:
+        nonlocal deadline_exhausted, transient_failures
+        transient_failures += 1
+        deadline_exhausted = True
+        diagnostic.update(
+            {
+                "status": (
+                    "deadline_exhausted_after_response"
+                    if after_response
+                    else "deadline_exhausted"
+                ),
+                "duration_seconds": round(
+                    max(0.0, time.monotonic() - stage_started),
+                    3,
+                ),
+            }
+        )
+        if not any(item is diagnostic for item in stage_diagnostics):
+            stage_diagnostics.append(diagnostic)
+
+    async def finish_health_update(
+        operation: Callable[[], Awaitable[Any]],
+    ) -> bool:
+        try:
+            await _await_before_deadline(operation, deadline)
+        except TimeoutError:
+            return False
+        return True
 
     async with httpx.AsyncClient(timeout=SEARXNG_TIMEOUT_SECONDS) as client:
         for index, configured_engines in enumerate(
             _engine_stages(policy, mode), start=1
         ):
-            service_eligible, service_skipped = await _eligible_engines(
-                (_SEARX_SERVICE_CIRCUIT,)
-            )
+            started = time.monotonic()
+            stage_diagnostic: dict[str, Any] = {
+                "stage": index,
+                "configured_engines": list(configured_engines),
+                "engines": [],
+                "skipped_cooldowns": [],
+            }
+            if deadline is not None and time.monotonic() >= deadline:
+                mark_deadline(stage_diagnostic, started)
+                break
+            try:
+                service_eligible, service_skipped = await _await_before_deadline(
+                    lambda: _eligible_engines((_SEARX_SERVICE_CIRCUIT,)),
+                    deadline,
+                )
+            except TimeoutError:
+                mark_deadline(stage_diagnostic, started)
+                break
             if not service_eligible:
                 transient_failures += 1
-                stage_diagnostics.append(
+                stage_diagnostic.update(
                     {
-                        "stage": index,
-                        "configured_engines": list(configured_engines),
-                        "engines": [],
-                        "skipped_cooldowns": [],
                         "status": "service_circuit_open",
                         "retry_after_seconds": service_skipped[0].get(
                             "retry_after_seconds"
                         ),
                     }
                 )
+                stage_diagnostics.append(stage_diagnostic)
                 break
             validated_engines = _validated_stage_engines(configured_engines)
             if not validated_engines:
                 configuration_failures += 1
-                stage_diagnostics.append(
-                    {
-                        "stage": index,
-                        "configured_engines": list(configured_engines),
-                        "engines": [],
-                        "skipped_cooldowns": [],
-                        "status": "invalid_engine_configuration",
-                    }
-                )
+                stage_diagnostic["status"] = "invalid_engine_configuration"
+                stage_diagnostics.append(stage_diagnostic)
                 continue
-            eligible, skipped = await _eligible_engines(validated_engines)
-            stage_diagnostic: dict[str, Any] = {
-                "stage": index,
-                "configured_engines": list(configured_engines),
-                "engines": list(eligible),
-                "skipped_cooldowns": skipped,
-            }
+            try:
+                eligible, skipped = await _await_before_deadline(
+                    lambda: _eligible_engines(validated_engines),
+                    deadline,
+                )
+            except TimeoutError:
+                mark_deadline(stage_diagnostic, started)
+                break
+            stage_diagnostic["engines"] = list(eligible)
+            stage_diagnostic["skipped_cooldowns"] = skipped
             if not eligible:
                 transient_failures += 1
                 stage_diagnostic["status"] = "circuit_open"
                 stage_diagnostics.append(stage_diagnostic)
                 continue
 
-            started = time.monotonic()
             try:
-                async with _engine_request_slots(eligible):
-                    # An overlapping request may have opened a circuit while
-                    # this request waited for the per-engine slot.
-                    service_after_wait, service_skipped_after_wait = (
-                        await _eligible_engines((_SEARX_SERVICE_CIRCUIT,))
-                    )
-                    if not service_after_wait:
-                        transient_failures += 1
-                        stage_diagnostic.update(
-                            {
-                                "status": "service_circuit_open",
-                                "retry_after_seconds": (
-                                    service_skipped_after_wait[0].get(
-                                        "retry_after_seconds"
-                                    )
-                                ),
-                            }
+                stage_budget = (
+                    None
+                    if deadline is None
+                    else max(0.0, deadline - time.monotonic())
+                )
+                if stage_budget is not None and stage_budget <= 0:
+                    raise TimeoutError
+                async with asyncio.timeout(stage_budget):
+                    async with _engine_request_slots(eligible):
+                        # An overlapping request may have opened a circuit while
+                        # this request waited for the per-engine slot.
+                        service_after_wait, service_skipped_after_wait = (
+                            await _eligible_engines((_SEARX_SERVICE_CIRCUIT,))
                         )
-                        stage_diagnostics.append(stage_diagnostic)
-                        break
-                    eligible_after_wait, newly_skipped = await _eligible_engines(
-                        tuple(eligible)
-                    )
-                    stage_diagnostic["skipped_cooldowns"].extend(newly_skipped)
-                    stage_diagnostic["engines"] = list(eligible_after_wait)
-                    if not eligible_after_wait:
-                        stage_diagnostic["status"] = "circuit_open"
-                        stage_diagnostics.append(stage_diagnostic)
-                        continue
-                    data = await _searxng_stage_request(
-                        client,
-                        base_url=base_url,
-                        query=outbound_query,
-                        policy=policy,
-                        engines=eligible_after_wait,
-                    )
+                        if not service_after_wait:
+                            transient_failures += 1
+                            stage_diagnostic.update(
+                                {
+                                    "status": "service_circuit_open",
+                                    "retry_after_seconds": (
+                                        service_skipped_after_wait[0].get(
+                                            "retry_after_seconds"
+                                        )
+                                    ),
+                                }
+                            )
+                            stage_diagnostics.append(stage_diagnostic)
+                            break
+                        eligible_after_wait, newly_skipped = await _eligible_engines(
+                            tuple(eligible)
+                        )
+                        stage_diagnostic["skipped_cooldowns"].extend(newly_skipped)
+                        stage_diagnostic["engines"] = list(eligible_after_wait)
+                        if not eligible_after_wait:
+                            stage_diagnostic["status"] = "circuit_open"
+                            stage_diagnostics.append(stage_diagnostic)
+                            continue
+                        data = await _searxng_stage_request(
+                            client,
+                            base_url=base_url,
+                            query=outbound_query,
+                            policy=policy,
+                            engines=eligible_after_wait,
+                        )
+            except TimeoutError:
+                mark_deadline(stage_diagnostic, started)
+                break
             except _SearxHTTPError as exc:
                 reason = f"HTTP {exc.status_code}"
+                retry_after = exc.retry_after
                 is_transient = exc.status_code in {408, 425, 429} or (
                     500 <= exc.status_code <= 599
                 )
                 if is_transient:
                     transient_failures += 1
-                    await _record_engine_failure(
-                        _SEARX_SERVICE_CIRCUIT,
-                        reason,
-                        retry_after=exc.retry_after,
-                    )
+                    if not await finish_health_update(
+                        lambda: _record_engine_failure(
+                            _SEARX_SERVICE_CIRCUIT,
+                            reason,
+                            retry_after=retry_after,
+                        )
+                    ):
+                        mark_deadline(stage_diagnostic, started)
+                        break
                 else:
                     configuration_failures += 1
                 stage_diagnostic.update(
@@ -3134,18 +3287,30 @@ async def _staged_searxng_search(
                 break
             except httpx.TimeoutException:
                 transient_failures += 1
-                await _record_engine_failure(_SEARX_SERVICE_CIRCUIT, "timeout")
+                if not await finish_health_update(
+                    lambda: _record_engine_failure(
+                        _SEARX_SERVICE_CIRCUIT,
+                        "timeout",
+                    )
+                ):
+                    mark_deadline(stage_diagnostic, started)
+                    break
                 stage_diagnostic.update({"status": "timeout"})
                 stage_diagnostics.append(stage_diagnostic)
                 continue
             except httpx.RequestError as exc:
                 transient_failures += 1
-                await _record_engine_failure(
-                    _SEARX_SERVICE_CIRCUIT,
-                    type(exc).__name__,
-                )
+                request_error_name = type(exc).__name__
+                if not await finish_health_update(
+                    lambda: _record_engine_failure(
+                        _SEARX_SERVICE_CIRCUIT,
+                        request_error_name,
+                    )
+                ):
+                    mark_deadline(stage_diagnostic, started)
+                    break
                 stage_diagnostic.update(
-                    {"status": "service_unavailable", "error": type(exc).__name__}
+                    {"status": "service_unavailable", "error": request_error_name}
                 )
                 stage_diagnostics.append(stage_diagnostic)
                 break
@@ -3182,22 +3347,30 @@ async def _staged_searxng_search(
                     item.get("reason_code", "").casefold(),
                 )
                 all_unresponsive[key] = item
-            provider_updates = [_record_engine_success(_SEARX_SERVICE_CIRCUIT)]
+            provider_updates: list[Callable[[], Awaitable[Any]]] = [
+                lambda: _record_engine_success(_SEARX_SERVICE_CIRCUIT)
+            ]
             requested_failures = 0
             for engine in stage_diagnostic["engines"]:
                 failure = failures.get(engine.casefold())
                 if failure is None:
-                    provider_updates.append(_record_engine_success(engine))
+                    provider_updates.append(
+                        lambda engine=engine: _record_engine_success(engine)
+                    )
                     continue
                 requested_failures += 1
+                failure_reason = failure.get(
+                    "reason_code",
+                    "upstream_unresponsive",
+                )
+                failure_retry_after = failure.get("retry_after_seconds")
                 provider_updates.append(
-                    _record_engine_failure(
-                        engine,
-                        failure.get("reason_code", "upstream_unresponsive"),
-                        retry_after=failure.get("retry_after_seconds"),
+                    lambda engine=engine,
+                    failure_reason=failure_reason,
+                    failure_retry_after=failure_retry_after: _record_engine_failure(
+                        engine, failure_reason, retry_after=failure_retry_after
                     )
                 )
-            await asyncio.gather(*provider_updates)
             successful_responses += 1
             responsive_engines += max(
                 0,
@@ -3216,6 +3389,15 @@ async def _staged_searxng_search(
                 }
             )
             stage_diagnostics.append(stage_diagnostic)
+            if not await finish_health_update(
+                lambda: asyncio.gather(*(update() for update in provider_updates))
+            ):
+                mark_deadline(
+                    stage_diagnostic,
+                    started,
+                    after_response=True,
+                )
+                break
             interim = compact_search_results(
                 aggregate_data,
                 query=query,
@@ -3244,6 +3426,7 @@ async def _staged_searxng_search(
     results.diagnostics["counts"]["unresponsive_engines"] = len(all_unresponsive)
     results.diagnostics["search_stages"] = stage_diagnostics
     results.diagnostics["engine_policy"] = _engine_policy_name(policy)
+    results.diagnostics["deadline_exhausted"] = deadline_exhausted
     if successful_responses and responsive_engines:
         acquisition_status = "partial" if transient_failures else "succeeded"
         failure_class = "transient" if transient_failures else None

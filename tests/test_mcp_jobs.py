@@ -4,6 +4,7 @@ import hashlib
 import os
 import sys
 import tempfile
+import time
 import types
 import unittest
 import uuid
@@ -119,6 +120,10 @@ class MCPJobIntegrationTests(unittest.IsolatedAsyncioTestCase):
             server = load_mcp_server()
         self.assertEqual(server.MCP_SYNC_JOB_WAIT_SECONDS, 45.0)
         self.assertEqual(server.RESEARCH_ASSISTANT_SYNC_WAIT_SECONDS, 45.0)
+        self.assertEqual(
+            server.RESEARCH_ASSISTANT_INTERACTIVE_TIMEOUT_SECONDS,
+            36.0,
+        )
 
         with patch.dict(
             os.environ,
@@ -134,6 +139,10 @@ class MCPJobIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(bounded.MCP_SYNC_JOB_WAIT_SECONDS, 25.0)
         self.assertEqual(bounded.RESEARCH_ASSISTANT_SYNC_WAIT_SECONDS, 25.0)
+        self.assertEqual(
+            bounded.RESEARCH_ASSISTANT_INTERACTIVE_TIMEOUT_SECONDS,
+            20.0,
+        )
 
     async def test_run_resilient_propagates_client_cancellation(self):
         server = load_mcp_server()
@@ -632,6 +641,96 @@ class MCPJobIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status.await_count, 2)
         sleep.assert_awaited_once()
         load.assert_awaited_once_with(job_id)
+
+    async def test_sync_wait_performs_bounded_final_status_read(self):
+        server = load_mcp_server(backend="redis")
+        job_id = uuid.uuid4().hex
+        completed = {
+            "status": "complete",
+            "answer_markdown": "Finished at the deadline.",
+        }
+        with patch.object(
+            server,
+            "enqueue_job",
+            AsyncMock(return_value={"job_id": job_id, "status": "running"}),
+        ), patch.object(
+            server,
+            "get_job_status",
+            AsyncMock(
+                side_effect=[
+                    {"job_id": job_id, "status": "running"},
+                    {"job_id": job_id, "status": "succeeded"},
+                ]
+            ),
+        ) as status, patch.object(
+            server,
+            "_load_completed_job",
+            AsyncMock(return_value=completed),
+        ) as load:
+            result = await server._enqueue_and_wait(
+                "research_assistant",
+                {"request": "current information", "mode": "balanced"},
+                "research_assistant",
+                wait_seconds=0.2,
+            )
+
+        self.assertEqual(result, completed)
+        self.assertEqual(status.await_count, 2)
+        load.assert_awaited_once_with(job_id)
+
+    async def test_sync_wait_bounds_a_hung_status_lookup(self):
+        server = load_mcp_server(backend="redis")
+        job_id = uuid.uuid4().hex
+
+        async def never_returns(_job_id):
+            await asyncio.Event().wait()
+
+        with patch.object(
+            server,
+            "enqueue_job",
+            AsyncMock(return_value={"job_id": job_id, "status": "running"}),
+        ), patch.object(server, "get_job_status", never_returns):
+            started = time.monotonic()
+            result = await server._enqueue_and_wait(
+                "research_assistant",
+                {"request": "current information", "mode": "balanced"},
+                "research_assistant",
+                wait_seconds=0.02,
+            )
+
+        self.assertLess(time.monotonic() - started, 0.2)
+        self.assertEqual(result["status"], "running")
+
+    async def test_redis_assistant_enqueues_gateway_bounded_worker_budget(self):
+        server = load_mcp_server(backend="redis")
+        with patch.object(
+            server,
+            "_enqueue_and_wait",
+            AsyncMock(return_value={"status": "complete"}),
+        ) as enqueue:
+            result = await server.research_assistant(
+                "Find the current installation guide",
+                mode="balanced",
+            )
+
+        self.assertEqual(result, {"status": "complete"})
+        payload = enqueue.await_args.args[1]
+        self.assertEqual(
+            payload[server._INTERNAL_ASSISTANT_TIME_BUDGET],
+            server.RESEARCH_ASSISTANT_INTERACTIVE_TIMEOUT_SECONDS,
+        )
+
+    async def test_redis_deep_assistant_omits_interactive_worker_budget(self):
+        server = load_mcp_server(backend="redis")
+        with patch.object(
+            server,
+            "_enqueue_and_wait",
+            AsyncMock(return_value={"status": "queued"}),
+        ) as enqueue:
+            await server.research_assistant("Run deep research", mode="deep")
+
+        payload = enqueue.await_args.args[1]
+        self.assertNotIn(server._INTERNAL_ASSISTANT_TIME_BUDGET, payload)
 
     async def test_disabled_backend_and_queue_failures_return_stable_errors(self):
         disabled = load_mcp_server(backend="inline")

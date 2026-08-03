@@ -7,6 +7,7 @@ import ipaddress
 import socket
 from collections.abc import Iterable, Sequence
 from typing import Any, TypeAlias
+from urllib.parse import urlsplit
 
 
 DEFAULT_ALLOWED_PORTS = "80,443,8080,8443"
@@ -163,7 +164,63 @@ def normalize_destination_host(
         raise DestinationPolicyError("Destination hostname is not allowed")
     if "." not in ascii_host:
         raise DestinationPolicyError("Single-label destination hostnames are not allowed")
+    labels = ascii_host.split(".")
+    if any(
+        not label
+        or len(label) > 63
+        or label.startswith("-")
+        or label.endswith("-")
+        or any(not (character.isascii() and (character.isalnum() or character == "-")) for character in label)
+        for label in labels
+    ):
+        raise DestinationPolicyError("Invalid destination hostname")
+
+    # Browsers accept legacy dotted/octal/hex IPv4 spellings that ipaddress
+    # intentionally rejects. Do not let such a spelling pass as a DNS name and
+    # later be reinterpreted as a private IP by a different URL parser.
+    try:
+        socket.inet_aton(ascii_host)
+    except OSError:
+        pass
+    else:
+        raise DestinationPolicyError("Ambiguous IPv4 destination is not allowed")
     return ascii_host
+
+
+def validate_http_url_without_dns(
+    url: str,
+    *,
+    allowed_ports: Iterable[int],
+    denied_networks: Iterable[IPNetwork] = (),
+) -> tuple[str, int]:
+    """Validate a proxied HTTP(S) URL without resolving its hostname locally.
+
+    This is the preflight policy for network-isolated clients. The trusted
+    egress broker must still resolve the returned hostname, validate every DNS
+    answer, and pin the connection before any bytes reach the destination.
+    """
+    if not isinstance(url, str) or not url.strip():
+        raise DestinationPolicyError("URL must be a non-empty string")
+
+    try:
+        parsed = urlsplit(url.strip())
+        port = parsed.port
+    except ValueError as exc:
+        raise DestinationPolicyError("Invalid URL") from exc
+
+    scheme = parsed.scheme.lower()
+    if scheme not in {"http", "https"}:
+        raise DestinationPolicyError("Only http and https URLs are allowed")
+    if not parsed.hostname:
+        raise DestinationPolicyError("URL must include a hostname")
+    if parsed.username is not None or parsed.password is not None:
+        raise DestinationPolicyError("URLs containing credentials are not allowed")
+
+    normalized_denials = tuple(denied_networks)
+    host = normalize_destination_host(parsed.hostname, normalized_denials)
+    destination_port = port if port is not None else (443 if scheme == "https" else 80)
+    validate_destination_port(destination_port, allowed_ports)
+    return host, destination_port
 
 
 def validate_dns_records(

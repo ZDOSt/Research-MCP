@@ -19,6 +19,7 @@ from crawler import (  # noqa: E402
     crawl4ai_request,
     direct_fetch_url,
     extract_direct_response,
+    validate_proxy_url_safety,
     validate_url_safety,
 )
 from browser import (  # noqa: E402
@@ -112,6 +113,38 @@ class FakeAsyncClient:
 
 
 class URLSafetyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_proxy_prevalidation_accepts_public_hostname_without_local_dns(self):
+        with patch("socket.getaddrinfo", side_effect=AssertionError("unexpected local DNS")):
+            self.assertEqual(
+                await validate_proxy_url_safety("https://docs.example.com/guide"),
+                "https://docs.example.com/guide",
+            )
+
+    async def test_proxy_prevalidation_blocks_unsafe_destinations_before_broker(self):
+        blocked = [
+            "file:///etc/passwd",
+            "ftp://example.com/file",
+            "http://user:secret@example.com/",
+            "http://localhost/",
+            "http://service/",
+            "http://service.internal/",
+            "http://metadata.google.internal/computeMetadata/v1/",
+            "http://127.0.0.1/",
+            "http://10.0.0.1/",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://[::1]/",
+            "http://0177.0.0.1/",
+            "http://127.0.0.1\\public.example/",
+            "https://bad_host.example/",
+            "https://example.com:22/private-scan",
+        ]
+
+        with patch("socket.getaddrinfo") as getaddrinfo:
+            for url in blocked:
+                with self.subTest(url=url), self.assertRaises(UnsafeURLError):
+                    await validate_proxy_url_safety(url)
+        getaddrinfo.assert_not_called()
+
     async def test_rejects_non_http_credentials_and_local_targets(self):
         blocked = [
             "file:///etc/passwd",
@@ -319,7 +352,7 @@ class ContentDispatchTests(unittest.TestCase):
         self.assertIn('"chromium_sandbox": sandbox_enabled', source)
         self.assertIn('"RESEARCH_BROWSER_SANDBOX_MODE"', source)
         self.assertIn('service_workers="block"', source)
-        self.assertIn("await validate_url_safety(url)", source)
+        self.assertIn("await validate_proxy_url_safety(url)", source)
         self.assertIn('await context.route("**/*", guard_outbound_request)', source)
         self.assertIn('await context.route_web_socket("**/*", block_websocket)', source)
         self.assertNotIn("validated_resource_origins", source)

@@ -103,7 +103,14 @@ async def test_streamed_clients_enforce_total_deadline(
     with pytest.raises(TimeoutError):
         await invoke()
 
-    assert observed == [timeout_seconds]
+    if module is searching:
+        # Search reserves time to return completed engine waves and divides the
+        # remaining hard deadline among optional cache/lock/network work.
+        assert observed
+        assert all(0 < value <= timeout_seconds for value in observed)
+        assert sum(observed) <= timeout_seconds
+    else:
+        assert observed == [timeout_seconds]
 
 
 @pytest.mark.asyncio

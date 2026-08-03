@@ -1,8 +1,8 @@
 """Crawl4AI v0.9.1 egress-proxy overlay for the isolated Docker profile.
 
 The upstream server points Chromium at this localhost HTTP proxy. This derived
-version retains upstream DNS validation and IP pinning, but opens the pinned
-connection through Research MCP's public-only SOCKS5 broker.
+version performs a DNS-free destination precheck, then delegates hostname
+resolution, public-address validation, and connection pinning to safe-egress.
 """
 
 from __future__ import annotations
@@ -12,7 +12,13 @@ import logging
 import os
 from urllib.parse import urlsplit
 
-from egress_broker import EgressBlocked, resolve_and_pin
+from egress_policy import (
+    DEFAULT_ALLOWED_PORTS,
+    DestinationPolicyError,
+    parse_allowed_ports,
+    parse_denied_networks,
+    validate_http_url_without_dns,
+)
 from socks5_client import open_socks5_connection
 
 
@@ -23,6 +29,10 @@ _SOCKS_PORT = int(os.environ.get("CRAWL4AI_EGRESS_SOCKS_PORT", "1080"))
 _SOCKS_TIMEOUT_SECONDS = max(
     0.1, float(os.environ.get("CRAWL4AI_EGRESS_CONNECT_TIMEOUT_SECONDS", "30"))
 )
+_ALLOWED_PORTS = parse_allowed_ports(
+    os.environ.get("SAFE_EGRESS_ALLOWED_PORTS", DEFAULT_ALLOWED_PORTS)
+)
+_DENIED_NETWORKS = parse_denied_networks(os.environ.get("SAFE_EGRESS_DENY_CIDRS", ""))
 if not _SOCKS_HOST:
     raise RuntimeError("CRAWL4AI_EGRESS_SOCKS_HOST is required")
 
@@ -32,13 +42,21 @@ _BAD = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 11\r\n\r\nBad Request"
 _MAX_HEADER_BYTES = 64 * 1024
 
 
-async def _open_pinned_connection(pin):
+async def _open_proxy_connection(host: str, port: int):
     return await open_socks5_connection(
         _SOCKS_HOST,
         _SOCKS_PORT,
-        pin.ip,
-        pin.port,
+        host,
+        port,
         timeout_seconds=_SOCKS_TIMEOUT_SECONDS,
+    )
+
+
+def _validate_target(url: str) -> tuple[str, int]:
+    return validate_http_url_without_dns(
+        url,
+        allowed_ports=_ALLOWED_PORTS,
+        denied_networks=_DENIED_NETWORKS,
     )
 
 
@@ -94,19 +112,18 @@ class PinningProxy:
             await self._safe_close(writer)
 
     async def _handle_connect(self, target, client_reader, client_writer):
-        host, _, port_text = target.rpartition(":")
-        if not host or not port_text.isdigit():
-            await self._reply(client_writer, _BAD)
-            return
         try:
-            pin = resolve_and_pin(f"https://{host}:{port_text}")
-        except EgressBlocked:
-            await self._reply(client_writer, _BLOCKED)
+            parsed = urlsplit(f"https://{target}")
+            if parsed.port is None or parsed.path or parsed.query or parsed.fragment:
+                raise DestinationPolicyError("CONNECT requires a host and port")
+            host, port = _validate_target(f"https://{target}")
+        except (DestinationPolicyError, ValueError):
+            await self._reply(client_writer, _BAD)
             return
 
         await self._drain_headers(client_reader)
         try:
-            upstream_reader, upstream_writer = await _open_pinned_connection(pin)
+            upstream_reader, upstream_writer = await _open_proxy_connection(host, port)
         except Exception:
             await self._reply(client_writer, _BLOCKED)
             return
@@ -121,15 +138,13 @@ class PinningProxy:
         )
 
     async def _handle_absolute(self, method, target, client_reader, client_writer):
-        parsed = urlsplit(target)
-        if parsed.scheme != "http" or not parsed.hostname:
-            await self._reply(client_writer, _BAD)
-            return
-        port = parsed.port or 80
         try:
-            pin = resolve_and_pin(f"http://{parsed.hostname}:{port}")
-        except EgressBlocked:
-            await self._reply(client_writer, _BLOCKED)
+            parsed = urlsplit(target)
+            if parsed.scheme != "http" or not parsed.hostname:
+                raise DestinationPolicyError("Absolute proxy requests must use HTTP")
+            host, port = _validate_target(target)
+        except (DestinationPolicyError, ValueError):
+            await self._reply(client_writer, _BAD)
             return
 
         headers = await self._read_headers(client_reader)
@@ -137,15 +152,16 @@ class PinningProxy:
         if parsed.query:
             path += "?" + parsed.query
         try:
-            upstream_reader, upstream_writer = await _open_pinned_connection(pin)
+            upstream_reader, upstream_writer = await _open_proxy_connection(host, port)
         except Exception:
             await self._reply(client_writer, _BLOCKED)
             return
 
         outbound = f"{method} {path} HTTP/1.1\r\n".encode("latin-1")
-        outbound += b"Host: " + parsed.hostname.encode("latin-1")
-        if parsed.port:
-            outbound += f":{parsed.port}".encode("latin-1")
+        host_header = f"[{host}]" if ":" in host else host
+        outbound += b"Host: " + host_header.encode("ascii")
+        if parsed.port is not None:
+            outbound += f":{port}".encode("ascii")
         outbound += b"\r\n" + headers + b"\r\n"
         upstream_writer.write(outbound)
         await upstream_writer.drain()

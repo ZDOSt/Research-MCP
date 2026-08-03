@@ -4,9 +4,9 @@ Research MCP gives any Streamable HTTP MCP client one private, high-level
 `research_assistant` tool. The client passes the complete request once; the
 server-side research model plans focused queries, searches and browses in
 parallel, inspects supplied URLs and GitHub when relevant, optionally discovers
-images, performs one bounded evidence-gap follow-up, and returns a finished
-citation-coverage-checked Markdown answer. The gateway exposes MCP only; it does not
-provide an OpenAI-compatible chat endpoint.
+images, and returns a citation-checked Markdown answer or a cited evidence digest
+under one interactive deadline. The gateway exposes MCP only; it does not provide
+an OpenAI-compatible chat endpoint.
 
 The existing evidence, URL, GitHub, memory, and durable-job tools remain
 available through an `advanced` tool profile. Separate workers perform bounded
@@ -294,7 +294,7 @@ create logical Qdrant partitions and authorization boundaries.
 
 | Tool | Purpose and important behavior |
 | --- | --- |
-| `research_assistant` | Complete a current, external, technical, URL, GitHub, image, or general research request in one call. Pass the complete user request and normally use `mode=auto`. It requires a configured `RESEARCH_MODEL_*` endpoint and returns `answer_markdown`, validated `citations`, optional image metadata, `confidence`, `limitations`, and a bounded `research_summary`. |
+| `research_assistant` | Complete a current, external, technical, URL, GitHub, image, or general research request in one call. Pass the complete user request and normally use `mode=auto`. Ordinary modes have a server-owned 36-second end-to-end worker budget and return the best answer or cited evidence available at expiry; `deep` remains background-oriented. It requires a configured `RESEARCH_MODEL_*` endpoint and returns `answer_markdown`, citations, optional image metadata, `confidence`, `limitations`, and a bounded `research_summary`. |
 | `research_web` | Run open-ended research. Pass the complete task in `query`; capable calling models may also supply 1-5 concise, optional `proposed_queries` of at most 180 characters each. The server validates suggestions and retains deterministic search anchors. Modes are `quick` (12-second target), `balanced` (30), `web_only` (25), `technical` (45), `academic` (50), `deep` (180/background-oriented), and `local_only`. Search queries and source extraction run under one bounded latency budget and return the best available evidence at expiry. `evidence` is the authoritative fresh result; `results` and `memory_results` are optional vector-memory matches and may be empty. Source indexing continues independently after the response. With Redis, same-owner duplicate active requests are coalesced and wait for the existing result rather than launching duplicate work. |
 | `investigate_url` | Investigate one public HTTP(S) URL with crawl, rendered-browser, scrolling, clicking, and network-data fallbacks. Modes are `auto`, `targeted`, `balanced`, and `exhaustive`; optional flags control ingestion, raw text, and diagnostics. |
 | `start_research` | Queue explicitly deep durable `research_web` work and return a job ID immediately. It accepts the same complete `query` and optional `proposed_queries` planning inputs. Ordinary work should use `research_web`. A model may follow with one bounded `research_job` call itself; users should not be asked to run job-control commands. It requires `JOB_BACKEND=redis`, which Compose configures. |
@@ -308,16 +308,18 @@ create logical Qdrant partitions and authorization boundaries.
 ### Unified orchestration
 
 `research_assistant(request, mode="auto")` accepts the complete private request.
-With the default configuration, `auto` runs the bounded quick path so a client
-with a roughly 60-second tool timeout receives a finished answer. Explicitly
-request `balanced`, `technical`, `academic`, or `deep` for a larger evidence
-budget, or set `RESEARCH_ASSISTANT_AUTO_MODE` for clients that support it.
+With the default configuration, `auto` classifies the request and selects the
+appropriate quick, balanced, technical, or academic acquisition profile.
+Those profiles retain their different search breadth but share the server-owned
+interactive deadline, so a client with a roughly 60-second tool timeout receives
+a terminal answer-bearing response.
+Use `deep` only for explicitly background-oriented work.
 Before any content crosses the configured research-model boundary, the server
 redacts credential patterns, signed/session URL values, common PII,
 private-context phrases, addresses, and host paths. Only normalized, bounded,
 planner-minimized queries cross public search boundaries.
-The deterministic failure path uses only a small public-topic vocabulary rather
-than copying the complete request. Explicit public URLs are retained exactly in
+The deterministic failure path preserves the privacy-filtered public topic,
+dates, products, and constraints. Explicit public URLs are retained exactly in
 execution-only state so signed query ordering and encoding remain intact; only
 redacted canonical forms are returned or persisted. Relevant web, URL, GitHub, and image operations run
 concurrently. The normal research pipeline still performs source selection,
@@ -330,15 +332,16 @@ public product name, so callers should still avoid placing secrets or sensitive
 identifiers in research requests and should use a trusted research-model
 endpoint.
 
-After acquisition, the model reviews the bounded evidence once. It may request
-at most one focused follow-up round, controlled by
-`RESEARCH_AGENT_MAX_FOLLOW_UP_ROUNDS`. It then writes from numbered evidence
-only. Citation IDs, paragraph/list-item coverage, and lexical evidence alignment
-are validated before IDs are converted to clickable source links. Model-authored
-links, images, active URL schemes, and raw HTML are removed. One citation-repair
-attempt is allowed before synthesis fails closed. These checks reduce unsupported
-claims but do not establish semantic entailment or factual truth.
-Planning, review, and synthesis have independent 30, 20, and 60 second defaults.
+Interactive calls skip the separate evidence-review model call and use one short
+deterministic rescue search only when initial acquisition returns nothing. Deep
+work may review the bounded evidence once and request at most one focused
+follow-up round, controlled by `RESEARCH_AGENT_MAX_FOLLOW_UP_ROUNDS`. The model
+writes from numbered evidence only. Citation IDs, paragraph/list-item coverage,
+and lexical evidence alignment are validated before IDs become clickable links.
+If synthesis or citation repair misses the interactive deadline, the server
+returns a clearly marked cited evidence digest instead of an unfinished job.
+These checks reduce unsupported claims but do not establish semantic entailment
+or factual truth.
 
 Image discovery uses a small SearXNG image-engine set and returns titles,
 resolution metadata, and validated source-page links. Direct image and thumbnail
@@ -388,9 +391,9 @@ proposals should be eligible. The unified assistant also bounds quick-mode
 planning and synthesis and disables rendered-browser verification by default so
 short-timeout MCP clients receive a useful result promptly. Set
 `RESEARCH_AGENT_QUICK_VERIFY=true` when rendered pages are more important than
-latency. The high-level assistant's `auto` mode uses `quick` by default for the
-same reason; set `RESEARCH_ASSISTANT_AUTO_MODE=balanced`, `technical`,
-`academic`, or `deep` when the connected client allows longer tool calls.
+latency. The high-level assistant's `auto` mode classifies each request by
+default; set `RESEARCH_ASSISTANT_AUTO_MODE=quick`, `balanced`, `technical`, or
+`academic` only when every automatic request should use that fixed profile.
 `local_only` performs no web search and therefore never uses proposed queries.
 
 Omitting `proposed_queries` preserves the previous deterministic planning path,
@@ -647,10 +650,12 @@ Configure the client for Streamable HTTP at
 `http://research-mcp:8001/mcp`, or replace the hostname with the value of
 `MCP_CLIENT_ALIAS`. Plain HTTP is appropriate only for a trusted, same-host
 Docker network; use a TLS reverse proxy across hosts or untrusted networks.
-The default synchronous wait for `research_assistant` is 45 seconds. The
-assistant's default `auto` execution is the bounded quick path, so clients that
-cancel around 60 seconds normally receive a finished answer; an explicitly
-deeper mode may instead return a durable running-job response.
+The default synchronous wait for `research_assistant` is 45 seconds. Ordinary
+assistant modes receive a 36-second worker budget measured from enqueue time,
+leaving delivery margin before clients cancel around 60 seconds. Slow
+acquisition paths are cancelled and completed evidence is retained; slow final
+synthesis falls back to a cited evidence digest. Explicit `deep` work may still
+return a durable running-job response.
 `MCP_CLIENT_TIMEOUT_SECONDS` (60 by default) and
 `MCP_SYNC_RESPONSE_SAFETY_SECONDS` (15 by default) enforce that bound. Set the
 client timeout to `0` only when every connected client supports longer calls.
@@ -690,10 +695,11 @@ beyond its own loopback interface. Compose passes that token only to Crawl4AI
 and the isolated `web-runner`, which sends it as a bearer credential. Replace
 the placeholder in `.env` before enabling the profile on a VPS. Compose builds
 `CRAWL4AI_DERIVED_IMAGE` from the pinned upstream image and overlays only its
-localhost pinning proxy. That proxy resolves and pins public destinations, then
-tunnels the pinned IP through `safe-egress`; the Crawl4AI container remains on
-the internal-only browser network. Always include `--build` after changing the
-upstream image pin or overlay.
+localhost egress proxy. The proxy normalizes the requested hostname and sends it
+through `safe-egress`, where DNS resolution, public-address validation, and
+connection pinning occur; the Crawl4AI container remains on the internal-only
+browser network. Always include `--build` after changing the upstream image pin
+or overlay.
 
 ```console
 # Start either profile
@@ -787,14 +793,18 @@ socket/routing design rather than this command.
 Stop containers without deleting research state:
 
 ```console
-docker compose down
+docker compose --profile crawl4ai --profile reranker down
 ```
+
+Include every optional profile that may have been started. Otherwise Compose can
+leave that profile's container running and fail to remove the shared project
+network.
 
 Deleting named volumes permanently removes queue state, vector memory, cached
 models, and artifacts:
 
 ```console
-docker compose down --volumes
+docker compose --profile crawl4ai --profile reranker down --volumes
 ```
 
 ## Configuration

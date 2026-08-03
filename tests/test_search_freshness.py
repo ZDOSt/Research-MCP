@@ -783,7 +783,7 @@ async def test_searx_request_applies_policy_and_surfaces_engine_diagnostics(monk
             }
         ],
         "unresponsive_engines": [
-            ["bing news", "timeout"],
+            ["reuters", "timeout"],
             {"engine": "example engine", "reason": "rate limited"},
         ],
     }
@@ -829,7 +829,7 @@ async def test_searx_request_applies_policy_and_surfaces_engine_diagnostics(monk
         "q": "today's AI news 2026-07-13",
         "format": "json",
         "language": "en",
-        "engines": "reuters,bing news",
+        "engines": "reuters,bing",
         "time_range": "day",
     }
     assert captured[0]["headers"] == {
@@ -839,6 +839,6 @@ async def test_searx_request_applies_policy_and_surfaces_engine_diagnostics(monk
     assert results.diagnostics["search_policy"]["target_date"] == "2026-07-13"
     assert results.diagnostics["counts"]["exact_match_results"] == 1
     assert results.diagnostics["unresponsive_engines"] == [
-        {"engine": "bing news", "reason_code": "timeout"},
+        {"engine": "reuters", "reason_code": "timeout"},
         {"engine": "example engine", "reason_code": "rate_limited"},
     ]

@@ -17,8 +17,14 @@ async def test_proposed_primary_cannot_resolve_without_canonical_relevance(monke
     proposed = "Docker container network fixes"
     canonical = "install SillyTavern on Ubuntu using Docker"
 
-    async def plan(query, mode, proposed_queries=None):
-        planner_inputs.append(proposed_queries)
+    async def plan(
+        query,
+        mode,
+        proposed_queries=None,
+        *,
+        allow_model_planning=True,
+    ):
+        planner_inputs.append((proposed_queries, allow_model_planning))
         return {
             "query": query,
             "mode": mode,
@@ -75,9 +81,10 @@ async def test_proposed_primary_cannot_resolve_without_canonical_relevance(monke
         verify=False,
         persist_source_artifacts=False,
         proposed_queries=[proposed],
+        allow_model_planning=False,
     )
 
-    assert planner_inputs == [[proposed]]
+    assert planner_inputs == [([proposed], False)]
     assert calls == [proposed, canonical]
     assert result["plan"]["intent_contexts"] == {"install": canonical}
     assert all("network-" not in item["url"] for item in result["searched"])
@@ -232,6 +239,55 @@ async def test_search_batch_cancellation_stops_owned_searches(monkeypatch):
         await task
     await asyncio.wait_for(stopped.wait(), timeout=0.2)
     assert active == 0
+
+
+@pytest.mark.asyncio
+async def test_search_batch_harvests_result_finished_at_timeout_boundary(monkeypatch):
+    budgets = []
+
+    async def search(**kwargs):
+        budgets.append(kwargs["time_budget_seconds"])
+        await asyncio.sleep(0)
+        return [kwargs["query"]]
+
+    async def boundary_wait(tasks, *, timeout):
+        assert timeout > 0
+        await asyncio.gather(*tasks)
+        # Model the event-loop boundary where wait's timeout snapshot misses a
+        # task that is complete by the time the caller resumes.
+        return set(), set(tasks)
+
+    monkeypatch.setattr(pipelines, "searxng_search", search)
+    monkeypatch.setattr(pipelines.asyncio, "wait", boundary_wait)
+
+    outcomes = await pipelines._run_search_batch_bounded(
+        ["current guide"],
+        [None],
+        max_results=4,
+        mode="balanced",
+        timeout_seconds=0.5,
+    )
+
+    assert outcomes == [["current guide"]]
+    assert len(budgets) == 1
+    assert 0 < budgets[0] < 0.5
+
+
+@pytest.mark.asyncio
+async def test_search_batch_does_not_extend_a_nearly_exhausted_budget(monkeypatch):
+    search = AsyncMock(return_value=["unexpected"])
+    monkeypatch.setattr(pipelines, "searxng_search", search)
+
+    outcomes = await pipelines._run_search_batch_bounded(
+        ["one", "two"],
+        [None, None],
+        max_results=4,
+        mode="quick",
+        timeout_seconds=0.1,
+    )
+
+    search.assert_not_awaited()
+    assert all(isinstance(outcome, TimeoutError) for outcome in outcomes)
 
 
 def test_search_query_waves_keep_one_primary_and_one_reserve_per_intent():
@@ -1499,7 +1555,7 @@ async def test_research_uses_one_date_safe_recovery_and_surfaces_diagnostics(
     async def plan(query, mode):
         return {"query": query, "mode": mode, "queries": ["today's AI news"]}
 
-    async def search(*, query, max_results, mode, policy):
+    async def search(*, query, max_results, mode, policy, time_budget_seconds=None):
         calls.append(policy)
         if len(calls) == 1:
             return SearchResults(
@@ -1613,7 +1669,7 @@ async def test_historical_exact_date_uses_a_distinct_date_safe_repair(monkeypatc
     async def plan(_query, mode):
         return {"query": query, "mode": mode, "queries": [query]}
 
-    async def search(*, query, max_results, mode, policy):
+    async def search(*, query, max_results, mode, policy, time_budget_seconds=None):
         calls.append((query, policy))
         return SearchResults([], policy=policy)
 
@@ -2037,6 +2093,93 @@ async def test_persistence_timeout_returns_extraction_and_invalidates_attempt(
 
 
 @pytest.mark.asyncio
+async def test_caller_budget_bounds_persistence_invalidation(monkeypatch):
+    candidate = {
+        "title": "Current guide",
+        "url": "https://docs.example/current",
+        "domain": "docs.example",
+        "snippet": "Current installation guide for the supported release.",
+        "score": 10,
+        "score_reasons": [],
+    }
+    persistence_cancelled = asyncio.Event()
+    invalidation_started = asyncio.Event()
+    release_invalidation = asyncio.Event()
+    invalidation_finished = asyncio.Event()
+
+    async def plan(query, mode):
+        return {"query": query, "mode": mode, "queries": [query]}
+
+    async def search(**_kwargs):
+        return [candidate]
+
+    async def crawl(_semaphore, source, **_kwargs):
+        return {
+            "ok": True,
+            "title": source["title"],
+            "url": source["url"],
+            "requested_url": source["url"],
+            "domain": source["domain"],
+            "evidence_text": "Current installation instructions for the supported release.",
+        }
+
+    async def persist(*_args, **_kwargs):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            persistence_cancelled.set()
+
+    async def invalidate(attempt_id, *, reason):
+        assert attempt_id == "caller-bounded-persistence"
+        assert reason == "research_persistence_timed_out"
+        invalidation_started.set()
+        await release_invalidation.wait()
+        invalidation_finished.set()
+        return {"invalidated": 0}
+
+    monkeypatch.setitem(
+        pipelines.RESEARCH_MODE_CONFIG,
+        "balanced",
+        {
+            "max_urls": 1,
+            "search_results": 1,
+            "top_k": 0,
+            "planner_budget": 0.01,
+            "search_budget": 0.2,
+            "crawl_budget": 1,
+            "total_budget": 30,
+        },
+    )
+    monkeypatch.setattr(pipelines, "build_research_plan", plan)
+    monkeypatch.setattr(pipelines, "searxng_search", search)
+    monkeypatch.setattr(pipelines, "crawl_source_limited", crawl)
+    monkeypatch.setattr(pipelines, "persist_crawled_source_limited", persist)
+    monkeypatch.setattr(pipelines, "invalidate_ingestion_attempt_impl", invalidate)
+
+    time_budget = 0.5
+    started = time.monotonic()
+    result = await pipelines.research_pipeline(
+        "current installation guide for the supported release",
+        max_sources=1,
+        verify=False,
+        persist_source_artifacts=False,
+        defer_persistence=False,
+        ingestion_attempt_id="caller-bounded-persistence",
+        time_budget_seconds=time_budget,
+    )
+    elapsed = time.monotonic() - started
+
+    assert elapsed < time_budget + 0.15
+    assert persistence_cancelled.is_set()
+    assert invalidation_started.is_set()
+    assert result["persistence"]["invalidation"]["status"] == "pending"
+    assert result["latency_budget"]["acquisition_seconds"] < time_budget
+
+    release_invalidation.set()
+    await asyncio.wait_for(invalidation_finished.wait(), timeout=0.2)
+
+
+@pytest.mark.asyncio
 async def test_bounded_invalidation_reports_failure_without_raising(monkeypatch):
     async def fail_invalidation(_attempt_id, *, reason):
         assert reason == "research_persistence_timed_out"
@@ -2187,6 +2330,55 @@ async def test_inline_cancellation_waits_for_attempt_invalidation(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_caller_budget_bounds_cancellation_invalidation(monkeypatch):
+    request_started = asyncio.Event()
+    invalidation_started = asyncio.Event()
+    release_invalidation = asyncio.Event()
+    invalidation_finished = asyncio.Event()
+
+    async def implementation(**_kwargs):
+        request_started.set()
+        await asyncio.Event().wait()
+
+    async def invalidate(attempt_id, *, reason):
+        assert attempt_id == "caller-bounded-cancellation"
+        assert reason == "research_request_cancelled"
+        invalidation_started.set()
+        await release_invalidation.wait()
+        invalidation_finished.set()
+        return {"invalidated": 0}
+
+    async def release_later():
+        await asyncio.sleep(0.5)
+        release_invalidation.set()
+
+    monkeypatch.setattr(pipelines, "_research_pipeline_impl", implementation)
+    monkeypatch.setattr(pipelines, "invalidate_ingestion_attempt_impl", invalidate)
+
+    time_budget = 0.2
+    task = asyncio.create_task(
+        pipelines.research_pipeline(
+            "cancelled bounded request",
+            ingestion_attempt_id="caller-bounded-cancellation",
+            time_budget_seconds=time_budget,
+        )
+    )
+    await request_started.wait()
+    release_task = asyncio.create_task(release_later())
+    started = time.monotonic()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    elapsed = time.monotonic() - started
+
+    assert elapsed < time_budget + 0.15
+    assert invalidation_started.is_set()
+    await release_task
+    await asyncio.wait_for(invalidation_finished.wait(), timeout=0.2)
+
+
+@pytest.mark.asyncio
 async def test_deferred_research_returns_fresh_evidence_without_qdrant_round_trip(
     monkeypatch,
     tmp_path,
@@ -2268,6 +2460,83 @@ async def test_deferred_research_returns_fresh_evidence_without_qdrant_round_tri
         "answer now from evidence" in instruction
         for instruction in result["answering_instructions"]
     )
+
+
+@pytest.mark.asyncio
+async def test_cancellation_during_deferred_staging_cancels_owned_tasks(monkeypatch):
+    candidate = {
+        "title": "Current installation guide",
+        "url": "https://docs.example/install",
+        "domain": "docs.example",
+        "snippet": "Current installation instructions",
+        "score": 10,
+        "score_reasons": [],
+    }
+    staging_started = asyncio.Event()
+    staging_cancelled = asyncio.Event()
+
+    async def plan(query, mode):
+        return {"query": query, "mode": mode, "queries": [query]}
+
+    async def search(**_kwargs):
+        return [candidate]
+
+    async def crawl(_semaphore, source, **_kwargs):
+        return {
+            "ok": True,
+            "title": source["title"],
+            "url": source["url"],
+            "requested_url": source["url"],
+            "domain": source["domain"],
+            "evidence_text": "Run the supported installer and verify service health.",
+            "_content": "Run the supported installer and verify service health.",
+        }
+
+    async def stage(*_args, **_kwargs):
+        staging_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            staging_cancelled.set()
+
+    monkeypatch.setitem(
+        pipelines.RESEARCH_MODE_CONFIG,
+        "balanced",
+        {
+            "max_urls": 1,
+            "search_results": 1,
+            "top_k": 0,
+            "planner_budget": 0.2,
+            "search_budget": 0.2,
+            "crawl_budget": 1,
+            "total_budget": 5,
+        },
+    )
+    monkeypatch.setattr(pipelines, "build_research_plan", plan)
+    monkeypatch.setattr(pipelines, "searxng_search", search)
+    monkeypatch.setattr(pipelines, "crawl_source_limited", crawl)
+    monkeypatch.setattr(
+        pipelines,
+        "stage_crawled_source_for_deferred_persistence",
+        stage,
+    )
+
+    task = asyncio.create_task(
+        pipelines.research_pipeline(
+            "install the current release",
+            max_sources=1,
+            verify=False,
+            research_run_id="deferred-staging-cancellation",
+            defer_persistence=True,
+            ingestion_attempt_id="deferred-staging-attempt",
+        )
+    )
+    await staging_started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert staging_cancelled.is_set()
 
 
 @pytest.mark.asyncio
@@ -2494,9 +2763,9 @@ async def test_interactive_deadline_returns_snippet_evidence_instead_of_hanging(
             "search_results": 1,
             "top_k": 0,
             "planner_budget": 0.01,
-            "search_budget": 0.03,
+            "search_budget": 0.2,
             "crawl_budget": 0.03,
-            "total_budget": 0.08,
+            "total_budget": 30,
         },
     )
     monkeypatch.setattr(pipelines, "build_research_plan", slow_plan)
@@ -2511,6 +2780,7 @@ async def test_interactive_deadline_returns_snippet_evidence_instead_of_hanging(
         verify=False,
         persist_source_artifacts=False,
         defer_persistence=True,
+        time_budget_seconds=0.4,
     )
     elapsed = time.monotonic() - started
 
@@ -2519,6 +2789,8 @@ async def test_interactive_deadline_returns_snippet_evidence_instead_of_hanging(
     assert result["completion"]["status"] == "partial"
     assert result["evidence"][0]["evidence_type"] == "search_result_snippet"
     assert result["evidence"][0]["url"] == candidate["url"]
+    assert result["latency_budget"]["seconds"] == 0.4
+    assert result["latency_budget"]["acquisition_seconds"] < 0.4
 
 
 @pytest.mark.asyncio

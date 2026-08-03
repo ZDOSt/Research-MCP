@@ -3160,6 +3160,8 @@ async def build_research_plan(
     query: str,
     mode: str,
     proposed_queries: Optional[List[str]] = None,
+    *,
+    allow_model_planning: bool = True,
 ) -> Dict[str, Any]:
     proposed_queries = normalize_proposed_queries(proposed_queries)
     fallback = deterministic_plan(query, mode)
@@ -3181,7 +3183,10 @@ async def build_research_plan(
         )
         if fallback.get("proposed_query_handling", {}).get("accepted"):
             return fallback
-    if budget == 0 or not research_model_configured():
+    # An upstream orchestrator can suppress only the optional model call. Its
+    # proposals were still validated above, and rejected proposals retain the
+    # canonical deterministic plan.
+    if budget == 0 or not allow_model_planning or not research_model_configured():
         return fallback
 
     focused_queries = [item[0] for item in focused_intents]
