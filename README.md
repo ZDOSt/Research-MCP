@@ -308,6 +308,10 @@ create logical Qdrant partitions and authorization boundaries.
 ### Unified orchestration
 
 `research_assistant(request, mode="auto")` accepts the complete private request.
+With the default configuration, `auto` runs the bounded quick path so a client
+with a roughly 60-second tool timeout receives a finished answer. Explicitly
+request `balanced`, `technical`, `academic`, or `deep` for a larger evidence
+budget, or set `RESEARCH_ASSISTANT_AUTO_MODE` for clients that support it.
 Before any content crosses the configured research-model boundary, the server
 redacts credential patterns, signed/session URL values, common PII,
 private-context phrases, addresses, and host paths. Only normalized, bounded,
@@ -378,9 +382,15 @@ and expansion-only results cannot by themselves mark the original intent
 resolved. Search-form additions
 such as official documentation, primary sources, release notes, GitHub issues,
 benchmarks, specifications, and reviews remain normal calling-model queries.
-Because `quick` mode has a
-one-query budget, it deliberately keeps only the deterministic anchor; use a
-larger mode such as `balanced` or `technical` when proposals should be eligible.
+Because `quick` mode has a one-query budget, it deliberately keeps only the
+deterministic anchor; use a larger mode such as `balanced` or `technical` when
+proposals should be eligible. The unified assistant also bounds quick-mode
+planning and synthesis and disables rendered-browser verification by default so
+short-timeout MCP clients receive a useful result promptly. Set
+`RESEARCH_AGENT_QUICK_VERIFY=true` when rendered pages are more important than
+latency. The high-level assistant's `auto` mode uses `quick` by default for the
+same reason; set `RESEARCH_ASSISTANT_AUTO_MODE=balanced`, `technical`,
+`academic`, or `deep` when the connected client allows longer tool calls.
 `local_only` performs no web search and therefore never uses proposed queries.
 
 Omitting `proposed_queries` preserves the previous deterministic planning path,
@@ -467,7 +477,7 @@ bounded best-evidence result. A typical explicitly durable/deep flow is:
    `get_research_artifact` to read a bounded copy later.
 
 `research_web` and `investigate_url` use the primary queue under Compose and wait
-for up to `MCP_SYNC_JOB_WAIT_SECONDS` (60 seconds by default). Quick, balanced,
+for up to `MCP_SYNC_JOB_WAIT_SECONDS` (45 seconds by default). Quick, balanced,
 web-only, technical, and academic work all have shorter internal best-evidence
 deadlines. Deep mode is the intentionally long-running option.
 Exact active requests are coalesced by authenticated owner, job kind, and
@@ -637,11 +647,17 @@ Configure the client for Streamable HTTP at
 `http://research-mcp:8001/mcp`, or replace the hostname with the value of
 `MCP_CLIENT_ALIAS`. Plain HTTP is appropriate only for a trusted, same-host
 Docker network; use a TLS reverse proxy across hosts or untrusted networks.
-Client tool-call timeouts should exceed
-`RESEARCH_ASSISTANT_SYNC_WAIT_SECONDS` (240 seconds by default) when using
-`research_assistant`. Clients with shorter limits should select the `advanced`
-profile and use `start_research` followed by one bounded `research_job` call;
-the unified profile intentionally does not expose those lower-level tools.
+The default synchronous wait for `research_assistant` is 45 seconds. The
+assistant's default `auto` execution is the bounded quick path, so clients that
+cancel around 60 seconds normally receive a finished answer; an explicitly
+deeper mode may instead return a durable running-job response.
+`MCP_CLIENT_TIMEOUT_SECONDS` (60 by default) and
+`MCP_SYNC_RESPONSE_SAFETY_SECONDS` (15 by default) enforce that bound. Set the
+client timeout to `0` only when every connected client supports longer calls.
+Clients that still have shorter limits should use the quick mode or lower
+`MCP_SYNC_RESPONSE_SAFETY_SECONDS`; clients that support durable continuation
+can select the `advanced` profile and use `start_research` followed by one
+bounded `research_job` call.
 
 LibreChat also blocks private MCP destinations by default. Allow the exact
 private socket rather than disabling SSRF protection:

@@ -127,10 +127,40 @@ def _mcp_tool(exposure: str):
     return decorate
 
 JOB_BACKEND = os.getenv("JOB_BACKEND", "inline").strip().lower()
-MCP_SYNC_JOB_WAIT_SECONDS = float(os.getenv("MCP_SYNC_JOB_WAIT_SECONDS", "60"))
-RESEARCH_ASSISTANT_SYNC_WAIT_SECONDS = max(
+MCP_CLIENT_TIMEOUT_SECONDS = max(
     0.0,
-    float(os.getenv("RESEARCH_ASSISTANT_SYNC_WAIT_SECONDS", "240")),
+    float(os.getenv("MCP_CLIENT_TIMEOUT_SECONDS", "60")),
+)
+MCP_SYNC_RESPONSE_SAFETY_SECONDS = max(
+    0.0,
+    float(os.getenv("MCP_SYNC_RESPONSE_SAFETY_SECONDS", "15")),
+)
+
+
+def _client_bounded_wait(value: str, default: float) -> float:
+    """Keep synchronous durable waits below common MCP client timeouts.
+
+    Streamable HTTP clients commonly cancel tool calls at 60 seconds. Returning
+    a durable job handle before that point avoids losing the response and keeps
+    the session usable. Set MCP_CLIENT_TIMEOUT_SECONDS=0 for an explicitly
+    unbounded client.
+    """
+    configured = max(0.0, float(os.getenv(value, str(default))))
+    if MCP_CLIENT_TIMEOUT_SECONDS <= 0:
+        return configured
+    return min(
+        configured,
+        max(0.0, MCP_CLIENT_TIMEOUT_SECONDS - MCP_SYNC_RESPONSE_SAFETY_SECONDS),
+    )
+
+
+MCP_SYNC_JOB_WAIT_SECONDS = _client_bounded_wait(
+    "MCP_SYNC_JOB_WAIT_SECONDS",
+    45,
+)
+RESEARCH_ASSISTANT_SYNC_WAIT_SECONDS = _client_bounded_wait(
+    "RESEARCH_ASSISTANT_SYNC_WAIT_SECONDS",
+    45,
 )
 MCP_JOB_POLL_SECONDS = max(0.1, float(os.getenv("MCP_JOB_POLL_SECONDS", "0.5")))
 MCP_JOB_LONG_POLL_SECONDS = max(
@@ -741,16 +771,11 @@ async def run_resilient(coro: Awaitable[dict], tool_name: str) -> dict:
     try:
         return await coro
     except asyncio.CancelledError:
-        context = runtime_retrieval_context()
-        return {
-            "error": "client_disconnected",
-            "tool": tool_name,
-            "retrieval_context": context,
-            "answering_instructions": [
-                "The MCP client disconnected before the tool response could be delivered.",
-                "Retry the request; the server stayed alive and did not intentionally reduce research depth.",
-            ],
-        }
+        # FastMCP's streamable HTTP responder marks the request complete when
+        # the client cancels it. Re-raising is essential: returning a value
+        # here makes FastMCP attempt a second response and crashes the session
+        # with "Request already responded to".
+        raise
 
 
 @_mcp_tool("unified")
@@ -772,8 +797,8 @@ async def research_assistant(
 
     Do not pre-plan subtools, split the request into multiple calls, or call this
     again after a completed response. Present answer_markdown directly. Use auto
-    unless the user explicitly requests quick, balanced, deep, technical, or
-    academic research. This tool requires RESEARCH_MODEL_BASE_URL and
+    for the server-configured bounded default, or explicitly request quick,
+    balanced, deep, technical, or academic research. This tool requires RESEARCH_MODEL_BASE_URL and
     RESEARCH_MODEL_NAME on the server; model credentials are never tool inputs.
     """
     request = _bounded_text(request, "request", MCP_MAX_QUERY_CHARS)

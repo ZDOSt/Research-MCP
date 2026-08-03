@@ -27,9 +27,11 @@ from browser import (
 from crawler import (
     CRAWL4AI_MAX_RESPONSE_BYTES,
     CRAWL4AI_TOTAL_TIMEOUT_SECONDS,
+    UnsafeURLError,
     _read_limited_response,
     validate_url_safety,
 )
+from redaction import redact_sensitive_text
 
 
 LOGGER = logging.getLogger("web-runner")
@@ -50,6 +52,27 @@ def crawl4ai_auth_headers() -> dict[str, str]:
     if not WEB_RUNNER_CRAWL4AI_API_TOKEN:
         return {}
     return {"Authorization": f"Bearer {WEB_RUNNER_CRAWL4AI_API_TOKEN}"}
+
+
+def _upstream_error_detail(body: bytes) -> str:
+    """Return a short, redacted Crawl4AI error for runner diagnostics."""
+    try:
+        detail = body.decode("utf-8", errors="replace")
+    except Exception:
+        detail = "<undecodable response>"
+    detail, _ = redact_sensitive_text(detail)
+    detail = " ".join(detail.split())
+    return detail[:500] or "<empty response>"
+
+
+def crawl4ai_http_timeout(total_timeout: float) -> httpx.Timeout:
+    """Allow Crawl4AI's non-streaming response to use its full crawl budget."""
+    return httpx.Timeout(
+        connect=15.0,
+        read=max(1.0, total_timeout + 5.0),
+        write=30.0,
+        pool=15.0,
+    )
 
 
 def require_isolated_runtime() -> None:
@@ -149,14 +172,27 @@ async def healthz() -> dict[str, bool]:
 
 @app.post("/v1/explore")
 async def explore(request: ExploreRequest) -> dict[str, Any]:
-    return await playwright_explore_page_local(
-        url=request.url,
-        labels=request.labels,
-        task=request.task,
-        max_chars=request.max_chars,
-        profile=request.profile,
-        timeout_ms=request.timeout_ms,
-    )
+    try:
+        return await playwright_explore_page_local(
+            url=request.url,
+            labels=request.labels,
+            task=request.task,
+            max_chars=request.max_chars,
+            profile=request.profile,
+            timeout_ms=request.timeout_ms,
+        )
+    except UnsafeURLError as exc:
+        LOGGER.info("Browser request rejected by egress policy: %s", type(exc).__name__)
+        raise HTTPException(status_code=400, detail="URL rejected by egress policy") from exc
+    except Exception as exc:
+        LOGGER.warning(
+            "Isolated browser exploration failed: %s",
+            _upstream_error_detail(str(exc).encode("utf-8", errors="replace")),
+        )
+        raise HTTPException(
+            status_code=502,
+            detail="Isolated browser exploration failed",
+        ) from exc
 
 
 def _crawl_urls(payload: dict[str, Any]) -> list[str]:
@@ -208,20 +244,35 @@ async def relay_crawl4ai(
             detail="Crawl4AI /md cannot be forced through the isolated proxy",
         )
 
-    forwarded_payload = await prepare_crawl_payload(payload)
-
     total_timeout = min(max(1.0, float(timeout_seconds)), CRAWL4AI_TOTAL_TIMEOUT_SECONDS)
     try:
+        forwarded_payload = await prepare_crawl_payload(payload)
         async with asyncio.timeout(total_timeout):
-            async with httpx.AsyncClient(timeout=httpx.Timeout(30.0), trust_env=False) as client:
+            # Crawl4AI returns a single response after the browser work is done;
+            # a fixed 30-second read timeout aborts valid cold or dynamic crawls.
+            # The outer asyncio timeout remains the hard end-to-end deadline.
+            client_timeout = crawl4ai_http_timeout(total_timeout)
+            async with httpx.AsyncClient(timeout=client_timeout, trust_env=False) as client:
                 async with client.stream(
                     "POST",
                     f"{WEB_RUNNER_CRAWL4AI_URL}/crawl",
                     headers=crawl4ai_auth_headers(),
                     json=forwarded_payload,
                 ) as upstream:
-                    upstream.raise_for_status()
                     body = await _read_limited_response(upstream, CRAWL4AI_MAX_RESPONSE_BYTES)
+                    if not upstream.is_success:
+                        LOGGER.warning(
+                            "Crawl4AI upstream returned HTTP %s: %s",
+                            upstream.status_code,
+                            _upstream_error_detail(body),
+                        )
+                        raise HTTPException(
+                            status_code=502,
+                            detail=(
+                                "Crawl4AI upstream returned HTTP "
+                                f"{upstream.status_code}"
+                            ),
+                        )
                     headers = {}
                     if upstream.headers.get("content-type"):
                         headers["content-type"] = upstream.headers["content-type"]
@@ -230,6 +281,9 @@ async def relay_crawl4ai(
                     return Response(content=body, status_code=upstream.status_code, headers=headers)
     except HTTPException:
         raise
+    except UnsafeURLError as exc:
+        LOGGER.info("Crawl4AI request rejected by egress policy: %s", type(exc).__name__)
+        raise HTTPException(status_code=400, detail="URL rejected by egress policy") from exc
     except Exception as exc:
         LOGGER.warning("Isolated Crawl4AI request failed: %s", type(exc).__name__)
         raise HTTPException(status_code=502, detail="Isolated Crawl4AI request failed") from exc

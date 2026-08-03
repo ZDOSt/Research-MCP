@@ -272,6 +272,67 @@ async def test_unified_agent_runs_at_most_one_follow_up_and_returns_finished_ans
 
 
 @pytest.mark.asyncio
+async def test_auto_mode_uses_bounded_quick_path_for_short_timeout_clients(monkeypatch):
+    plan = {
+        "mode": "quick",
+        "queries": ["official product setup documentation"],
+        "use_web_search": True,
+        "urls": [],
+        "github_repositories": [],
+        "github_searches": [],
+        "include_memory": False,
+        "include_images": False,
+        "image_query": "product setup",
+        "answer_focus": "installation",
+        "generated_by": "model:private-model",
+    }
+    pipeline = AsyncMock(
+        return_value={
+            "evidence": [_evidence()],
+            "completion": {"status": "complete"},
+            "plan": {"queries": ["official product setup documentation"]},
+        }
+    )
+    review = AsyncMock()
+    write = AsyncMock(
+        return_value={
+            "answer_markdown": "Use the documented command.",
+            "citations": [{"evidence_id": 1, "url": _evidence()["url"]}],
+            "citation_validation": {"valid": True},
+            "generated_by": "model:private-model",
+        }
+    )
+    planner = AsyncMock(return_value=plan)
+    monkeypatch.setattr(research_agent, "research_model_configured", lambda: True)
+    monkeypatch.setattr(research_agent, "RESEARCH_ASSISTANT_AUTO_MODE", "quick")
+    monkeypatch.setattr(research_agent, "build_assistant_plan", planner)
+    monkeypatch.setattr(research_agent, "research_pipeline", pipeline)
+    monkeypatch.setattr(research_agent, "_review_evidence", review)
+    monkeypatch.setattr(research_agent, "_write_answer", write)
+    monkeypatch.setattr(research_agent, "RESEARCH_AGENT_MAX_FOLLOW_UP_ROUNDS", 1)
+
+    result = await research_agent.run_research_assistant(
+        "How do I install the product?",
+        mode="auto",
+    )
+
+    assert result["status"] == "complete"
+    planner.assert_awaited_once_with(
+        "How do I install the product?",
+        "quick",
+        timeout_seconds=research_agent.RESEARCH_AGENT_QUICK_PLAN_TIMEOUT_SECONDS,
+    )
+    assert pipeline.await_args.kwargs["mode"] == "quick"
+    assert pipeline.await_args.kwargs["verify"] is False
+    review.assert_not_awaited()
+    write.assert_awaited_once()
+    assert (
+        write.await_args.kwargs["timeout_seconds"]
+        == research_agent.RESEARCH_AGENT_QUICK_SYNTHESIS_TIMEOUT_SECONDS
+    )
+
+
+@pytest.mark.asyncio
 async def test_public_web_fallback_redacts_complete_request(monkeypatch):
     plan = {
         "mode": "balanced",

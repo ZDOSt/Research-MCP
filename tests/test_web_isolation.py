@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import yaml
+from fastapi import HTTPException
 
 import browser
 import crawler
@@ -28,6 +29,39 @@ class FakeStreamingResponse:
     async def aiter_bytes(self):
         for chunk in self._chunks:
             yield chunk
+
+
+class FakeUpstreamResponse:
+    def __init__(self, status_code, chunks, headers=None):
+        self.status_code = status_code
+        self.is_success = 200 <= status_code < 300
+        self._chunks = chunks
+        self.headers = headers or {}
+        self.encoding = "utf-8"
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        return False
+
+    async def aiter_bytes(self):
+        for chunk in self._chunks:
+            yield chunk
+
+
+class FakeUpstreamClient:
+    def __init__(self, response):
+        self.response = response
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        return False
+
+    def stream(self, *args, **kwargs):
+        return self.response
 
 
 class FakePlaywrightManager:
@@ -221,6 +255,73 @@ class RunnerBoundaryTests(unittest.IsolatedAsyncioTestCase):
             )
         with patch.object(web_runner, "WEB_RUNNER_CRAWL4AI_API_TOKEN", ""):
             self.assertEqual(web_runner.crawl4ai_auth_headers(), {})
+
+    def test_runner_allows_crawl4ai_to_use_the_full_crawl_budget(self):
+        timeout = web_runner.crawl4ai_http_timeout(120.0)
+
+        self.assertEqual(timeout.connect, 15.0)
+        self.assertEqual(timeout.read, 125.0)
+        self.assertEqual(timeout.write, 30.0)
+        self.assertEqual(timeout.pool, 15.0)
+
+    def test_runner_redacts_crawl4ai_upstream_error_details(self):
+        detail = web_runner._upstream_error_detail(
+            b'{"error":"request failed?token=super-secret-value"}'
+        )
+
+        self.assertNotIn("super-secret-value", detail)
+        self.assertIn("REDACTED", detail)
+
+    async def test_runner_converts_crawl4ai_upstream_errors_to_controlled_502(self):
+        response = FakeUpstreamResponse(
+            500,
+            [b'{"error":"upstream failed?token=super-secret-value"}'],
+        )
+        with patch.object(
+            web_runner,
+            "prepare_crawl_payload",
+            new=AsyncMock(return_value={"urls": ["https://example.com"]}),
+        ), patch.object(
+            web_runner.httpx,
+            "AsyncClient",
+            return_value=FakeUpstreamClient(response),
+        ):
+            with self.assertRaises(HTTPException) as raised:
+                await web_runner.relay_crawl4ai(
+                    "crawl",
+                    {"urls": ["https://example.com"]},
+                    timeout_seconds=30,
+                )
+
+        self.assertEqual(raised.exception.status_code, 502)
+        self.assertEqual(
+            raised.exception.detail,
+            "Crawl4AI upstream returned HTTP 500",
+        )
+
+    async def test_browser_route_maps_runtime_failures_to_controlled_status(self):
+        request = web_runner.ExploreRequest(url="https://example.com")
+        with patch.object(
+            web_runner,
+            "playwright_explore_page_local",
+            new=AsyncMock(side_effect=RuntimeError("browser failed")),
+        ):
+            with self.assertRaises(HTTPException) as context:
+                await web_runner.explore(request)
+
+        self.assertEqual(context.exception.status_code, 502)
+
+    async def test_browser_route_rejects_unsafe_urls_without_raw_500(self):
+        request = web_runner.ExploreRequest(url="https://example.com")
+        with patch.object(
+            web_runner,
+            "playwright_explore_page_local",
+            new=AsyncMock(side_effect=crawler.UnsafeURLError("private address")),
+        ):
+            with self.assertRaises(HTTPException) as context:
+                await web_runner.explore(request)
+
+        self.assertEqual(context.exception.status_code, 400)
 
     def test_runner_requires_both_network_marker_and_socks_proxy(self):
         with patch.dict(
@@ -683,11 +784,23 @@ class ComposeIsolationTests(unittest.TestCase):
         )
         self.assertEqual(
             gateway_environment["MCP_SYNC_JOB_WAIT_SECONDS"],
-            "${MCP_SYNC_JOB_WAIT_SECONDS:-60}",
+            "${MCP_SYNC_JOB_WAIT_SECONDS:-45}",
         )
         self.assertEqual(
             gateway_environment["RESEARCH_ASSISTANT_SYNC_WAIT_SECONDS"],
-            "${RESEARCH_ASSISTANT_SYNC_WAIT_SECONDS:-240}",
+            "${RESEARCH_ASSISTANT_SYNC_WAIT_SECONDS:-45}",
+        )
+        self.assertEqual(
+            gateway_environment["MCP_CLIENT_TIMEOUT_SECONDS"],
+            "${MCP_CLIENT_TIMEOUT_SECONDS:-60}",
+        )
+        self.assertEqual(
+            gateway_environment["MCP_SYNC_RESPONSE_SAFETY_SECONDS"],
+            "${MCP_SYNC_RESPONSE_SAFETY_SECONDS:-15}",
+        )
+        self.assertEqual(
+            worker_environment["RESEARCH_ASSISTANT_AUTO_MODE"],
+            "${RESEARCH_ASSISTANT_AUTO_MODE:-quick}",
         )
         self.assertEqual(
             gateway_environment["RESEARCH_ADMISSION_MAX_ACTIVE"],

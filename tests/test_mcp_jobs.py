@@ -1,3 +1,4 @@
+import asyncio
 import importlib.util
 import hashlib
 import os
@@ -104,6 +105,45 @@ def load_mcp_server(*, backend="redis", auth_token=""):
 
 
 class MCPJobIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    def test_synchronous_waits_stay_inside_client_timeout(self):
+        with patch.dict(
+            os.environ,
+            {
+                "MCP_CLIENT_TIMEOUT_SECONDS": "60",
+                "MCP_SYNC_RESPONSE_SAFETY_SECONDS": "15",
+                "MCP_SYNC_JOB_WAIT_SECONDS": "45",
+                "RESEARCH_ASSISTANT_SYNC_WAIT_SECONDS": "45",
+            },
+            clear=False,
+        ):
+            server = load_mcp_server()
+        self.assertEqual(server.MCP_SYNC_JOB_WAIT_SECONDS, 45.0)
+        self.assertEqual(server.RESEARCH_ASSISTANT_SYNC_WAIT_SECONDS, 45.0)
+
+        with patch.dict(
+            os.environ,
+            {
+                "MCP_CLIENT_TIMEOUT_SECONDS": "30",
+                "MCP_SYNC_RESPONSE_SAFETY_SECONDS": "5",
+                "MCP_SYNC_JOB_WAIT_SECONDS": "60",
+                "RESEARCH_ASSISTANT_SYNC_WAIT_SECONDS": "60",
+            },
+            clear=False,
+        ):
+            bounded = load_mcp_server()
+
+        self.assertEqual(bounded.MCP_SYNC_JOB_WAIT_SECONDS, 25.0)
+        self.assertEqual(bounded.RESEARCH_ASSISTANT_SYNC_WAIT_SECONDS, 25.0)
+
+    async def test_run_resilient_propagates_client_cancellation(self):
+        server = load_mcp_server()
+
+        async def cancelled_operation():
+            raise asyncio.CancelledError
+
+        with self.assertRaises(asyncio.CancelledError):
+            await server.run_resilient(cancelled_operation(), "research_web")
+
     async def test_start_research_enqueues_complete_scoped_payload(self):
         server = load_mcp_server()
         job_id = uuid.uuid4().hex

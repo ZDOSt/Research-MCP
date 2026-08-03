@@ -64,6 +64,23 @@ RESEARCH_AGENT_SYNTHESIS_TIMEOUT_SECONDS = max(
     1.0,
     float(os.getenv("RESEARCH_AGENT_SYNTHESIS_TIMEOUT_SECONDS", "60")),
 )
+RESEARCH_AGENT_QUICK_PLAN_TIMEOUT_SECONDS = max(
+    1.0,
+    float(os.getenv("RESEARCH_AGENT_QUICK_PLAN_TIMEOUT_SECONDS", "8")),
+)
+RESEARCH_AGENT_QUICK_SYNTHESIS_TIMEOUT_SECONDS = max(
+    1.0,
+    float(os.getenv("RESEARCH_AGENT_QUICK_SYNTHESIS_TIMEOUT_SECONDS", "25")),
+)
+RESEARCH_AGENT_QUICK_VERIFY = os.getenv(
+    "RESEARCH_AGENT_QUICK_VERIFY", "false"
+).strip().lower() in {"1", "true", "yes", "on"}
+_RESEARCH_ASSISTANT_MODES = {"quick", "balanced", "deep", "technical", "academic"}
+RESEARCH_ASSISTANT_AUTO_MODE = os.getenv(
+    "RESEARCH_ASSISTANT_AUTO_MODE", "quick"
+).strip().lower()
+if RESEARCH_ASSISTANT_AUTO_MODE not in _RESEARCH_ASSISTANT_MODES:
+    RESEARCH_ASSISTANT_AUTO_MODE = "quick"
 
 _URL_RE = re.compile(r"https?://[^\s<>\]\[(){}\"']+", re.I)
 _GITHUB_REPOSITORY_URL_RE = re.compile(
@@ -539,8 +556,18 @@ def _normalize_plan(
     }
 
 
-async def build_assistant_plan(request: str, mode: str = "auto") -> Dict[str, Any]:
-    async with asyncio.timeout(RESEARCH_AGENT_PLAN_TIMEOUT_SECONDS):
+async def build_assistant_plan(
+    request: str,
+    mode: str = "auto",
+    *,
+    timeout_seconds: Optional[float] = None,
+) -> Dict[str, Any]:
+    effective_timeout = (
+        RESEARCH_AGENT_PLAN_TIMEOUT_SECONDS
+        if timeout_seconds is None
+        else max(1.0, float(timeout_seconds))
+    )
+    async with asyncio.timeout(effective_timeout):
         content = await _chat(
             [
             {
@@ -1197,10 +1224,16 @@ async def _write_answer(
     *,
     answer_focus: str = "",
     images: Optional[List[dict]] = None,
+    timeout_seconds: Optional[float] = None,
 ) -> Dict[str, Any]:
     model_evidence = _compact_evidence(evidence)
     model_images = _compact_images_for_model(images or [])
-    async with asyncio.timeout(RESEARCH_AGENT_SYNTHESIS_TIMEOUT_SECONDS):
+    effective_timeout = (
+        RESEARCH_AGENT_SYNTHESIS_TIMEOUT_SECONDS
+        if timeout_seconds is None
+        else max(1.0, float(timeout_seconds))
+    )
+    async with asyncio.timeout(effective_timeout):
         messages = [
             {
                 "role": "system",
@@ -1334,13 +1367,29 @@ async def run_research_assistant(
             "retrieval_context": retrieval_context,
         }
 
+    # Most MCP clients impose a roughly one-minute tool timeout and do not
+    # automatically resume durable jobs. Keep the high-level auto path inside
+    # that envelope; callers can select a deeper mode explicitly or configure
+    # RESEARCH_ASSISTANT_AUTO_MODE for clients with a longer timeout.
+    effective_mode = (
+        RESEARCH_ASSISTANT_AUTO_MODE if mode == "auto" else mode
+    )
+
     planning_warning = None
     try:
-        plan = await build_assistant_plan(request, mode)
+        if effective_mode == "quick":
+            plan = await build_assistant_plan(
+                request,
+                effective_mode,
+                timeout_seconds=RESEARCH_AGENT_QUICK_PLAN_TIMEOUT_SECONDS,
+            )
+        else:
+            plan = await build_assistant_plan(request, effective_mode)
     except Exception as exc:
         planning_warning = _safe_model_error(exc)
-        plan = deterministic_assistant_plan(request, mode)
+        plan = deterministic_assistant_plan(request, effective_mode)
 
+    quick_mode = plan.get("mode") == "quick"
     execution_urls = list(plan.get("_execution_urls") or plan.get("urls") or [])
     serialized_plan = _public_plan(plan)
     public_request, public_query_redactions = _public_research_task(request, plan)
@@ -1348,7 +1397,10 @@ async def run_research_assistant(
         "query": public_request,
         "mode": plan["mode"],
         "max_sources": _MODE_MAX_SOURCES[plan["mode"]],
-        "verify": True,
+        # Quick mode is deliberately bounded for clients with short MCP
+        # request timeouts. Direct extraction and search snippets remain
+        # available; rendered-browser verification is opt-in for this mode.
+        "verify": (not quick_mode) or RESEARCH_AGENT_QUICK_VERIFY,
         "namespace": namespace,
         "include_memory": plan["include_memory"],
         "synthesize": False,
@@ -1414,7 +1466,7 @@ async def run_research_assistant(
     evidence = _merge_evidence(*evidence_groups)
     follow_up = {"attempted": False, "reason": "not_needed", "queries": []}
     follow_up_result: Dict[str, Any] = {}
-    if not evidence and RESEARCH_AGENT_MAX_FOLLOW_UP_ROUNDS:
+    if not evidence and RESEARCH_AGENT_MAX_FOLLOW_UP_ROUNDS and not quick_mode:
         fallback_plan = deterministic_assistant_plan(request, "balanced")
         fallback_queries = fallback_plan["queries"] or [public_request]
         follow_up.update(
@@ -1446,7 +1498,7 @@ async def run_research_assistant(
             acquisition_errors.append(
                 {"source": "no_evidence_fallback", "error": type(exc).__name__}
             )
-    elif evidence and RESEARCH_AGENT_MAX_FOLLOW_UP_ROUNDS:
+    elif evidence and RESEARCH_AGENT_MAX_FOLLOW_UP_ROUNDS and not quick_mode:
         try:
             review = await _review_evidence(request, evidence)
         except Exception as exc:
@@ -1496,12 +1548,15 @@ async def run_research_assistant(
 
     if evidence:
         try:
-            written = await _write_answer(
-                request,
-                evidence,
-                answer_focus=plan.get("answer_focus", ""),
-                images=images,
-            )
+            write_kwargs = {
+                "answer_focus": plan.get("answer_focus", ""),
+                "images": images,
+            }
+            if quick_mode:
+                write_kwargs["timeout_seconds"] = (
+                    RESEARCH_AGENT_QUICK_SYNTHESIS_TIMEOUT_SECONDS
+                )
+            written = await _write_answer(request, evidence, **write_kwargs)
         except Exception as exc:
             response = {
                 "status": "partial",
