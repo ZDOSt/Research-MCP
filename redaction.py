@@ -1,3 +1,4 @@
+import ipaddress
 import re
 from typing import List, Tuple
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -131,7 +132,10 @@ _URL_PARAMETER_ASSIGNMENT_RE = re.compile(
 PUBLIC_QUERY_PATTERNS: List[Tuple[re.Pattern[str], str]] = [
     (re.compile(r"(?<!\d)\d{3}-\d{2}-\d{4}(?!\d)"), "[REDACTED_ID]"),
     (
-        re.compile(r"(?<!\d)(?:\d{1,3}\.){3}\d{1,3}(?!\d)"),
+        re.compile(
+            r"(?<!\d)(?:\d{1,3}\.){3}\d{1,3}"
+            r"(?::\d{1,5})?(?:/[^\s<>\"']*)?(?![\d.])"
+        ),
         "[REDACTED_ADDRESS]",
     ),
     (
@@ -152,6 +156,18 @@ PUBLIC_QUERY_PATTERNS: List[Tuple[re.Pattern[str], str]] = [
     (
         re.compile(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b"),
         "[REDACTED_EMAIL]",
+    ),
+    (
+        re.compile(
+            r"(?i)(?<![\w.-])(?:"
+            r"localhost|"
+            r"(?:[a-z0-9](?:[a-z0-9-]{0,62})\.)+"
+            r"(?:internal|corp|home|lan|local|localdomain|localhost)|"
+            r"(?:[a-z0-9](?:[a-z0-9-]{0,62})\.)*home\.arpa"
+            r")(?:\.)?(?::\d{1,5})?"
+            r"(?:/[^\s<>\"']*)?(?![\w.-])"
+        ),
+        "[REDACTED_PRIVATE_HOST]",
     ),
     (
         re.compile(
@@ -190,6 +206,16 @@ _MODEL_INLINE_SECRET_RE = re.compile(
     r"\s*[=:]\s*)"
     r"(?!\$\{|<|example|changeme|\[REDACTED)([^\s,;#\"'<>]{6,})"
 )
+_BRACKETED_IPV6_RE = re.compile(
+    r"(?<![\w:])\[(?P<address>[0-9A-Fa-f:.]+(?:%[A-Za-z0-9_.-]+)?)\]"
+    r"(?::\d{1,5})?(?:/[^\s<>\"']*)?(?![\w:])"
+)
+_BARE_IPV6_RE = re.compile(
+    r"(?<![\w:])(?P<address>"
+    r"(?=[0-9A-Fa-f:]*:[0-9A-Fa-f:]*:)"
+    r"[0-9A-Fa-f:]{2,}(?:%[A-Za-z0-9_.-]+)?"
+    r")(?:/[^\s<>\"']*)?(?![\w:])"
+)
 
 
 def redact_sensitive_text(text: str) -> tuple[str, int]:
@@ -207,6 +233,21 @@ def redact_public_query_text(text: str) -> tuple[str, int]:
     for pattern, replacement in PUBLIC_QUERY_PATTERNS:
         output, replacements = pattern.subn(replacement, output)
         count += replacements
+
+    def redact_ipv6(match: re.Match[str]) -> str:
+        nonlocal count
+        candidate = match.group("address").split("%", 1)[0]
+        try:
+            parsed = ipaddress.ip_address(candidate)
+        except ValueError:
+            return match.group(0)
+        if parsed.version != 6:
+            return match.group(0)
+        count += 1
+        return "[REDACTED_ADDRESS]"
+
+    output = _BRACKETED_IPV6_RE.sub(redact_ipv6, output)
+    output = _BARE_IPV6_RE.sub(redact_ipv6, output)
     return output, count
 
 

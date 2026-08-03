@@ -41,6 +41,7 @@ except ImportError:  # pragma: no cover - redis is installed in production.
         pass
 
 from shared import SEARXNG_URL, get_domain, runtime_retrieval_context
+from temporal_scope import is_mixed_as_of_relative_comparison
 from url_identity import canonicalize_web_url
 
 
@@ -1386,7 +1387,24 @@ def infer_search_policy(
         previous_year = reference_date.year - 1
         in_date_span = (date(previous_year, 1, 1), date(previous_year, 12, 31))
 
-    if today or yesterday:
+    mixed_as_of_comparison = (
+        as_of_span is not None and is_mixed_as_of_relative_comparison(query)
+    )
+
+    if mixed_as_of_comparison:
+        # A single cutoff would discard the current half, while a recency window
+        # would discard the historical half. Keep both scopes in the query and
+        # avoid post-search date filtering.
+        temporal_intent = "mixed_comparison"
+        time_range = None
+    elif as_of_span is not None:
+        # "As of" is a knowledge cutoff, not a recency window. Sources from any
+        # earlier date remain eligible. An explicit cutoff also outranks
+        # relative wording such as "today" in the same request.
+        cutoff_date = as_of_span[1]
+        temporal_intent = "as_of"
+        time_range = None
+    elif today or yesterday:
         relative_date = reference_date - timedelta(days=1) if yesterday else reference_date
         if publication_scope:
             target_date = relative_date
@@ -1399,12 +1417,6 @@ def infer_search_policy(
             event_end_date = relative_date
             temporal_intent = "event_date"
             time_range = None
-    elif as_of_span is not None:
-        # "As of" is a knowledge cutoff, not a recency window. Sources from any
-        # earlier date remain eligible.
-        cutoff_date = as_of_span[1]
-        temporal_intent = "as_of"
-        time_range = None
     elif range_span is not None:
         if publication_scope:
             start_date, cutoff_date = range_span

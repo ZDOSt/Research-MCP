@@ -14,6 +14,7 @@ import httpx
 from query_hints import normalize_proposed_queries, proposed_query_dedupe_key
 from redaction import redact_model_input_text, redact_url_credentials
 from shared import logger, runtime_retrieval_context
+from temporal_scope import is_mixed_as_of_relative_comparison
 
 
 PLANNER_BASE_URL = os.getenv("PLANNER_BASE_URL", "").rstrip("/")
@@ -221,6 +222,18 @@ _TEMPORAL_CONSTRAINT_RE = re.compile(
     rf"(?![\w/-])",
     re.I,
 )
+_EXPLICIT_AS_OF_RE = re.compile(
+    rf"\bas\s+of\s+(?:{_PLANNER_DATE_EXPRESSION_PATTERN})(?![\w/-])",
+    re.I,
+)
+
+
+def _as_of_is_single_cutoff(value: str) -> bool:
+    return bool(_EXPLICIT_AS_OF_RE.search(value)) and not (
+        is_mixed_as_of_relative_comparison(value)
+    )
+
+
 _NAMED_FULL_DATE_RE = re.compile(
     rf"\b(?P<month>{_PLANNER_MONTH_NAMES})\s+"
     r"(?P<day>\d{1,2})(?:st|nd|rd|th)?(?:,?\s+)"
@@ -792,7 +805,7 @@ def _apply_temporal_context(
 ) -> str:
     temporal_constraints = _temporal_constraints(source_query)
     relative_dates = []
-    if current_date:
+    if current_date and not _as_of_is_single_cutoff(source_query):
         try:
             local_date = date.fromisoformat(current_date)
         except ValueError:
@@ -821,7 +834,7 @@ def _apply_relative_date_context(
     limit: int,
 ) -> str:
     """Attach concrete dates only for relative day expressions."""
-    if not current_date:
+    if not current_date or _as_of_is_single_cutoff(source_query):
         return search_query
     try:
         local_date = date.fromisoformat(current_date)
@@ -2526,7 +2539,7 @@ def _relative_runtime_date_values(
     source_context: str,
     current_date: Optional[str],
 ) -> set[str]:
-    if not current_date:
+    if not current_date or _as_of_is_single_cutoff(source_context):
         return set()
     try:
         local_date = date.fromisoformat(current_date)
@@ -3034,7 +3047,12 @@ def _merge_proposed_queries(
             }
         )
 
-    available = max(0, budget - len(intent_order))
+    # Quick mode has room for exactly one query. Once a calling-model proposal
+    # has passed canonical-topic and constraint validation, let it replace the
+    # deterministic anchor instead of paying planning latency and discarding it.
+    # If validation rejects every proposal, the deterministic anchor remains.
+    replace_quick_anchor = mode == "quick" and budget == 1 and len(intent_order) == 1
+    available = budget if replace_quick_anchor else max(0, budget - len(intent_order))
     per_intent_limit = 4 if mode == "deep" else 1
     selected: List[dict] = []
     while available > 0:
@@ -3072,7 +3090,8 @@ def _merge_proposed_queries(
         "rejected": rejected,
         "policy": (
             "calling-model queries are validated against canonical deterministic "
-            "intents; semantic expansions run with deterministic anchors"
+            "intents; quick mode may use one validated reformulation, while "
+            "semantic expansions in larger modes run with deterministic anchors"
         ),
     }
     if not selected:
@@ -3106,7 +3125,7 @@ def _merge_proposed_queries(
                     selected_items[0]["role"],
                 )
             )
-        if deterministic_items:
+        if deterministic_items and not (replace_quick_anchor and selected_items):
             merged_entries.append(
                 (deterministic_items[0], intent_id, "deterministic")
             )
@@ -3221,18 +3240,17 @@ async def build_research_plan(
             if not model_query:
                 continue
             model_intent_id = "intent-1"
-            canonical_query = fallback.get("intent_contexts", {}).get(
-                model_intent_id,
-                compact_search_query(source_context),
-            )
             for index, (_focused_query, source_segment) in enumerate(
                 focused_intents,
                 start=1,
             ):
                 if source_context == source_segment:
                     model_intent_id = f"intent-{index}"
-                    canonical_query = _focused_query
                     break
+            canonical_query = fallback.get("intent_contexts", {}).get(
+                model_intent_id,
+                compact_search_query(source_context),
+            )
             if not canonical_query:
                 continue
             required_terms = _proposed_query_required_terms(
@@ -3246,6 +3264,28 @@ async def build_research_plan(
                 current_date,
             )
             if constraint_problem:
+                continue
+            # Keep the permissive synonym handling used for model-authored
+            # queries (for example, ``regulatory landscape`` for ``regulation``)
+            # while rejecting generic drift such as ``news`` for a request about
+            # Iran. At least one distinctive canonical topic term must survive;
+            # temporal and exact constraints are checked separately above.
+            from searching import search_result_relevance
+
+            alignment = search_result_relevance(
+                {
+                    "title": _proposed_query_alignment_text(model_query),
+                    "snippet": "",
+                    "url": "https://query.invalid/",
+                },
+                _proposed_query_alignment_text(canonical_query),
+                threshold=0.0,
+            )
+            distinctive_terms = set(alignment.get("distinctive_query_terms") or [])
+            matched_distinctive_terms = set(
+                alignment.get("matched_distinctive_terms") or []
+            )
+            if distinctive_terms and not matched_distinctive_terms:
                 continue
             (
                 semantic_expansion_terms,

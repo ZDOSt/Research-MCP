@@ -18,6 +18,9 @@ from github_connector import (
 )
 from pipelines import compact_investigation_result, explore_url_pipeline, research_pipeline
 from planner import (
+    SEARCH_QUERY_MAX_CHARS,
+    _focused_search_intents,
+    _merge_proposed_queries,
     _chat,
     _extract_json_object,
     deterministic_plan,
@@ -82,7 +85,7 @@ RESEARCH_ASSISTANT_AUTO_MODE = os.getenv(
 if RESEARCH_ASSISTANT_AUTO_MODE not in _RESEARCH_ASSISTANT_MODES:
     RESEARCH_ASSISTANT_AUTO_MODE = "quick"
 
-_URL_RE = re.compile(r"https?://[^\s<>\]\[(){}\"']+", re.I)
+_URL_RE = re.compile(r"https?://[^\s<>\"']+", re.I)
 _GITHUB_REPOSITORY_URL_RE = re.compile(
     r"https?://(?:www\.)?github\.com/(?P<owner>[A-Za-z0-9_.-]+)/"
     r"(?P<repository>[A-Za-z0-9_.-]+)(?:/|\b)",
@@ -268,14 +271,21 @@ def _model_safe_url(value: object) -> str:
 
 
 def _public_query_token_key(value: str) -> str:
-    return unicodedata.normalize("NFKC", value).casefold()
+    return unicodedata.normalize("NFKC", value).casefold().strip(".")
+
+
+def _privacy_sensitive_public_request(value: str) -> bool:
+    _, redactions = redact_public_query_text(value)
+    return bool(redactions or _PRIVATE_REQUEST_CUE_RE.search(value))
 
 
 def _minimize_public_query(value: str, private_request: str) -> tuple[str, int]:
     """Remove request-specific terms when the private request contains risk cues."""
-    output, redactions = redact_public_query_text(value)
+    value_without_urls, url_redactions = _URL_RE.subn(" ", value)
+    output, redactions = redact_public_query_text(value_without_urls)
+    redactions += url_redactions
     redacted_request, request_redactions = redact_public_query_text(private_request)
-    privacy_sensitive = bool(request_redactions or _PRIVATE_REQUEST_CUE_RE.search(private_request))
+    privacy_sensitive = _privacy_sensitive_public_request(private_request)
     if not privacy_sensitive:
         return re.sub(r"\s+", " ", output).strip(), redactions
 
@@ -320,6 +330,16 @@ def _minimize_public_query(value: str, private_request: str) -> tuple[str, int]:
     return output, redactions + removed + placeholders
 
 
+def _public_request_without_urls(request: str) -> str:
+    """Build public task text without leaking path-embedded URL credentials."""
+    request_without_urls = _URL_RE.sub(" ", str(request or ""))
+    public_request, _ = _minimize_public_query(
+        request_without_urls,
+        request,
+    )
+    return re.sub(r"\s+", " ", public_request).strip()
+
+
 def _redacted_url_for_output(value: str) -> str:
     redacted, _ = redact_url_credentials(value)
     return normalize_search_url(redacted)
@@ -349,6 +369,12 @@ def _explicit_urls(request: str) -> List[str]:
     seen = set()
     for match in _URL_RE.findall(request or ""):
         candidate = match.rstrip(".,;:!?")
+        for opening, closing in (("(", ")"), ("[", "]"), ("{", "}")):
+            while (
+                candidate.endswith(closing)
+                and candidate.count(closing) > candidate.count(opening)
+            ):
+                candidate = candidate[:-1]
         try:
             parsed = urlsplit(candidate)
         except ValueError:
@@ -508,6 +534,76 @@ def _normalize_plan(
         public_query=True,
         private_request=request,
     )
+    # Keep the complete public topic as a deterministic anchor. A model can
+    # otherwise satisfy the plan schema with a generic query such as ``news``;
+    # because this plan is later used to construct the public pipeline request,
+    # that would discard the user's actual subject before SearXNG is called.
+    # The anchor is built from the privacy-filtered request, so private values
+    # never cross the public-search boundary.
+    public_request = _public_request_without_urls(request)
+    if not public_request:
+        public_request = "authoritative public information for the requested topic"
+    current_date = runtime_retrieval_context().get("current_date_local")
+    canonical_plan = deterministic_plan(public_request, mode)
+    focused_intents = _focused_search_intents(
+        public_request,
+        SEARCH_QUERY_MAX_CHARS,
+        current_date,
+    )
+    if bounded_queries:
+        canonical_plan = _merge_proposed_queries(
+            canonical_plan,
+            public_request,
+            mode,
+            bounded_queries,
+            focused_intents,
+            current_date,
+        )
+    # Larger modes keep one deterministic anchor per intent and, when accepted,
+    # one model reformulation. Quick mode may use its single validated model
+    # query directly. Joining every variant into the public task adds noise.
+    normalized_plan_queries = list(canonical_plan.get("queries") or [])
+    normalized_plan_intents = list(canonical_plan.get("query_intent_ids") or [])
+    if len(normalized_plan_queries) != len(normalized_plan_intents):
+        normalized_plan_intents = ["intent-1"] * len(normalized_plan_queries)
+    normalized_plan_roles = list(canonical_plan.get("query_roles") or [])
+    if len(normalized_plan_queries) != len(normalized_plan_roles):
+        normalized_plan_roles = ["deterministic"] * len(normalized_plan_queries)
+    privacy_sensitive = _privacy_sensitive_public_request(request)
+    bounded_queries = []
+    for intent_id in dict.fromkeys(normalized_plan_intents):
+        entries = [
+            (candidate, role)
+            for candidate, candidate_intent, role in zip(
+                normalized_plan_queries,
+                normalized_plan_intents,
+                normalized_plan_roles,
+            )
+            if candidate_intent == intent_id
+        ]
+        anchor = next(
+            (candidate for candidate, role in entries if role == "deterministic"),
+            entries[0][0] if entries else "",
+        )
+        reformulation = next(
+            (
+                candidate
+                for candidate, role in entries
+                if role != "deterministic" and candidate != anchor
+            ),
+            "",
+        )
+        if privacy_sensitive and reformulation:
+            bounded_queries.append(reformulation)
+            if len(bounded_queries) >= 5:
+                break
+            continue
+        if anchor:
+            bounded_queries.append(anchor)
+        if reformulation and len(bounded_queries) < 5:
+            bounded_queries.append(reformulation)
+        if len(bounded_queries) >= 5:
+            break
     queries = normalize_proposed_queries(bounded_queries) if bounded_queries else []
     raw_search = raw.get("use_web_search")
     use_web_search = raw_search if isinstance(raw_search, bool) else not bool(deterministic_urls)
@@ -604,12 +700,11 @@ async def build_assistant_plan(
 
 def deterministic_assistant_plan(request: str, mode: str = "auto") -> Dict[str, Any]:
     """Build a privacy-filtered fallback when the internal planner is unavailable."""
-    request_tokens = {
-        token.casefold()
-        for token in re.findall(r"[A-Za-z][A-Za-z0-9_-]{1,30}", request)
-    }
-    safe_terms = sorted(request_tokens & _PUBLIC_FALLBACK_TERMS)
-    public_request = " ".join(safe_terms[:12]).strip()
+    # Preserve public subjects, dates, and product names while removing
+    # credentials and request-specific private terms. The old fixed allowlist
+    # reduced an otherwise public question about (for example) Iran to merely
+    # ``news``, which produced irrelevant search results.
+    public_request = _public_request_without_urls(request)
     if not public_request:
         public_request = "authoritative public information for the requested topic"
     selected_mode = _deterministic_mode(request, mode)

@@ -57,6 +57,40 @@ def test_verbose_instruction_is_compacted_for_search_engines(monkeypatch):
     assert fallback_search_query(VERBOSE_AI_NEWS_QUERY) == "AI news published today"
 
 
+def test_explicit_as_of_cutoff_prevents_runtime_date_augmentation(monkeypatch):
+    monkeypatch.setattr(
+        "planner.runtime_retrieval_context",
+        lambda: {"current_date_local": "2026-08-03"},
+    )
+    request = (
+        "Summarize today's latest news on the Iran war/conflict as of "
+        "March 28, 2026."
+    )
+
+    plan = deterministic_plan(request, "quick")
+
+    assert plan["queries"]
+    assert "Iran" in plan["queries"][0]
+    assert "as of March 28, 2026" in plan["queries"][0]
+    assert "2026-08-03" not in plan["queries"][0]
+
+
+def test_mixed_as_of_and_today_comparison_keeps_both_dates(monkeypatch):
+    monkeypatch.setattr(
+        "planner.runtime_retrieval_context",
+        lambda: {"current_date_local": "2026-08-03"},
+    )
+
+    plan = deterministic_plan(
+        "Compare OpenAI pricing as of March 28, 2024 with today's pricing",
+        "quick",
+    )
+
+    assert plan["queries"]
+    assert "March 28, 2024" in plan["queries"][0]
+    assert "2026-08-03" in plan["queries"][0]
+
+
 def test_publication_date_semantics_survive_every_query_variant():
     plan = deterministic_plan(
         "Find articles published on 2026-06-10 about Product X",
@@ -1678,6 +1712,36 @@ async def test_configured_planner_rejects_query_without_canonical_anchor(monkeyp
 
 
 @pytest.mark.asyncio
+async def test_configured_planner_rejects_generic_news_for_specific_conflict(monkeypatch):
+    planner = pytest.importorskip("planner")
+    source_query = (
+        "Summarize today's latest news on the Iran war/conflict as of "
+        "March 28, 2026. Identify the most important developments."
+    )
+    monkeypatch.setattr(planner, "PLANNER_BASE_URL", "https://planner.example")
+    monkeypatch.setattr(planner, "PLANNER_MODEL", "private-planner")
+    monkeypatch.setattr(
+        planner,
+        "runtime_retrieval_context",
+        lambda: {"current_date_local": "2026-08-03"},
+    )
+    monkeypatch.setattr(
+        planner,
+        "_chat",
+        AsyncMock(
+            return_value=json.dumps({"queries": ["news"], "subquestions": []})
+        ),
+    )
+
+    plan = await planner.build_research_plan(source_query, "balanced")
+
+    assert plan["generated_by"] == "deterministic"
+    assert plan["queries"]
+    assert "iran" in plan["queries"][0].lower()
+    assert all(query.casefold() != "news" for query in plan["queries"])
+
+
+@pytest.mark.asyncio
 async def test_empty_configured_planner_output_remains_deterministic(monkeypatch):
     planner = pytest.importorskip("planner")
     monkeypatch.setattr(planner, "PLANNER_BASE_URL", "https://planner.example")
@@ -2610,7 +2674,7 @@ async def test_local_only_never_accepts_proposed_web_queries(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_quick_mode_keeps_its_single_deterministic_query(monkeypatch):
+async def test_quick_mode_uses_one_validated_calling_model_query(monkeypatch):
     planner = pytest.importorskip("planner")
     monkeypatch.setattr(planner, "PLANNER_BASE_URL", "")
     monkeypatch.setattr(planner, "PLANNER_MODEL", "")
@@ -2622,12 +2686,29 @@ async def test_quick_mode_keeps_its_single_deterministic_query(monkeypatch):
     )
 
     assert len(plan["queries"]) == 1
-    assert "query_roles" not in plan
+    assert plan["queries"] == ["latest Docker official installation documentation"]
+    assert plan["query_roles"] == ["calling_model"]
+    assert plan["generated_by"] == "calling-model+deterministic"
+    assert len(plan["proposed_query_handling"]["accepted"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_quick_mode_rejects_generic_calling_model_query(monkeypatch):
+    planner = pytest.importorskip("planner")
+    monkeypatch.setattr(planner, "PLANNER_BASE_URL", "")
+    monkeypatch.setattr(planner, "PLANNER_MODEL", "")
+
+    plan = await planner.build_research_plan(
+        "Find today's latest news about the Iran conflict",
+        "quick",
+        proposed_queries=["news"],
+    )
+
+    assert len(plan["queries"]) == 1
+    assert "iran" in plan["queries"][0].casefold()
+    assert plan["queries"][0].casefold() != "news"
     assert plan["generated_by"] == "deterministic"
     assert plan["proposed_query_handling"]["accepted"] == []
-    assert plan["proposed_query_handling"]["rejected"][0]["reason"] == (
-        "mode_query_budget_exhausted"
-    )
 
 
 def test_github_repository_normalization_and_validation():

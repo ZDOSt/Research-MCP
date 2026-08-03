@@ -36,6 +36,33 @@ def test_search_policy_targets_current_news_without_overfiltering_other_research
     assert academic.time_range is None
 
 
+def test_explicit_as_of_cutoff_overrides_relative_today_wording():
+    policy = infer_search_policy(
+        "today's latest Iran conflict news as of March 28, 2026",
+        current_date="2026-08-03",
+    )
+
+    assert policy.categories == ("news", "general")
+    assert policy.temporal_intent == "as_of"
+    assert policy.cutoff_date == date(2026, 3, 28)
+    assert policy.target_date is None
+    assert policy.strict_date is False
+    assert policy.time_range is None
+
+
+def test_mixed_historical_and_current_comparison_does_not_filter_either_side():
+    policy = infer_search_policy(
+        "Compare OpenAI pricing as of March 28, 2024 with today's pricing",
+        current_date="2026-08-03",
+    )
+
+    assert policy.temporal_intent == "mixed_comparison"
+    assert policy.cutoff_date is None
+    assert policy.target_date is None
+    assert policy.strict_date is False
+    assert policy.time_range is None
+
+
 @pytest.mark.parametrize(
     ("query", "expected_days", "expected_time_range"),
     [

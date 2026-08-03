@@ -68,6 +68,158 @@ async def test_model_plan_is_bounded_redacted_and_deterministically_augmented(mo
     assert "sk-secretvalue" not in " ".join(plan["queries"])
 
 
+def test_deterministic_fallback_preserves_public_subject_and_event_date(monkeypatch):
+    request = (
+        "Summarize today's latest news on the Iran war/conflict as of "
+        "March 28, 2026. Identify the most important developments."
+    )
+    monkeypatch.setattr(
+        research_agent,
+        "runtime_retrieval_context",
+        lambda: {"current_date_local": "2026-08-03"},
+    )
+    monkeypatch.setattr(
+        planner,
+        "runtime_retrieval_context",
+        lambda: {"current_date_local": "2026-08-03"},
+    )
+
+    plan = research_agent.deterministic_assistant_plan(request, "quick")
+
+    assert plan["queries"]
+    assert "iran" in plan["queries"][0].lower()
+    assert "2026" in plan["queries"][0]
+    assert plan["queries"][0].casefold() != "news"
+
+
+def test_deterministic_fallback_retains_safe_term_before_sentence_period():
+    plan = research_agent.deterministic_assistant_plan(
+        "Codename Apollo Blue failed with Docker.",
+        "quick",
+    )
+
+    assert "Docker" in plan["queries"][0]
+    assert "Apollo" not in " ".join(plan["queries"])
+
+
+@pytest.mark.parametrize(
+    "private_host",
+    [
+        "db.prod.internal:5432",
+        "api.service.corp",
+        "db.home:5432",
+        "host.localdomain:6379",
+        "localhost:8080",
+        "[fd00::1234]:5432",
+        "fe80::1",
+    ],
+)
+def test_deterministic_fallback_removes_bare_private_hosts(private_host):
+    plan = research_agent.deterministic_assistant_plan(
+        f"Fix connection refused from {private_host} in Docker",
+        "quick",
+    )
+
+    serialized = json.dumps(plan)
+    assert private_host not in serialized
+    assert "Docker" in plan["queries"][0]
+    assert "connection refused" in plan["queries"][0]
+
+
+@pytest.mark.parametrize(
+    "private_endpoint",
+    [
+        "10.20.30.40:5432/private-route-9472",
+        "db.prod.internal:5432/private-route-9472",
+        "db.prod.internal:5432/reset(private-route-9472)",
+        "[fd00::1234]:5432/private-route-9472",
+        "fe80::1/private-route-9472",
+    ],
+)
+def test_deterministic_fallback_removes_private_endpoint_paths(private_endpoint):
+    plan = research_agent.deterministic_assistant_plan(
+        f"Fix connection refused from {private_endpoint} in Docker",
+        "quick",
+    )
+
+    serialized = json.dumps(plan)
+    assert "private-route-9472" not in serialized
+    assert "Docker" in plan["queries"][0]
+
+
+def test_parenthesized_url_path_never_becomes_a_public_search_query():
+    secret_path = "secret-token-value-123456789"
+    request = f"Research https://docs.example.com/reset({secret_path})"
+
+    plan = research_agent.deterministic_assistant_plan(request, "quick")
+
+    assert secret_path not in " ".join(plan["queries"])
+    assert plan["_execution_urls"] == [
+        f"https://docs.example.com/reset({secret_path})"
+    ]
+
+
+def test_model_repeated_url_path_never_becomes_a_public_search_query():
+    secret_path = "secret-token-value-123456789"
+    request = f"Research Docker using https://docs.example.com/reset({secret_path})"
+
+    plan = research_agent._normalize_plan(
+        {
+            "mode": "quick",
+            "queries": [
+                f"Docker reset guide https://docs.example.com/reset({secret_path})"
+            ],
+        },
+        request,
+        "quick",
+    )
+
+    assert secret_path not in " ".join(plan["queries"])
+
+
+@pytest.mark.asyncio
+async def test_model_assistant_plan_replaces_generic_query_with_public_anchor(monkeypatch):
+    request = (
+        "Summarize today's latest news on the Iran war/conflict as of "
+        "March 28, 2026. Identify the most important developments."
+    )
+    monkeypatch.setattr(
+        research_agent,
+        "_chat",
+        AsyncMock(
+            return_value=json.dumps(
+                {
+                    "mode": "quick",
+                    "use_web_search": True,
+                    "queries": ["news"],
+                    "include_images": False,
+                }
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        research_agent,
+        "research_model_config",
+        lambda: {"model": "private-model"},
+    )
+    monkeypatch.setattr(
+        research_agent,
+        "runtime_retrieval_context",
+        lambda: {"current_date_local": "2026-08-03"},
+    )
+    monkeypatch.setattr(
+        planner,
+        "runtime_retrieval_context",
+        lambda: {"current_date_local": "2026-08-03"},
+    )
+
+    plan = await research_agent.build_assistant_plan(request, mode="quick")
+
+    assert plan["queries"]
+    assert "iran" in plan["queries"][0].lower()
+    assert all(query.casefold() != "news" for query in plan["queries"])
+
+
 @pytest.mark.asyncio
 async def test_explicit_mode_cannot_be_overridden_by_planning_model(monkeypatch):
     monkeypatch.setattr(
