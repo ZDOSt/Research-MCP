@@ -16,7 +16,13 @@ from github_connector import (
     normalize_repository,
     search_github,
 )
-from pipelines import compact_investigation_result, explore_url_pipeline, research_pipeline
+from pipelines import (
+    build_crawled_source_evidence,
+    build_search_snippet_evidence,
+    compact_investigation_result,
+    explore_url_pipeline,
+    research_pipeline,
+)
 from planner import (
     SEARCH_QUERY_MAX_CHARS,
     _focused_search_intents,
@@ -35,7 +41,7 @@ from redaction import (
     redact_sensitive_text,
     redact_url_credentials,
 )
-from searching import normalize_search_url, searxng_image_search
+from searching import normalize_search_url, searxng_image_search, searxng_search
 from shared import DEFAULT_NAMESPACE, normalize_namespace, runtime_retrieval_context
 
 
@@ -740,15 +746,35 @@ def deterministic_assistant_plan(request: str, mode: str = "auto") -> Dict[str, 
 
 
 def _public_research_task(request: str, plan: Mapping[str, Any]) -> tuple[str, int]:
-    """Return a bounded public task without reusing the complete private request."""
+    """Return the authoritative public task while keeping plan queries separate."""
+    public_request = _public_request_without_urls(request)
     _, request_redactions = redact_public_query_text(request)
-    candidates = list(plan.get("queries") or [])
-    if plan.get("answer_focus"):
-        candidates.append(str(plan["answer_focus"]))
-    if candidates:
-        value = "; ".join(str(item) for item in candidates[:5])
+    candidates = [
+        str(item).strip()
+        for item in (plan.get("queries") or [])
+        if str(item).strip()
+    ]
+    # Redacting a private incident can leave grammatical debris. In that case,
+    # use the first already-validated planner query, but never join multiple
+    # plan clauses into one noisy search task.
+    answer_focus = str(plan.get("answer_focus") or "").strip()
+    if request_redactions and answer_focus:
+        candidates.append(answer_focus)
+    if request_redactions and candidates:
+        candidates.sort(
+            key=lambda item: (
+                len(_PUBLIC_QUERY_TOKEN_RE.findall(item)),
+                len(item),
+            ),
+            reverse=True,
+        )
+        value = candidates[0]
+        if answer_focus and answer_focus not in value:
+            value = f"{value} {answer_focus}"
+    elif public_request:
+        value = public_request
     else:
-        value = deterministic_assistant_plan(request, "balanced")["image_query"]
+        value = str(candidates[0]) if candidates else ""
     public_value, redactions = _minimize_public_query(value, request)
     public_value = re.sub(r"\s+", " ", public_value).strip()[:1000]
     if not public_value:
@@ -785,6 +811,74 @@ def _merge_evidence(*groups: List[dict]) -> List[dict]:
             if len(output) >= RESEARCH_AGENT_MAX_EVIDENCE:
                 return output
     return output
+
+
+def _recover_pipeline_evidence(result: Mapping[str, Any]) -> List[dict]:
+    """Recover fresh pipeline evidence when vector retrieval returned nothing.
+
+    The pipeline normally includes this material itself. Keep the assistant
+    boundary defensive because deferred indexing, Qdrant outages, and older
+    worker versions can return useful crawl/search metadata without a populated
+    ``evidence`` array. Extracted page previews win over snippets for the same
+    URL; snippets remain explicitly low-confidence discovery evidence.
+    """
+    existing = [
+        item for item in (result.get("evidence") or []) if isinstance(item, Mapping)
+    ]
+    # A legacy worker can put discovery snippets in ``evidence`` before its
+    # crawl/index phase completes. Do not let those low-confidence records
+    # reserve a URL: a successful extracted page for the same URL is stronger
+    # evidence and must take precedence.
+    existing_extracted = [
+        item
+        for item in existing
+        if str(item.get("evidence_type") or "") != "search_result_snippet"
+    ]
+    existing_snippets = [
+        item
+        for item in existing
+        if str(item.get("evidence_type") or "") == "search_result_snippet"
+    ]
+    recovered = build_crawled_source_evidence(
+        [
+            item
+            for item in (result.get("crawled_sources") or [])
+            if isinstance(item, Mapping)
+        ],
+        existing_extracted,
+    )
+    combined = _merge_evidence(existing_extracted, recovered)
+    recovered_urls = {
+        normalize_search_url(str(value))
+        for item in combined
+        for value in (item.get("url"), item.get("requested_url"))
+        if value
+    }
+    # Preserve an existing snippet only when no extracted page evidence was
+    # recovered for its URL.
+    for snippet in existing_snippets:
+        snippet_urls = {
+            normalize_search_url(str(value))
+            for value in (snippet.get("url"), snippet.get("requested_url"))
+            if value
+        }
+        if snippet_urls & recovered_urls:
+            continue
+        combined = _merge_evidence(combined, [snippet])
+        recovered_urls.update(snippet_urls)
+    candidates = [
+        item
+        for item in (result.get("searched") or [])
+        if isinstance(item, Mapping)
+    ]
+    if candidates:
+        snippets = build_search_snippet_evidence(
+            candidates,
+            combined,
+            len(candidates),
+        )
+        combined = _merge_evidence(combined, snippets)
+    return combined
 
 
 def _url_result_evidence(result: Mapping[str, Any]) -> List[dict]:
@@ -1414,13 +1508,43 @@ def _merge_deferred_manifests(*results: Mapping[str, Any]) -> Optional[dict]:
 
 
 def _confidence(evidence: List[dict], citations: List[dict], limitations: List[str]) -> str:
+    cited_ids = {
+        item.get("evidence_id")
+        for item in citations
+        if item.get("evidence_id") is not None
+    }
+    cited_evidence = [
+        item for item in evidence if item.get("evidence_id") in cited_ids
+    ]
+    if cited_evidence and all(item.get("relevance_fallback") for item in cited_evidence):
+        return "low"
+    if cited_evidence and all(
+        str(item.get("evidence_type") or "") == "search_result_snippet"
+        for item in cited_evidence
+    ):
+        # Search snippets are useful fallback evidence, but they are discovery
+        # metadata rather than independently extracted page content.
+        return "low"
     hosts = {
         urlsplit(str(item.get("url") or "")).hostname
         for item in citations
         if item.get("url")
     }
     hosts.discard(None)
-    if len(citations) >= 3 and len(hosts) >= 2 and not limitations:
+    extracted_hosts = {
+        urlsplit(str(item.get("url") or "")).hostname
+        for item in cited_evidence
+        if not item.get("relevance_fallback")
+        and str(item.get("evidence_type") or "") != "search_result_snippet"
+        and item.get("url")
+    }
+    extracted_hosts.discard(None)
+    if (
+        len(citations) >= 3
+        and len(hosts) >= 2
+        and len(extracted_hosts) >= 2
+        and not limitations
+    ):
         return "high"
     if citations:
         return "medium"
@@ -1476,7 +1600,9 @@ async def _gather_with_budget(
     """Collect completed acquisition paths without letting one consume the turn."""
     if not awaitables:
         return []
-    tasks = [asyncio.create_task(item) for item in awaitables]
+    # ``ensure_future`` preserves acquisition that was deliberately started
+    # before optional model planning while still wrapping new coroutines.
+    tasks = [asyncio.ensure_future(item) for item in awaitables]
     deadline = time.monotonic() + max(0.0, timeout_seconds)
     try:
         done, pending = await asyncio.wait(
@@ -1521,9 +1647,19 @@ async def _gather_with_budget(
 
 def _evidence_digest(evidence: List[dict], images: List[dict]) -> Dict[str, Any]:
     """Return an answer-bearing, cited fallback when model synthesis misses its budget."""
+    tentative_only = bool(evidence) and all(
+        item.get("relevance_fallback") for item in evidence
+    )
     lines = [
-        "The research pass retrieved the following relevant evidence, but the final "
-        "model synthesis did not finish within the interactive time limit:",
+        (
+            "The search found only the following tentative leads. None passed the "
+            "topical relevance gate; use an excerpt only when it directly supports "
+            "the requested claim, label it low-confidence, and report the evidence gap:"
+            if tentative_only
+            else "The research pass retrieved the following evidence. The concise source "
+            "digest below is returned because model-assisted synthesis was unavailable or "
+            "did not finish within the interactive time limit:"
+        )
     ]
     for item in evidence[:6]:
         evidence_id = item.get("evidence_id")
@@ -1542,7 +1678,9 @@ def _evidence_digest(evidence: List[dict], images: List[dict]) -> Dict[str, Any]
         excerpt = re.sub(r"\[E(\d+)\]", r"E\1", excerpt)
         metadata = f" ({_safe_markdown_label(published, published)})" if published else ""
         provenance = ""
-        if str(item.get("evidence_type") or "") == "search_result_snippet":
+        if item.get("relevance_fallback"):
+            provenance = " [tentative low-confidence lead; failed topical relevance gate]"
+        elif str(item.get("evidence_type") or "") == "search_result_snippet":
             confidence = re.sub(
                 r"[^a-zA-Z0-9_-]+",
                 "",
@@ -1595,18 +1733,8 @@ async def run_research_assistant(
     )
     namespace = normalize_namespace(namespace)
     retrieval_context = runtime_retrieval_context()
-    if not research_model_configured():
-        return {
-            "status": "configuration_required",
-            "error": "internal_research_model_not_configured",
-            "detail": (
-                "research_assistant requires RESEARCH_MODEL_BASE_URL and "
-                "RESEARCH_MODEL_NAME on the server"
-            ),
-            "required_settings": ["RESEARCH_MODEL_BASE_URL", "RESEARCH_MODEL_NAME"],
-            "optional_settings": ["RESEARCH_MODEL_API_KEY"],
-            "retrieval_context": retrieval_context,
-        }
+    model_available = research_model_configured()
+    model_usable_this_turn = model_available
 
     # Most MCP clients impose a roughly one-minute tool timeout and do not
     # automatically resume durable jobs. Auto still classifies the request so
@@ -1616,41 +1744,85 @@ async def run_research_assistant(
         RESEARCH_ASSISTANT_AUTO_MODE if mode == "auto" else mode
     )
 
+    # Start one deterministic discovery wave immediately. The optional model
+    # may improve the wider investigation, but it must never gate the first web
+    # results or consume the only useful search window.
+    baseline_plan = deterministic_assistant_plan(request, effective_mode)
+    deterministic_public_request, _ = _public_research_task(
+        request,
+        baseline_plan,
+    )
+    baseline_query = next(
+        (
+            str(item).strip()
+            for item in baseline_plan.get("queries") or []
+            if str(item).strip()
+        ),
+        deterministic_public_request,
+    )
+    baseline_search_task: asyncio.Task | None = None
+    if deadline is not None and baseline_plan.get("use_web_search"):
+        baseline_budget = min(8.0, max(2.0, interactive_budget * 0.25))
+        baseline_search_task = asyncio.create_task(
+            searxng_search(
+                baseline_query,
+                max_results=4,
+                mode=str(baseline_plan.get("mode") or "quick"),
+                cache_scope=search_cache_scope,
+                time_budget_seconds=baseline_budget,
+            ),
+            name="research-assistant-baseline-search",
+        )
+
     planning_warning = None
-    try:
-        if deadline is not None:
-            synthesis_reserve = min(
-                14.0,
-                max(8.0, interactive_budget * 0.38),
-            )
-            acquisition_reserve = min(
-                10.0,
-                max(5.0, interactive_budget * 0.28),
-            )
-            planning_timeout = min(
-                5.0,
-                _remaining_seconds(deadline)
-                - synthesis_reserve
-                - acquisition_reserve,
-            )
-            if planning_timeout < 0.1:
-                raise TimeoutError("interactive planning budget exhausted")
-            plan = await build_assistant_plan(
-                request,
-                effective_mode,
-                timeout_seconds=planning_timeout,
-            )
-        elif effective_mode == "quick":
-            plan = await build_assistant_plan(
-                request,
-                effective_mode,
-                timeout_seconds=RESEARCH_AGENT_QUICK_PLAN_TIMEOUT_SECONDS,
-            )
-        else:
-            plan = await build_assistant_plan(request, effective_mode)
-    except Exception as exc:
-        planning_warning = _safe_model_error(exc)
+    if not model_available:
+        planning_warning = (
+            "Internal research model is not configured; deterministic search planning "
+            "and cited evidence output were used."
+        )
         plan = deterministic_assistant_plan(request, effective_mode)
+    else:
+        try:
+            if deadline is not None:
+                synthesis_reserve = min(
+                    14.0,
+                    max(8.0, interactive_budget * 0.38),
+                )
+                acquisition_reserve = min(
+                    10.0,
+                    max(5.0, interactive_budget * 0.28),
+                )
+                planning_timeout = min(
+                    5.0,
+                    _remaining_seconds(deadline)
+                    - synthesis_reserve
+                    - acquisition_reserve,
+                )
+                if planning_timeout < 0.1:
+                    raise TimeoutError("interactive planning budget exhausted")
+                plan = await build_assistant_plan(
+                    request,
+                    effective_mode,
+                    timeout_seconds=planning_timeout,
+                )
+            elif effective_mode == "quick":
+                plan = await build_assistant_plan(
+                    request,
+                    effective_mode,
+                    timeout_seconds=RESEARCH_AGENT_QUICK_PLAN_TIMEOUT_SECONDS,
+                )
+            else:
+                plan = await build_assistant_plan(request, effective_mode)
+        except asyncio.CancelledError:
+            if baseline_search_task is not None:
+                await _cancel_acquisition_tasks([baseline_search_task])
+            raise
+        except Exception as exc:
+            planning_warning = _safe_model_error(exc)
+            # A model that already failed during planning must not consume more
+            # of the same interactive request's budget in synthesis.
+            model_usable_this_turn = False
+            plan = deterministic_assistant_plan(request, effective_mode)
     planning_finished = time.monotonic()
 
     # Deep is explicitly background-oriented. A model or stale environment
@@ -1667,7 +1839,8 @@ async def run_research_assistant(
     # both acquisition and another model call, spend it on deterministic
     # acquisition and return the server-rendered cited digest.
     acquisition_only = bool(
-        deadline is not None and remaining_after_planning < 10.0
+        not model_usable_this_turn
+        or (deadline is not None and remaining_after_planning < 10.0)
     )
     synthesis_reserve = (
         0.0
@@ -1719,6 +1892,9 @@ async def run_research_assistant(
         primary_kwargs["time_budget_seconds"] = max(0.1, acquisition_budget)
     tasks = []
     task_kinds = []
+    if baseline_search_task is not None:
+        tasks.append(baseline_search_task)
+        task_kinds.append("baseline_search")
     if plan["use_web_search"]:
         tasks.append(research_pipeline(**primary_kwargs))
         task_kinds.append("web")
@@ -1749,6 +1925,7 @@ async def run_research_assistant(
     url_results = []
     github_results = []
     images = []
+    baseline_candidates = []
     acquisition_errors = []
     evidence_groups: List[List[dict]] = []
     for kind, result in zip(task_kinds, acquired):
@@ -1759,9 +1936,13 @@ async def run_research_assistant(
             acquisition_errors.append(
                 {"source": kind, "error": str(result["error"])[:100]}
             )
-        if kind == "web":
+        if kind == "baseline_search":
+            baseline_candidates = [
+                dict(item) for item in result if isinstance(item, Mapping)
+            ]
+        elif kind == "web":
             primary_result = dict(result)
-            evidence_groups.append(primary_result.get("evidence") or [])
+            evidence_groups.append(_recover_pipeline_evidence(primary_result))
         elif kind == "url":
             url_results.append(result)
             evidence_groups.append(result.get("evidence") or [])
@@ -1773,6 +1954,13 @@ async def run_research_assistant(
             evidence_groups.append(_image_result_evidence(images))
 
     evidence = _merge_evidence(*evidence_groups)
+    if baseline_candidates:
+        baseline_snippets = build_search_snippet_evidence(
+            baseline_candidates,
+            evidence,
+            min(4, len(baseline_candidates)),
+        )
+        evidence = _merge_evidence(evidence, baseline_snippets)
     follow_up = {"attempted": False, "reason": "not_needed", "queries": []}
     follow_up_result: Dict[str, Any] = {}
     if deadline is not None:
@@ -1805,7 +1993,10 @@ async def run_research_assistant(
             )
             try:
                 follow_up_result = await research_pipeline(
-                    query=fallback_plan["image_query"],
+                    # ``image_query`` is an optional presentation hint and can
+                    # be empty or unrelated to the user's task. The rescue
+                    # pass must execute the validated web queries themselves.
+                    query=public_request,
                     mode="quick",
                     max_sources=2,
                     verify=False,
@@ -1822,7 +2013,7 @@ async def run_research_assistant(
                     allow_model_planning=False,
                     time_budget_seconds=fallback_budget,
                 )
-                evidence = _merge_evidence(follow_up_result.get("evidence") or [])
+                evidence = _recover_pipeline_evidence(follow_up_result)
             except Exception as exc:
                 acquisition_errors.append(
                     {"source": "no_evidence_fallback", "error": type(exc).__name__}
@@ -1839,7 +2030,9 @@ async def run_research_assistant(
         )
         try:
             follow_up_result = await research_pipeline(
-                query=fallback_plan["image_query"],
+                # Keep the fallback anchored to the original task; image_query
+                # is not a general-purpose web-search query.
+                query=public_request,
                 mode="balanced",
                 max_sources=2,
                 verify=True,
@@ -1855,7 +2048,7 @@ async def run_research_assistant(
                 proposed_queries=fallback_queries,
                 allow_model_planning=False,
             )
-            evidence = _merge_evidence(follow_up_result.get("evidence") or [])
+            evidence = _recover_pipeline_evidence(follow_up_result)
         except Exception as exc:
             acquisition_errors.append(
                 {"source": "no_evidence_fallback", "error": type(exc).__name__}
@@ -1891,7 +2084,7 @@ async def run_research_assistant(
                     allow_model_planning=False,
                 )
                 evidence = _merge_evidence(
-                    follow_up_result.get("evidence") or [],
+                    _recover_pipeline_evidence(follow_up_result),
                     evidence,
                 )
             except Exception as exc:
@@ -1912,16 +2105,26 @@ async def run_research_assistant(
     synthesis_fallback = None
     synthesis_started = time.monotonic()
 
-    if evidence and acquisition_only:
+    synthesis_evidence = [
+        item for item in evidence if not item.get("relevance_fallback")
+    ]
+    if evidence and not synthesis_evidence:
+        synthesis_fallback = "skipped_low_topical_relevance"
+        limitations.append(
+            "The remaining results did not pass the topical relevance gate and are "
+            "listed only as tentative leads."
+        )
+        written = _evidence_digest(evidence[:12], images)
+    elif synthesis_evidence and acquisition_only:
         synthesis_fallback = "skipped_to_preserve_search_budget"
         limitations.append(
             "The remaining interactive budget was reserved for source retrieval; "
             "the response contains a cited evidence digest."
         )
-        written = _evidence_digest(evidence[:12], images)
-    elif evidence:
+        written = _evidence_digest(synthesis_evidence[:12], images)
+    elif synthesis_evidence:
         synthesis_evidence = (
-            evidence[:12] if deadline is not None else evidence
+            synthesis_evidence[:12] if deadline is not None else synthesis_evidence
         )
         try:
             write_kwargs = {
@@ -1959,6 +2162,27 @@ async def run_research_assistant(
         }
     synthesis_finished = time.monotonic()
 
+    citation_validated_synthesis = bool(
+        str(written.get("generated_by") or "").startswith("model:")
+        and (written.get("citation_validation") or {}).get("valid") is True
+    )
+    if citation_validated_synthesis:
+        result_instructions = [
+            "Present answer_markdown directly; it is the citation-validated research answer.",
+            "Do not repeat this research request unless the user asks for additional research.",
+        ]
+    elif evidence:
+        result_instructions = [
+            "Use the cited excerpts in answer_markdown to answer the user's original request directly.",
+            "Preserve the source URLs, confidence labels, and limitations; do not add claims unsupported by the retrieved evidence.",
+            "Use tentative leads only when their excerpt directly addresses the request; label them low-confidence and clearly report any remaining evidence gap.",
+        ]
+    else:
+        result_instructions = [
+            "Tell the user that the research pass did not retrieve enough citable evidence.",
+            "Do not invent an answer or claim that research succeeded.",
+        ]
+
     response = {
         "status": "complete" if evidence and not limitations else "partial",
         **written,
@@ -1989,8 +2213,7 @@ async def run_research_assistant(
         },
         "retrieval_context": retrieval_context,
         "answering_instructions": [
-            "Present answer_markdown directly; it contains either a citation-validated synthesis or a cited evidence digest.",
-            "Do not repeat this research request or independently reinterpret the evidence unless the user asks.",
+            *result_instructions,
             *_UNTRUSTED_RESULT_INSTRUCTIONS,
         ],
     }

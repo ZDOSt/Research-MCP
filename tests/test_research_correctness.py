@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
+import json
 import uuid
 
 import pytest
@@ -805,6 +806,32 @@ async def test_low_confidence_shell_is_not_ingested_when_browser_fails(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_ip_literal_search_result_skips_crawl_and_keeps_safe_diagnostics(
+    monkeypatch,
+):
+    crawl = AsyncMock()
+    monkeypatch.setattr(pipelines, "crawl_url_impl", crawl)
+
+    result = await pipelines.crawl_source(
+        {
+            "url": "https://93.184.216.34/private/path?token=secret-value",
+            "title": "Search result",
+            "domain": "93.184.216.34",
+            "snippet": "A discovery snippet remains available.",
+        },
+        query="install ExampleApp",
+    )
+
+    crawl.assert_not_awaited()
+    assert result["ok"] is False
+    assert result["destination_host"] == "93.184.216.34"
+    assert result["destination_type"] == "public_ip_literal"
+    assert "private/path" not in result["reason"]
+    assert "secret-value" not in result["reason"]
+    assert "original hostname" in result["reason"]
+
+
+@pytest.mark.asyncio
 async def test_low_confidence_shell_is_cleared_if_exploration_crashes(monkeypatch):
     crawl = AsyncMock(
         return_value={
@@ -1255,6 +1282,78 @@ async def test_synthesis_rejects_invalid_citations_and_reports_validated_ids(
     report = await planner.synthesize_report("q", evidence)
     assert report["citation_validation"]["valid"] is True
     assert report["citation_validation"]["cited_evidence_ids"] == [1]
+
+
+@pytest.mark.asyncio
+async def test_synthesis_preserves_evidence_quality_metadata_for_model(monkeypatch):
+    evidence = [
+        {
+            "evidence_id": 1,
+            "title": "Extracted guide",
+            "url": "https://docs.example.com/guide",
+            "quote": "Install ExampleApp with Docker Compose.",
+            "evidence_type": "extracted_page_content",
+            "confidence": "high",
+            "limitations": "Only the Linux installation path was extracted.",
+        },
+        {
+            "evidence_id": 2,
+            "title": "Discovery result",
+            "url": "https://news.example.com/version-2",
+            "quote": "Version 2 preview is available.",
+            "evidence_type": "search_result_snippet",
+            "confidence": "low",
+            "limitations": "Discovery snippet only; linked page content was not extracted.",
+        },
+    ]
+    chat = AsyncMock(
+        return_value=(
+            "The extracted guide says to install ExampleApp with Docker Compose [E1].\n\n"
+            "An unverified, snippet-only discovery result says a Version 2 preview is "
+            "available; the linked page was not extracted [E2]."
+        )
+    )
+    monkeypatch.setattr(planner, "PLANNER_ENABLE_SYNTHESIS", True)
+    monkeypatch.setattr(planner, "research_model_configured", lambda: True)
+    monkeypatch.setattr(planner, "research_model_config", lambda: {"model": "model"})
+    monkeypatch.setattr(planner, "_chat", chat)
+
+    report = await planner.synthesize_report("How do I install ExampleApp?", evidence)
+
+    assert report is not None
+    messages = chat.await_args.args[0]
+    compact_evidence = json.loads(messages[1]["content"].split("Evidence:\n", 1)[1])
+    assert compact_evidence[0]["evidence_type"] == "extracted_page_content"
+    assert compact_evidence[0]["confidence"] == "high"
+    assert compact_evidence[0]["limitations"] == evidence[0]["limitations"]
+    assert compact_evidence[1]["evidence_type"] == "search_result_snippet"
+    assert compact_evidence[1]["confidence"] == "low"
+    assert compact_evidence[1]["limitations"] == evidence[1]["limitations"]
+    system_prompt = messages[0]["content"]
+    assert "unverified search-provider discovery metadata" in system_prompt
+    assert "explicitly labeled unverified and snippet-only" in system_prompt
+
+
+@pytest.mark.asyncio
+async def test_synthesis_skips_all_snippet_evidence(monkeypatch):
+    evidence = [
+        {
+            "evidence_id": 1,
+            "title": "Discovery result",
+            "url": "https://example.com/result",
+            "quote": "A search-provider excerpt.",
+            "evidence_type": "search_result_snippet",
+            "confidence": "low",
+            "limitations": "Discovery snippet only; linked page content was not extracted.",
+        }
+    ]
+    chat = AsyncMock(return_value="A definitive answer [E1].")
+    monkeypatch.setattr(planner, "PLANNER_ENABLE_SYNTHESIS", True)
+    monkeypatch.setattr(planner, "research_model_configured", lambda: True)
+    monkeypatch.setattr(planner, "_chat", chat)
+
+    assert await planner.synthesize_report("Verify this result", evidence) is None
+    chat.assert_not_awaited()
 
 
 def test_evidence_pack_explains_artifact_reference_lifecycle():

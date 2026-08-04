@@ -199,7 +199,7 @@ PUBLIC_QUERY_PATTERNS: List[Tuple[re.Pattern[str], str]] = [
 ]
 
 _HTTP_URL_IN_TEXT_RE = re.compile(r"https?://[^\s<>\]\[(){}\"']+", re.I)
-_MODEL_INLINE_SECRET_RE = re.compile(
+_INLINE_SECRET_ASSIGNMENT_RE = re.compile(
     r"(?i)(?<![A-Z0-9_.-])"
     r"((?:[A-Z0-9_.\[\]-]*(?:PASSWORD|PASSWD|SECRET|TOKEN|API[_-]?KEY|ACCESS[_-]?KEY)"
     r"[A-Z0-9_.\[\]-]*|CLIENT[_-]?SECRET|SESSION(?:[_-]?(?:ID|KEY|TOKEN))?|SID)"
@@ -233,6 +233,11 @@ def redact_public_query_text(text: str) -> tuple[str, int]:
     for pattern, replacement in PUBLIC_QUERY_PATTERNS:
         output, replacements = pattern.subn(replacement, output)
         count += replacements
+    output, inline_redactions = _INLINE_SECRET_ASSIGNMENT_RE.subn(
+        r"\1[REDACTED]",
+        output,
+    )
+    count += inline_redactions
 
     def redact_ipv6(match: re.Match[str]) -> str:
         nonlocal count
@@ -323,7 +328,7 @@ def redact_model_input_text(text: str) -> tuple[str, int]:
 
     output = _HTTP_URL_IN_TEXT_RE.sub(redact_embedded_url, output)
     output, text_redactions = redact_public_query_text(output)
-    output, inline_redactions = _MODEL_INLINE_SECRET_RE.subn(
+    output, inline_redactions = _INLINE_SECRET_ASSIGNMENT_RE.subn(
         r"\1[REDACTED]",
         output,
     )

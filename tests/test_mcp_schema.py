@@ -37,9 +37,9 @@ def test_current_github_access_policy_forwards_only_bounded_non_secret_claims():
 
 
 @pytest.mark.asyncio
-async def test_compatibility_default_exposes_all_bounded_client_schemas():
+async def test_default_exposes_only_unified_bounded_client_schemas():
     tools = {tool.name: tool for tool in await mcp_server.mcp.list_tools()}
-    assert {"research_assistant", "research_job", "research_web"}.issubset(tools)
+    assert set(tools) == {"research_assistant", "research_job"}
 
     assistant = tools["research_assistant"].parameters["properties"]
     assert assistant["request"]["minLength"] == 1
@@ -57,6 +57,11 @@ async def test_compatibility_default_exposes_all_bounded_client_schemas():
         "result",
         "cancel",
     ]
+
+
+def test_all_profile_remains_an_explicit_compatibility_option():
+    tools = _tools_for_profile("all")
+    assert {"research_assistant", "research_job", "research_web"}.issubset(tools)
 
 
 def _tools_for_profile(profile):
@@ -185,4 +190,4 @@ async def test_unified_tool_discovery_promotes_one_completed_research_call():
     assert "user's complete" in description
     assert "server-owned interactive deadline" in description
     assert "cited partial evidence" in description
-    assert "Present answer_markdown directly" in description
+    assert "Follow the returned answering_instructions" in description

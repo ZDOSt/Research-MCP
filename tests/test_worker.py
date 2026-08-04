@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import json
 import os
 import tempfile
 import unittest
@@ -7,6 +8,7 @@ import uuid
 from unittest.mock import AsyncMock, Mock, patch
 
 from artifact_store import ArtifactStore
+from job_store import JobLeaseLostError
 import shared
 import worker
 from worker import (
@@ -44,6 +46,8 @@ class FakeWorkerStore:
         self.acknowledged_invalidations = []
         self.registration_error = None
         self.successful_ingestion_attempt_id = None
+        self.delivery_payloads = []
+        self.delivery_requeues = []
 
     async def claim_job(self, timeout, worker_id):
         job, self.job = self.job, None
@@ -90,6 +94,21 @@ class FakeWorkerStore:
 
     async def requeue_job(self, job_id, reason, lease_token=None):
         self.requeued = (job_id, reason, lease_token)
+
+    async def prepare_completed_delivery(self, job_id, payload, lease_token=None):
+        self.delivery_payloads.append(dict(payload))
+        return True
+
+    async def requeue_completed_delivery(self, job_id, payload, lease_token=None):
+        self.delivery_requeues.append((job_id, dict(payload), lease_token))
+        self.requeued = (job_id, "completed result pending delivery", lease_token)
+        self.job = {
+            "job_id": job_id,
+            "kind": "research_web",
+            "payload": dict(payload),
+            "lease_token": uuid.uuid4().hex,
+        }
+        return True
 
     async def register_ingestion_invalidation(
         self,
@@ -149,19 +168,142 @@ class FakeWorkerStore:
 
 
 class WorkerTests(unittest.IsolatedAsyncioTestCase):
-    async def test_unified_healthcheck_fails_when_internal_model_is_unconfigured(self):
-        with patch.dict(
-            os.environ,
-            {"JOB_BACKEND": "redis", "MCP_TOOL_PROFILE": "unified"},
-            clear=False,
-        ), patch(
-            "planner.research_model_configured",
-            return_value=False,
-        ), patch.object(worker, "get_job_store") as get_store:
+    async def test_unified_healthcheck_does_not_depend_on_internal_model(self):
+        with (
+            patch.dict(
+                os.environ,
+                {"JOB_BACKEND": "redis", "MCP_TOOL_PROFILE": "unified"},
+                clear=False,
+            ),
+            patch.object(worker, "get_job_store") as get_store,
+        ):
+            get_store.return_value.ping = AsyncMock(return_value=True)
+            get_store.return_value.get_worker_heartbeat = AsyncMock(
+                return_value={"state": "ready"}
+            )
+            get_store.return_value.close = AsyncMock()
             healthy = await worker.worker_healthcheck()
 
-        self.assertFalse(healthy)
-        get_store.assert_not_called()
+        self.assertTrue(healthy)
+
+    async def test_run_continues_after_one_worker_iteration_failure(self):
+        store = AsyncMock()
+        store.result_ttl_seconds = 2_592_000
+        store.ping.return_value = True
+        store.requeue_stale_jobs.return_value = 0
+        store.claim_due_ingestion_invalidations.return_value = []
+        job_worker = JobWorker(
+            store=store,
+            artifacts=self.artifacts,
+            worker_id="test-worker",
+            poll_interval=0.05,
+        )
+        job_worker._maybe_repair_qdrant_lifecycle = AsyncMock()
+        job_worker._maybe_prune_artifacts = AsyncMock()
+        job_worker._maybe_recover_stale_jobs = AsyncMock()
+        job_worker._maybe_replay_ingestion_invalidations = AsyncMock()
+        calls = 0
+
+        async def run_once(timeout):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise OSError("Redis temporarily unavailable")
+            job_worker.stop()
+            return False
+
+        job_worker.run_once = run_once
+
+        await asyncio.wait_for(job_worker.run(), timeout=0.5)
+
+        self.assertEqual(calls, 2)
+
+    async def test_run_continues_when_maintenance_or_heartbeat_temporarily_fails(self):
+        store = AsyncMock()
+        store.result_ttl_seconds = 2_592_000
+        store.ping.return_value = True
+        store.requeue_stale_jobs.return_value = 0
+        store.claim_due_ingestion_invalidations.return_value = []
+        job_worker = JobWorker(
+            store=store,
+            artifacts=self.artifacts,
+            worker_id="test-worker",
+            poll_interval=0.05,
+        )
+        repairs = 0
+
+        async def repair(*, force=False):
+            nonlocal repairs
+            repairs += 1
+            if not force and repairs == 2:
+                raise OSError("Qdrant temporarily unavailable")
+
+        job_worker._maybe_repair_qdrant_lifecycle = repair
+        job_worker._maybe_prune_artifacts = AsyncMock()
+        job_worker._maybe_recover_stale_jobs = AsyncMock()
+        job_worker._maybe_replay_ingestion_invalidations = AsyncMock()
+        job_worker.run_once = AsyncMock(side_effect=lambda timeout: job_worker.stop())
+
+        await asyncio.wait_for(job_worker.run(), timeout=0.5)
+
+        job_worker.run_once.assert_awaited_once()
+        self.assertGreaterEqual(repairs, 3)
+
+    async def test_run_continues_when_ready_heartbeat_temporarily_fails(self):
+        store = AsyncMock()
+        store.result_ttl_seconds = 2_592_000
+        store.ping.return_value = True
+        store.requeue_stale_jobs.return_value = 0
+        store.claim_due_ingestion_invalidations.return_value = []
+        store.record_worker_heartbeat.side_effect = [
+            None,
+            None,
+            OSError("Redis heartbeat unavailable"),
+            None,
+            None,
+        ]
+        job_worker = JobWorker(
+            store=store,
+            artifacts=self.artifacts,
+            worker_id="test-worker",
+            poll_interval=0.05,
+        )
+        job_worker._maybe_repair_qdrant_lifecycle = AsyncMock()
+        job_worker._maybe_prune_artifacts = AsyncMock()
+        job_worker._maybe_recover_stale_jobs = AsyncMock()
+        job_worker._maybe_replay_ingestion_invalidations = AsyncMock()
+        job_worker.run_once = AsyncMock(side_effect=lambda timeout: job_worker.stop())
+
+        await asyncio.wait_for(job_worker.run(), timeout=0.5)
+
+        job_worker.run_once.assert_awaited_once()
+        self.assertEqual(store.record_worker_heartbeat.await_count, 5)
+
+    async def test_run_propagates_cancellation_from_iteration(self):
+        store = AsyncMock()
+        store.result_ttl_seconds = 2_592_000
+        store.ping.return_value = True
+        store.requeue_stale_jobs.return_value = 0
+        store.claim_due_ingestion_invalidations.return_value = []
+        job_worker = JobWorker(
+            store=store,
+            artifacts=self.artifacts,
+            worker_id="test-worker",
+            poll_interval=0.05,
+        )
+        job_worker._maybe_repair_qdrant_lifecycle = AsyncMock()
+        job_worker._maybe_prune_artifacts = AsyncMock(
+            side_effect=[None, asyncio.CancelledError]
+        )
+        job_worker._maybe_recover_stale_jobs = AsyncMock()
+        job_worker._maybe_replay_ingestion_invalidations = AsyncMock()
+        run_once = AsyncMock()
+        job_worker.run_once = run_once
+
+        with self.assertRaises(asyncio.CancelledError):
+            await job_worker.run()
+
+        run_once.assert_awaited_once()
 
     async def asyncSetUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -213,7 +355,299 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(store.registered_invalidations, {})
         self.assertIsNone(store.failed)
 
-    async def test_authenticated_worker_scopes_search_cache_without_exposing_owner(self):
+    async def test_completed_assistant_survives_artifact_archival_failure(self):
+        job_id = uuid.uuid4().hex
+        store = FakeWorkerStore(
+            {
+                "job_id": job_id,
+                "kind": "research_assistant",
+                "payload": {
+                    "request": "Find the current installation guide",
+                    "mode": "balanced",
+                },
+            }
+        )
+        result = {
+            "status": "complete",
+            "answer_markdown": "Install it using the documented command.",
+            "citations": [
+                {
+                    "evidence_id": 1,
+                    "title": "Official guide",
+                    "url": "https://docs.example.com/install",
+                    "published_at": "2026-08-01",
+                }
+            ],
+            "limitations": [],
+            "confidence": "high",
+            "research_summary": {
+                "sources_consulted": 2,
+                "evidence_items": 3,
+                "queries": ["current official installation guide"],
+            },
+            "retrieval_context": {"current_date_utc": "2026-08-03"},
+        }
+
+        async def dispatch(_kind, _payload):
+            return result
+
+        job_worker = JobWorker(
+            store=store,
+            artifacts=self.artifacts,
+            dispatcher=dispatch,
+            worker_id="test-worker",
+            poll_interval=0.01,
+        )
+        with patch.object(
+            self.artifacts,
+            "write_json",
+            AsyncMock(side_effect=OSError("artifact disk unavailable")),
+        ):
+            self.assertTrue(await job_worker.run_once(timeout=0.01))
+
+        self.assertIsNone(store.failed)
+        self.assertIsNotNone(store.completed)
+        _, metadata, _ = store.completed
+        self.assertEqual(metadata["result_storage"], "inline_fallback")
+        inline = metadata["inline_result"]
+        self.assertEqual(inline["answer_markdown"], result["answer_markdown"])
+        self.assertEqual(inline["citations"][0]["url"], result["citations"][0]["url"])
+        self.assertLessEqual(
+            len(json.dumps(metadata, ensure_ascii=False).encode("utf-8")),
+            262_144,
+        )
+
+    async def test_successful_result_delivery_retries_without_rerunning_research(self):
+        job_id = uuid.uuid4().hex
+        store = FakeWorkerStore(
+            {"job_id": job_id, "kind": "research_web", "payload": {"query": "q"}}
+        )
+        original_complete = store.complete_job
+        complete_attempts = 0
+
+        async def transient_complete(*args, **kwargs):
+            nonlocal complete_attempts
+            complete_attempts += 1
+            if complete_attempts < 3:
+                raise OSError("Redis temporarily unavailable")
+            return await original_complete(*args, **kwargs)
+
+        store.complete_job = transient_complete
+        dispatch = AsyncMock(
+            return_value={"query": "q", "results": [{"text": "useful evidence"}]}
+        )
+        job_worker = JobWorker(
+            store=store,
+            artifacts=self.artifacts,
+            dispatcher=dispatch,
+            worker_id="test-worker",
+            poll_interval=0.01,
+        )
+
+        self.assertTrue(await job_worker.run_once(timeout=0.01))
+
+        dispatch.assert_awaited_once()
+        self.assertEqual(complete_attempts, 3)
+        self.assertIsNotNone(store.completed)
+        self.assertIsNone(store.failed)
+        self.assertIsNone(store.requeued)
+
+    async def test_persistent_success_delivery_failure_requeues_without_failing_job(self):
+        job_id = uuid.uuid4().hex
+        store = FakeWorkerStore(
+            {"job_id": job_id, "kind": "research_web", "payload": {"query": "q"}}
+        )
+        store.complete_job = AsyncMock(
+            side_effect=OSError("Redis terminal write unavailable")
+        )
+        dispatch = AsyncMock(
+            return_value={"query": "q", "results": [{"text": "useful evidence"}]}
+        )
+        job_worker = JobWorker(
+            store=store,
+            artifacts=self.artifacts,
+            dispatcher=dispatch,
+            worker_id="test-worker",
+            poll_interval=0.01,
+        )
+
+        self.assertTrue(await job_worker.run_once(timeout=0.01))
+
+        dispatch.assert_awaited_once()
+        self.assertEqual(store.complete_job.await_count, 3)
+        self.assertIsNone(store.failed)
+        self.assertIsNotNone(store.requeued)
+        self.assertIn("completed result", store.requeued[1])
+        self.assertEqual(len(store.delivery_requeues), 1)
+        self.assertTrue(store.delivery_requeues[0][1]["_delivery_only"])
+        self.assertIn("result_metadata", store.delivery_requeues[0][1])
+        self.assertEqual(
+            len(list(self.artifacts.root.joinpath(job_id).glob("result-*.json"))),
+            1,
+        )
+
+    async def test_success_delivery_lease_loss_never_invalidates_completed_ingestion(self):
+        job_id = uuid.uuid4().hex
+        store = FakeWorkerStore(
+            {"job_id": job_id, "kind": "ingest_text", "payload": {"text": "q"}}
+        )
+        store.complete_job = AsyncMock(side_effect=JobLeaseLostError("resolved"))
+        dispatch = AsyncMock(return_value={"stored": 1})
+        job_worker = JobWorker(
+            store=store,
+            artifacts=self.artifacts,
+            dispatcher=dispatch,
+            worker_id="test-worker",
+            poll_interval=0.01,
+        )
+
+        self.assertTrue(await job_worker.run_once(timeout=0.01))
+
+        dispatch.assert_awaited_once()
+        store.complete_job.assert_awaited_once()
+        self.assertIsNone(store.failed)
+        self.assertIsNone(store.requeued)
+        self.invalidate_attempt.assert_not_awaited()
+
+    async def test_inline_fallback_delivery_failure_requeues_without_provider_failure(self):
+        job_id = uuid.uuid4().hex
+        store = FakeWorkerStore(
+            {
+                "job_id": job_id,
+                "kind": "research_assistant",
+                "payload": {"request": "Find current docs", "mode": "balanced"},
+            }
+        )
+        store.complete_job = AsyncMock(side_effect=OSError("Redis unavailable"))
+        dispatch = AsyncMock(
+            return_value={
+                "status": "complete",
+                "answer_markdown": "Use the documented command.",
+                "citations": [{"url": "https://docs.example/install"}],
+            }
+        )
+        job_worker = JobWorker(
+            store=store,
+            artifacts=self.artifacts,
+            dispatcher=dispatch,
+            worker_id="test-worker",
+            poll_interval=0.01,
+        )
+
+        with patch.object(
+            self.artifacts,
+            "write_json",
+            AsyncMock(side_effect=OSError("artifact disk unavailable")),
+        ):
+            self.assertTrue(await job_worker.run_once(timeout=0.01))
+
+        dispatch.assert_awaited_once()
+        self.assertEqual(store.complete_job.await_count, 3)
+        self.assertIsNone(store.failed)
+        self.assertEqual(len(store.delivery_requeues), 1)
+        self.assertTrue(store.delivery_requeues[0][1]["_delivery_only"])
+
+    async def test_persistent_delivery_and_requeue_failure_still_never_fails_success(self):
+        job_id = uuid.uuid4().hex
+        store = FakeWorkerStore(
+            {"job_id": job_id, "kind": "research_web", "payload": {"query": "q"}}
+        )
+        store.complete_job = AsyncMock(side_effect=OSError("Redis unavailable"))
+        store.requeue_job = AsyncMock(side_effect=OSError("Redis still unavailable"))
+        dispatch = AsyncMock(return_value={"query": "q", "results": [{"text": "e"}]})
+        job_worker = JobWorker(
+            store=store,
+            artifacts=self.artifacts,
+            dispatcher=dispatch,
+            worker_id="test-worker",
+            poll_interval=0.01,
+        )
+
+        self.assertTrue(await job_worker.run_once(timeout=0.01))
+
+        dispatch.assert_awaited_once()
+        self.assertEqual(store.complete_job.await_count, 3)
+        self.assertEqual(len(store.delivery_requeues), 1)
+        self.assertIsNone(store.failed)
+        self.assertEqual(
+            len(list(self.artifacts.root.joinpath(job_id).glob("result-*.json"))),
+            1,
+        )
+
+    async def test_delivery_replay_does_not_dispatch_provider_again(self):
+        job_id = uuid.uuid4().hex
+        result = {"query": "q", "results": [{"text": "evidence"}]}
+        artifact = await self.artifacts.write_json(
+            job_id,
+            result,
+            name="result-replay",
+        )
+        store = FakeWorkerStore(
+            {
+                "job_id": job_id,
+                "kind": "research_web",
+                "payload": {
+                    "_delivery_only": True,
+                    "result_metadata": worker.compact_result_metadata(result, artifact),
+                    "artifact": artifact,
+                    "artifact_path": artifact["relative_path"],
+                },
+            }
+        )
+        dispatch = AsyncMock(side_effect=AssertionError("provider must not rerun"))
+        job_worker = JobWorker(
+            store=store,
+            artifacts=self.artifacts,
+            dispatcher=dispatch,
+            worker_id="test-worker",
+            poll_interval=0.01,
+        )
+
+        self.assertTrue(await job_worker.run_once(timeout=0.01))
+
+        dispatch.assert_not_awaited()
+        self.assertIsNotNone(store.completed)
+        self.assertIsNone(store.failed)
+
+    def test_inline_fallback_prioritizes_answer_over_oversized_metadata(self):
+        answer = "A" * 8000
+        result = {
+            "status": "partial",
+            "answer_markdown": answer,
+            "citations": [
+                {
+                    "title": "T" * 2000,
+                    "url": f"https://example.com/{index}/" + "u" * 1900,
+                    "published_at": "P" * 2000,
+                    "evidence_type": "E" * 2000,
+                }
+                for index in range(64)
+            ],
+            "limitations": ["L" * 2000 for _ in range(32)],
+            "answering_instructions": ["I" * 1000 for _ in range(8)],
+            "research_summary": {
+                "queries": ["Q" * 500 for _ in range(8)],
+                "acquisition_errors": [
+                    {"detail": "D" * 2000} for _ in range(16)
+                ],
+            },
+        }
+
+        metadata = worker.inline_assistant_result_metadata(result, max_bytes=12_000)
+
+        self.assertIsNotNone(metadata)
+        inline = metadata["inline_result"]
+        self.assertTrue(inline["answer_markdown"])
+        self.assertTrue(inline["citations"])
+        self.assertIn("url", inline["citations"][0])
+        self.assertLessEqual(
+            len(json.dumps(metadata, ensure_ascii=False).encode("utf-8")),
+            12_000,
+        )
+
+    async def test_authenticated_worker_scopes_search_cache_without_exposing_owner(
+        self,
+    ):
         job_id = uuid.uuid4().hex
         owner_id = "librechat-client"
         store = FakeWorkerStore(
@@ -443,19 +877,84 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
             worker_id="test-worker",
             poll_interval=0.01,
         )
-        with patch.dict(
-            os.environ,
-            {
-                "RESEARCH_ASSISTANT_INTERACTIVE_TIMEOUT_SECONDS": "36",
-                "RESEARCH_ASSISTANT_SYNC_WAIT_SECONDS": "45",
-            },
-        ), patch.object(worker, "_queued_seconds", return_value=11.5):
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "RESEARCH_ASSISTANT_INTERACTIVE_TIMEOUT_SECONDS": "36",
+                    "RESEARCH_ASSISTANT_SYNC_WAIT_SECONDS": "45",
+                },
+            ),
+            patch.object(worker, "_queued_seconds", return_value=11.5),
+        ):
             self.assertTrue(await job_worker.run_once(timeout=0.01))
 
         self.assertAlmostEqual(
             dispatched_payload[_INTERNAL_ASSISTANT_TIME_BUDGET],
             8.5,
         )
+
+    async def test_expired_interactive_queue_budget_fails_without_dispatch(self):
+        job_id = uuid.uuid4().hex
+        store = FakeWorkerStore(
+            {
+                "job_id": job_id,
+                "kind": "research_assistant",
+                "payload": {
+                    "request": "Find the current installation guide",
+                    "mode": "balanced",
+                    _INTERNAL_ASSISTANT_TIME_BUDGET: 20,
+                },
+            }
+        )
+        dispatch = AsyncMock()
+        job_worker = JobWorker(
+            store=store,
+            artifacts=self.artifacts,
+            dispatcher=dispatch,
+            worker_id="test-worker",
+            poll_interval=0.01,
+        )
+
+        with patch.object(worker, "_queued_seconds", return_value=20.0):
+            self.assertTrue(await job_worker.run_once(timeout=0.01))
+
+        dispatch.assert_not_awaited()
+        self.assertIsNone(store.completed)
+        self.assertIsNotNone(store.failed)
+        self.assertEqual(store.failed[1]["type"], "TimeoutError")
+        self.assertEqual(
+            store.failed[1]["message"],
+            "interactive research deadline expired while waiting in queue",
+        )
+
+    async def test_subsecond_interactive_budget_fails_without_dispatch(self):
+        job_id = uuid.uuid4().hex
+        store = FakeWorkerStore(
+            {
+                "job_id": job_id,
+                "kind": "research_assistant",
+                "payload": {
+                    "request": "Find current instructions",
+                    "mode": "balanced",
+                    _INTERNAL_ASSISTANT_TIME_BUDGET: 20,
+                },
+            }
+        )
+        dispatch = AsyncMock()
+        job_worker = JobWorker(
+            store=store,
+            artifacts=self.artifacts,
+            dispatcher=dispatch,
+            worker_id="test-worker",
+            poll_interval=0.01,
+        )
+
+        with patch.object(worker, "_queued_seconds", return_value=19.5):
+            self.assertTrue(await job_worker.run_once(timeout=0.01))
+
+        dispatch.assert_not_awaited()
+        self.assertEqual(store.failed[1]["type"], "TimeoutError")
 
     async def test_deep_assistant_does_not_receive_interactive_budget(self):
         job_id = uuid.uuid4().hex
@@ -485,10 +984,13 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(_INTERNAL_ASSISTANT_TIME_BUDGET, dispatched_payload)
 
     async def test_dispatch_runs_authorized_github_work_and_marks_it_untrusted(self):
-        with patch.dict(os.environ, {"GITHUB_TOKEN": ""}, clear=False), patch(
-            "github_connector.inspect_github_repository",
-            AsyncMock(return_value={"type": "repository", "files": []}),
-        ) as inspect:
+        with (
+            patch.dict(os.environ, {"GITHUB_TOKEN": ""}, clear=False),
+            patch(
+                "github_connector.inspect_github_repository",
+                AsyncMock(return_value={"type": "repository", "files": []}),
+            ) as inspect,
+        ):
             result = await dispatch_job(
                 "github_research",
                 {
@@ -514,10 +1016,13 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
             "GITHUB_TOKEN": "server-secret",
             "GITHUB_ALLOWED_REPOSITORIES": "example/allowed",
         }
-        with patch.dict(os.environ, environment, clear=False), patch(
-            "github_connector.inspect_github_repository",
-            AsyncMock(return_value={"type": "repository"}),
-        ) as inspect:
+        with (
+            patch.dict(os.environ, environment, clear=False),
+            patch(
+                "github_connector.inspect_github_repository",
+                AsyncMock(return_value={"type": "repository"}),
+            ) as inspect,
+        ):
             result = await dispatch_job(
                 "github_research",
                 {
@@ -913,6 +1418,41 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(store.cancelled[0], job_id)
         self.assertIsNone(store.failed)
+
+    async def test_cancellation_consumes_simultaneous_dispatch_failure(self):
+        job_id = uuid.uuid4().hex
+        store = FakeWorkerStore(
+            {"job_id": job_id, "kind": "research_web", "payload": {"query": "q"}},
+            cancel_after_checks=1,
+        )
+        failure = RuntimeError("simultaneous provider failure")
+
+        async def dispatch(_kind, _payload):
+            raise failure
+
+        job_worker = JobWorker(
+            store=store,
+            artifacts=self.artifacts,
+            dispatcher=dispatch,
+            worker_id="test-worker",
+            poll_interval=0.01,
+        )
+
+        handled_contexts = []
+        loop = asyncio.get_running_loop()
+        previous_handler = loop.get_exception_handler()
+        loop.set_exception_handler(lambda _loop, context: handled_contexts.append(context))
+        try:
+            await job_worker.run_once(timeout=0.01)
+            await asyncio.sleep(0)
+        finally:
+            loop.set_exception_handler(previous_handler)
+
+        self.assertEqual(store.cancelled[0], job_id)
+        self.assertIsNone(store.failed)
+        self.assertFalse(
+            any(context.get("exception") is failure for context in handled_contexts)
+        )
 
     async def test_dispatch_failure_redacts_before_truncating(self):
         job_id = uuid.uuid4().hex

@@ -7,6 +7,7 @@ import ipaddress
 import json
 import os
 import re
+import ssl
 import threading
 import time
 import unicodedata
@@ -53,6 +54,11 @@ SEARXNG_TIMEOUT_SECONDS = max(
     1.0,
     float(os.getenv("SEARXNG_TIMEOUT_SECONDS", "12")),
 )
+# Build TLS trust once at import time. Constructing it inside a staged request
+# can consume a short caller deadline before the first completed engine wave is
+# harvested, especially on Windows. SearXNG is an internal service, so it must
+# not inherit host proxy settings either.
+_SEARXNG_SSL_CONTEXT = ssl.create_default_context()
 SEARCH_CACHE_TTL_SECONDS = max(
     1.0,
     min(3600.0, float(os.getenv("SEARCH_CACHE_TTL_SECONDS", "600"))),
@@ -3153,7 +3159,11 @@ async def _staged_searxng_search(
             return False
         return True
 
-    async with httpx.AsyncClient(timeout=SEARXNG_TIMEOUT_SECONDS) as client:
+    async with httpx.AsyncClient(
+        timeout=SEARXNG_TIMEOUT_SECONDS,
+        verify=_SEARXNG_SSL_CONTEXT,
+        trust_env=False,
+    ) as client:
         for index, configured_engines in enumerate(
             _engine_stages(policy, mode), start=1
         ):

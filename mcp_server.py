@@ -31,7 +31,12 @@ from job_store import (
     get_job_status,
     request_cancellation,
 )
-from pipelines import build_evidence_pack, compact_investigation_result, explore_url_pipeline, research_pipeline
+from pipelines import (
+    build_evidence_pack,
+    compact_investigation_result,
+    explore_url_pipeline,
+    research_pipeline,
+)
 from query_hints import (
     MAX_PROPOSED_SEARCH_QUERIES,
     PROPOSED_SEARCH_QUERY_MAX_CHARS,
@@ -55,7 +60,9 @@ from shared import (
 
 
 TOKEN_POLICIES = load_token_policies()
-MCP_TOOL_PROFILE = os.getenv("MCP_TOOL_PROFILE", "all").strip().lower()
+# Keep the one-call assistant as the upgrade-safe default. Legacy specialized
+# tools remain opt-in via ``advanced`` or ``all``.
+MCP_TOOL_PROFILE = os.getenv("MCP_TOOL_PROFILE", "unified").strip().lower()
 if MCP_TOOL_PROFILE not in {"unified", "advanced", "all"}:
     raise ValueError("MCP_TOOL_PROFILE must be unified, advanced, or all")
 
@@ -87,8 +94,9 @@ def _server_instructions() -> str:
         "Use research_assistant once for any request that depends on current or externally "
         "verified information, web pages, documentation, repositories, unfamiliar errors, "
         "images, or research. Pass the user's complete request. The server plans, searches, "
-        "browses, verifies, and writes a citation-checked answer internally under one interactive "
-        "deadline; present its answer_markdown directly and do not launch redundant research calls. "
+        "browses, and verifies under one interactive deadline. It returns either a citation-checked "
+        "answer or a cited evidence digest with explicit answering instructions; follow those "
+        "instructions and do not launch redundant research calls. "
         "A client must still make the initial MCP tool call; MCP cannot force a client model "
         "to call tools. "
     )
@@ -125,6 +133,7 @@ def _mcp_tool(exposure: str):
         return function
 
     return decorate
+
 
 JOB_BACKEND = os.getenv("JOB_BACKEND", "inline").strip().lower()
 MCP_CLIENT_TIMEOUT_SECONDS = max(
@@ -169,8 +178,19 @@ RESEARCH_ASSISTANT_INTERACTIVE_TIMEOUT_SECONDS = min(
     ),
     max(1.0, RESEARCH_ASSISTANT_SYNC_WAIT_SECONDS - 5.0),
 )
+RESEARCH_RUNNER_SOCKET = os.getenv(
+    "RESEARCH_RUNNER_SOCKET", "/run/research-interactive/runner.sock"
+)
 _INTERNAL_ASSISTANT_TIME_BUDGET = "_research_assistant_time_budget_seconds"
 MCP_JOB_POLL_SECONDS = max(0.1, float(os.getenv("MCP_JOB_POLL_SECONDS", "0.5")))
+MCP_JOB_STATUS_TIMEOUT_SECONDS = max(
+    0.1,
+    float(os.getenv("MCP_JOB_STATUS_TIMEOUT_SECONDS", "1.0")),
+)
+MCP_JOB_RESULT_TIMEOUT_SECONDS = max(
+    0.5,
+    float(os.getenv("MCP_JOB_RESULT_TIMEOUT_SECONDS", "4.0")),
+)
 MCP_JOB_LONG_POLL_SECONDS = max(
     0.0,
     min(60.0, float(os.getenv("MCP_JOB_LONG_POLL_SECONDS", "15"))),
@@ -251,10 +271,14 @@ JobWaitSeconds = Annotated[float, Field(ge=0, le=60)]
 
 
 def _comma_separated_setting(name: str, default: str = "") -> list[str]:
-    values = [item.strip() for item in os.getenv(name, default).split(",") if item.strip()]
+    values = [
+        item.strip() for item in os.getenv(name, default).split(",") if item.strip()
+    ]
     if len(values) > 64:
         raise ValueError(f"{name} cannot contain more than 64 entries")
-    if any(any(ord(char) < 33 or ord(char) == 127 for char in value) for value in values):
+    if any(
+        any(ord(char) < 33 or ord(char) == 127 for char in value) for value in values
+    ):
         raise ValueError(f"{name} contains an invalid entry")
     return list(dict.fromkeys(values))
 
@@ -271,7 +295,11 @@ def _default_allowed_host_entries(*hosts: str) -> list[str]:
         else:
             if address.is_unspecified:
                 continue
-            normalized = f"[{address.compressed}]" if address.version == 6 else address.compressed
+            normalized = (
+                f"[{address.compressed}]"
+                if address.version == 6
+                else address.compressed
+            )
         entries.extend((normalized, f"{normalized}:*"))
     return list(dict.fromkeys(entries))
 
@@ -310,7 +338,9 @@ def _http_security_settings(host: str, external_bind: str) -> dict:
             or parsed.query
             or parsed.fragment
         ):
-            raise ValueError("MCP_ALLOWED_ORIGINS entries must be absolute HTTP(S) origins")
+            raise ValueError(
+                "MCP_ALLOWED_ORIGINS entries must be absolute HTTP(S) origins"
+            )
 
     settings = {
         "host_origin_protection": True,
@@ -380,7 +410,9 @@ def _build_run_kwargs() -> dict:
     return run_kwargs
 
 
-def _bounded_text(value: str, field: str, max_chars: int, *, allow_empty: bool = False) -> str:
+def _bounded_text(
+    value: str, field: str, max_chars: int, *, allow_empty: bool = False
+) -> str:
     if not isinstance(value, str):
         raise ValueError(f"{field} must be a string")
     normalized = value.strip()
@@ -409,7 +441,10 @@ def _complete_research_result(result: dict) -> dict:
     """Mark a full result complete and hide only its duplicate job archive path."""
     if not isinstance(result, dict) or result.get("error"):
         return result
-    if result.get("status") in {"queued", "running"} and result.get("terminal") is False:
+    if (
+        result.get("status") in {"queued", "running"}
+        and result.get("terminal") is False
+    ):
         return result
 
     output = dict(result)
@@ -417,10 +452,26 @@ def _complete_research_result(result: dict) -> dict:
     instructions = list(output.get("answering_instructions") or [])
     evidence = output.get("evidence")
     if isinstance(evidence, list) and evidence:
-        evidence_instruction = (
-            "The evidence array is the authoritative current-run research result. Answer from it now; "
-            "do not rerun research merely because results or memory_results is empty."
+        tentative_only = all(
+            isinstance(item, dict) and bool(item.get("relevance_fallback"))
+            for item in evidence
         )
+        if tentative_only:
+            instructions = [
+                instruction
+                for instruction in instructions
+                if "answer now" not in str(instruction).casefold()
+            ]
+            evidence_instruction = (
+                "The evidence array contains only tentative leads that failed the topical relevance "
+                "gate. Do not present them as an answer to the factual request; clearly report the "
+                "evidence gap and their limitations without rerunning the same research request."
+            )
+        else:
+            evidence_instruction = (
+                "The evidence array is the authoritative current-run research result. Answer from it now; "
+                "do not rerun research merely because results or memory_results is empty."
+            )
         if evidence_instruction not in instructions:
             instructions.append(evidence_instruction)
     persistence = output.get("persistence")
@@ -528,7 +579,9 @@ def _current_github_access_policy() -> Optional[dict]:
     )
     return {
         "allowed": "github:read" in scopes,
-        "repositories": list(dict.fromkeys(item for item in repositories if item))[:256],
+        "repositories": list(dict.fromkeys(item for item in repositories if item))[
+            :256
+        ],
     }
 
 
@@ -588,6 +641,17 @@ async def _load_completed_job(job_id: str) -> dict:
         return job_result
 
     metadata = job_result.get("result") or {}
+    inline_result = metadata.get("inline_result")
+    if isinstance(inline_result, dict):
+        full_result = dict(inline_result)
+        full_result["job"] = {
+            "job_id": job_id,
+            "status": "succeeded",
+            "artifact_id": metadata.get("artifact_id"),
+            "result_storage": "inline_fallback",
+        }
+        return _complete_research_result(full_result)
+
     artifact_path = metadata.get("artifact_path")
     if not artifact_path:
         return job_result
@@ -694,18 +758,38 @@ def _research_admission_limited_response(
 
 
 async def _wait_for_terminal_job(job_id: str, wait_seconds: float) -> Optional[dict]:
-    deadline = time.monotonic() + max(0.0, min(60.0, wait_seconds))
-    status = await get_job_status(job_id)
-    while (
-        status
-        and status.get("status") not in {"succeeded", "failed", "cancelled"}
-        and time.monotonic() < deadline
-    ):
+    total_wait = max(0.0, min(60.0, wait_seconds))
+    deadline = time.monotonic() + total_wait
+    status: Optional[dict] = None
+    last_error: Optional[Exception] = None
+    first_read = True
+    while first_read or time.monotonic() < deadline:
+        first_read = False
+        remaining = (
+            deadline - time.monotonic()
+            if total_wait > 0
+            else MCP_JOB_STATUS_TIMEOUT_SECONDS
+        )
+        if remaining <= 0:
+            break
+        try:
+            async with asyncio.timeout(
+                min(MCP_JOB_STATUS_TIMEOUT_SECONDS, remaining)
+            ):
+                status = await get_job_status(job_id)
+            last_error = None
+        except Exception as exc:
+            last_error = exc
+        if status and status.get("status") in {"succeeded", "failed", "cancelled"}:
+            return status
+        if total_wait <= 0:
+            break
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
         await asyncio.sleep(min(MCP_JOB_POLL_SECONDS, remaining))
-        status = await get_job_status(job_id)
+    if status is None and last_error is not None:
+        raise last_error
     return status
 
 
@@ -716,13 +800,21 @@ async def _enqueue_and_wait(
     *,
     wait_seconds: Optional[float] = None,
 ) -> dict:
+    effective_wait = MCP_SYNC_JOB_WAIT_SECONDS if wait_seconds is None else wait_seconds
+    deadline = time.monotonic() + max(0.0, effective_wait)
     try:
         owner_id = _current_principal_id()
-        job = (
-            await enqueue_job(kind, payload, owner_id=owner_id)
-            if owner_id
-            else await enqueue_job(kind, payload)
+        remaining_wait = max(0.0, deadline - time.monotonic())
+        enqueue_timeout = min(
+            MCP_JOB_STATUS_TIMEOUT_SECONDS,
+            remaining_wait if effective_wait > 0 else MCP_JOB_STATUS_TIMEOUT_SECONDS,
         )
+        async with asyncio.timeout(enqueue_timeout):
+            job = (
+                await enqueue_job(kind, payload, owner_id=owner_id)
+                if owner_id
+                else await enqueue_job(kind, payload)
+            )
     except ResearchAdmissionLimitedError as exc:
         return _research_admission_limited_response(exc, tool_name=tool_name)
     except JobQueueFullError as exc:
@@ -740,64 +832,77 @@ async def _enqueue_and_wait(
             "retryable": True,
         }
 
-    effective_wait = MCP_SYNC_JOB_WAIT_SECONDS if wait_seconds is None else wait_seconds
-    deadline = time.monotonic() + max(0.0, effective_wait)
     last_status = str(job.get("status") or "queued")
-    final_poll = False
-    try:
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            try:
-                async with asyncio.timeout(remaining):
-                    status = await get_job_status(job["job_id"])
-            except TimeoutError:
-                break
-            if status and status.get("status"):
-                last_status = str(status["status"])
-            if status and status.get("status") in {"succeeded", "failed", "cancelled"}:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                try:
-                    async with asyncio.timeout(remaining):
-                        return await _load_completed_job(job["job_id"])
-                except TimeoutError:
-                    break
-            if final_poll:
-                break
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            if remaining <= MCP_JOB_POLL_SECONDS:
-                # Leave a small, in-deadline window for one final status read.
-                final_poll = True
-                final_window = min(0.1, max(0.01, remaining * 0.25))
-                await asyncio.sleep(max(0.0, remaining - final_window))
-            else:
-                await asyncio.sleep(MCP_JOB_POLL_SECONDS)
-    except JobQueueFullError as exc:
-        return {
-            "error": "job_queue_full",
-            "detail": _safe_error_detail(exc),
-            "retryable": True,
-        }
-    except Exception as exc:
-        return _running_job_response(
-            job["job_id"],
-            tool_name=tool_name,
-            warning="job_status_temporarily_unavailable",
-            detail=_safe_error_detail(exc),
-            coalesced=bool(job.get("coalesced")),
-        )
+    last_status_error: Optional[Exception] = None
+    result_reserve = min(
+        MCP_JOB_RESULT_TIMEOUT_SECONDS,
+        max(0.0, effective_wait * 0.25),
+    )
+    polling_deadline = max(time.monotonic(), deadline - result_reserve)
 
-    return _running_job_response(
+    async def read_status(*, boundary: float) -> Optional[dict]:
+        nonlocal last_status_error
+        remaining = boundary - time.monotonic()
+        if remaining <= 0:
+            return None
+        try:
+            async with asyncio.timeout(min(MCP_JOB_STATUS_TIMEOUT_SECONDS, remaining)):
+                status = await get_job_status(job["job_id"])
+        except Exception as exc:
+            # Redis/network hiccups are retryable until the one absolute client
+            # deadline. A single failed read must not discard a completed job.
+            last_status_error = exc
+            return None
+        last_status_error = None
+        return status
+
+    async def load_terminal_result() -> Optional[dict]:
+        nonlocal last_status_error
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        try:
+            async with asyncio.timeout(min(MCP_JOB_RESULT_TIMEOUT_SECONDS, remaining)):
+                return await _load_completed_job(job["job_id"])
+        except Exception as exc:
+            last_status_error = exc
+            return None
+
+    while time.monotonic() < polling_deadline:
+        status = await read_status(boundary=polling_deadline)
+        if status and status.get("status"):
+            last_status = str(status["status"])
+            if last_status in {"succeeded", "failed", "cancelled"}:
+                completed = await load_terminal_result()
+                if completed is not None:
+                    return completed
+                break
+        remaining = polling_deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        await asyncio.sleep(min(MCP_JOB_POLL_SECONDS, remaining))
+
+    # Harvest once more at the boundary. This catches jobs that completed while
+    # the last status request timed out and preserves the reserved result window.
+    final_status = await read_status(boundary=deadline)
+    if final_status and final_status.get("status"):
+        last_status = str(final_status["status"])
+        if last_status in {"succeeded", "failed", "cancelled"}:
+            completed = await load_terminal_result()
+            if completed is not None:
+                return completed
+
+    response = _running_job_response(
         job["job_id"],
         tool_name=tool_name,
         status=last_status,
         coalesced=bool(job.get("coalesced")),
     )
+    if last_status_error is not None:
+        response["warning"] = "job_status_temporarily_unavailable"
+        response["detail"] = _safe_error_detail(last_status_error)
+    return response
+
 
 async def run_resilient(coro: Awaitable[dict], tool_name: str) -> dict:
     try:
@@ -808,6 +913,21 @@ async def run_resilient(coro: Awaitable[dict], tool_name: str) -> dict:
         # here makes FastMCP attempt a second response and crashes the session
         # with "Request already responded to".
         raise
+
+
+async def _run_interactive_assistant(payload: dict) -> dict:
+    """Run ordinary assistant research outside the durable Redis worker.
+
+    The Unix socket is private to the gateway and the interactive runner. A
+    failure is returned as a terminal structured response; it is never turned
+    into a queued/running handle that the MCP client cannot reliably resume.
+    """
+    from research_runner_client import run_interactive_research
+
+    return await run_interactive_research(
+        payload,
+        timeout_seconds=RESEARCH_ASSISTANT_INTERACTIVE_TIMEOUT_SECONDS,
+    )
 
 
 @_mcp_tool("unified")
@@ -822,19 +942,20 @@ async def research_assistant(
     Use this once whenever the answer depends on current or externally verified
     information, web pages, documentation, repositories, unfamiliar errors,
     technical guidance, products, news, or images. Pass the user's complete
-    request, including constraints and desired output. The server-configured
-    research model interprets the goal, creates focused searches, selects and
-    browses sources concurrently, and returns a finished citation-checked
-    Markdown answer. Auto, quick, balanced, technical, and academic calls are
-    bounded by a server-owned interactive deadline; slow paths are harvested as
-    cited partial evidence instead of requiring a second frontend tool call.
+    request, including constraints and desired output. The server creates focused
+    searches and browses sources concurrently. Its optional research model can
+    return a finished citation-checked Markdown answer; without successful model
+    synthesis, it returns a cited evidence digest and instructions for the calling
+    model to answer from those excerpts. Auto, quick, balanced, technical, and
+    academic calls are bounded by a server-owned interactive deadline; slow paths
+    are harvested as cited partial evidence instead of requiring another research call.
 
     Do not pre-plan subtools, split the request into multiple calls, or call this
-    again after a completed response. Present answer_markdown directly. Use auto
+    again after a completed response. Follow the returned answering_instructions. Use auto
     for the server-configured default, or request quick, balanced, technical, or
     academic research within that same interactive deadline. Deep is the
-    explicitly durable/background-oriented mode. This tool requires
-    RESEARCH_MODEL_BASE_URL and RESEARCH_MODEL_NAME on the server; model
+    explicitly durable/background-oriented mode. RESEARCH_MODEL_BASE_URL and
+    RESEARCH_MODEL_NAME enable model-assisted planning and answer writing; model
     credentials are never tool inputs.
     """
     request = _bounded_text(request, "request", MCP_MAX_QUERY_CHARS)
@@ -854,7 +975,7 @@ async def research_assistant(
     github_access_policy = _current_github_access_policy()
     if github_access_policy is not None:
         payload["_github_access_policy"] = github_access_policy
-    if JOB_BACKEND == "redis":
+    if JOB_BACKEND == "redis" and mode == "deep":
         return await run_resilient(
             _enqueue_and_wait(
                 "research_assistant",
@@ -864,6 +985,24 @@ async def research_assistant(
             ),
             "research_assistant",
         )
+    if JOB_BACKEND == "redis":
+        # Ordinary research is latency-sensitive. It must not wait behind a
+        # durable worker that is crawling another request; the private runner
+        # executes the same research agent over a Unix socket instead.
+        interactive_payload = {
+            "request": request,
+            "mode": mode,
+            "namespace": namespace,
+            "search_cache_scope": _current_search_cache_scope(),
+            "time_budget_seconds": RESEARCH_ASSISTANT_INTERACTIVE_TIMEOUT_SECONDS,
+        }
+        if github_access_policy is not None:
+            interactive_payload["github_access_policy"] = github_access_policy
+        result = await run_resilient(
+            _run_interactive_assistant(interactive_payload),
+            "research_assistant",
+        )
+        return _complete_research_result(result)
     result = await run_resilient(
         run_research_assistant(
             request=request,
@@ -1180,7 +1319,11 @@ async def ingest_text(
     """
     text = _bounded_text(text, "text", MCP_MAX_INGEST_CHARS)
     source = _bounded_text(source, "source", 4096)
-    title = _bounded_text(title, "title", 2000, allow_empty=True) if title is not None else None
+    title = (
+        _bounded_text(title, "title", 2000, allow_empty=True)
+        if title is not None
+        else None
+    )
     content_type = _bounded_text(content_type, "content_type", 100)
     namespace = normalize_namespace(namespace)
     required_scope = "memory:write" if redact_secrets else "memory:write:unredacted"
@@ -1266,17 +1409,27 @@ async def start_research(
         if proposed_queries is not None:
             payload["proposed_queries"] = proposed_queries
         owner_id = _current_principal_id()
-        job = (
-            await enqueue_job("research_web", payload, owner_id=owner_id)
-            if owner_id
-            else await enqueue_job("research_web", payload)
-        )
+        async with asyncio.timeout(MCP_JOB_STATUS_TIMEOUT_SECONDS):
+            job = (
+                await enqueue_job("research_web", payload, owner_id=owner_id)
+                if owner_id
+                else await enqueue_job("research_web", payload)
+            )
     except ResearchAdmissionLimitedError as exc:
         return _research_admission_limited_response(exc, tool_name="start_research")
     except JobQueueFullError as exc:
         return {
             "error": "job_queue_full",
             "detail": _safe_error_detail(exc),
+            "retryable": True,
+        }
+    except TimeoutError:
+        return {
+            "error": "job_queue_unavailable",
+            "detail": (
+                "Job enqueue exceeded the "
+                f"{MCP_JOB_STATUS_TIMEOUT_SECONDS:g}-second queue deadline"
+            ),
             "retryable": True,
         }
     except Exception as exc:
@@ -1316,24 +1469,40 @@ async def research_job(
     if authorization_failure:
         return authorization_failure
     action = action.strip().lower()
+    wait_budget = max(0.0, min(60.0, float(wait_seconds)))
+    operation_budget = wait_budget + MCP_JOB_RESULT_TIMEOUT_SECONDS
+    if MCP_CLIENT_TIMEOUT_SECONDS > 0:
+        operation_budget = min(
+            operation_budget,
+            max(
+                MCP_JOB_STATUS_TIMEOUT_SECONDS,
+                MCP_CLIENT_TIMEOUT_SECONDS - MCP_SYNC_RESPONSE_SAFETY_SECONDS,
+            ),
+        )
+    operation_deadline = time.monotonic() + max(
+        MCP_JOB_STATUS_TIMEOUT_SECONDS,
+        operation_budget,
+    )
     try:
         authorization_enabled = _token_authorization_enabled()
-        status_result = (
-            await get_job_status(job_id)
-            if action in {"status", "result"} or authorization_enabled
-            else None
-        )
+        status_result = None
         if authorization_enabled:
+            async with asyncio.timeout(MCP_JOB_STATUS_TIMEOUT_SECONDS):
+                status_result = await get_job_status(job_id)
             owner_failure = _job_owner_failure(status_result)
             if owner_failure:
                 return {**owner_failure, "job_id": job_id}
-        if (
-            action in {"status", "result"}
-            and status_result
-            and status_result.get("status") not in {"succeeded", "failed", "cancelled"}
-            and wait_seconds > 0
+            if status_result is None:
+                return {"error": "job_not_found", "job_id": job_id}
+        if action in {"status", "result"} and (
+            status_result is None
+            or status_result.get("status") not in {"succeeded", "failed", "cancelled"}
         ):
-            status_result = await _wait_for_terminal_job(job_id, wait_seconds)
+            remaining_wait = min(
+                wait_budget,
+                max(0.0, operation_deadline - time.monotonic()),
+            )
+            status_result = await _wait_for_terminal_job(job_id, remaining_wait)
         if action == "status":
             if status_result and status_result.get("status") not in {
                 "succeeded",
@@ -1362,15 +1531,30 @@ async def research_job(
                     status=str(status_result.get("status") or "running"),
                 )
             else:
-                result = (
-                    await _load_completed_job(job_id)
-                    if include_full_result
-                    else await get_job_result(job_id)
-                )
+                remaining = operation_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("job result deadline exhausted")
+                async with asyncio.timeout(
+                    min(MCP_JOB_RESULT_TIMEOUT_SECONDS, remaining)
+                ):
+                    result = (
+                        await _load_completed_job(job_id)
+                        if include_full_result
+                        else await get_job_result(job_id)
+                    )
         elif action == "cancel":
-            result = await request_cancellation(job_id)
+            remaining = operation_deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("job cancellation deadline exhausted")
+            async with asyncio.timeout(
+                min(MCP_JOB_STATUS_TIMEOUT_SECONDS, remaining)
+            ):
+                result = await request_cancellation(job_id)
         else:
-            return {"error": f"Unknown action: {action}", "valid_actions": ["status", "result", "cancel"]}
+            return {
+                "error": f"Unknown action: {action}",
+                "valid_actions": ["status", "result", "cancel"],
+            }
     except Exception as exc:
         return {
             "error": "job_operation_failed",
@@ -1434,7 +1618,11 @@ async def get_research_artifact(
                 or not secrets.compare_digest(principal_id, bound_principal)
             )
         )
-        if owner_failure or binding_mismatch or (job is None and bound_principal is None):
+        if (
+            owner_failure
+            or binding_mismatch
+            or (job is None and bound_principal is None)
+        ):
             return {
                 **(
                     owner_failure

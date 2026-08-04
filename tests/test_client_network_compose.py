@@ -99,15 +99,19 @@ class ClientNetworkComposeTests(unittest.TestCase):
 
 
 class ModelNetworkComposeTests(unittest.TestCase):
-    def test_only_research_worker_joins_external_model_network(self):
+    def test_research_execution_services_join_external_model_network(self):
         override = yaml.safe_load(
             (PROJECT_ROOT / "docker-compose.model-network.yml").read_text("utf-8")
         )
 
-        self.assertEqual(set(override["services"]), {"research-worker"})
+        self.assertEqual(set(override["services"]), {"research-worker", "research-runner"})
         self.assertIn(
             "research-model",
             override["services"]["research-worker"]["networks"],
+        )
+        self.assertIn(
+            "research-model",
+            override["services"]["research-runner"]["networks"],
         )
         self.assertTrue(override["networks"]["research-model"]["external"])
         self.assertIn(

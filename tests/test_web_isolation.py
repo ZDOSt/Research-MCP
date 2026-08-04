@@ -749,6 +749,53 @@ class ComposeIsolationTests(unittest.TestCase):
             "/run/research-web/runner.sock",
         )
 
+    def test_interactive_runner_is_private_and_gateway_can_reach_only_its_socket(self):
+        runner = self.services["research-runner"]
+        gateway = self.services["mcp-gateway"]
+        self.assertNotIn("ports", runner)
+        self.assertNotIn("expose", runner)
+        self.assertIn(
+            "interactive-runner-control:/run/research-interactive",
+            runner["volumes"],
+        )
+        self.assertIn(
+            "interactive-runner-control:/run/research-interactive:ro",
+            gateway["volumes"],
+        )
+        self.assertEqual(
+            runner["environment"]["RESEARCH_RUNNER_SOCKET"],
+            "/run/research-interactive/runner.sock",
+        )
+        self.assertEqual(
+            gateway["environment"]["RESEARCH_RUNNER_SOCKET"],
+            "/run/research-interactive/runner.sock",
+        )
+        self.assertEqual(
+            gateway["depends_on"]["research-runner"]["condition"],
+            "service_healthy",
+        )
+        self.assertEqual(
+            set(runner["depends_on"]),
+            {"searxng"},
+        )
+        self.assertEqual(
+            runner["depends_on"]["searxng"]["condition"],
+            "service_healthy",
+        )
+
+    def test_runtime_image_prepares_interactive_socket_directory_for_app_user(self):
+        dockerfile = (PROJECT_ROOT / "Dockerfile").read_text(encoding="utf-8")
+        self.assertIn(
+            "mkdir -p /data/artifacts /data/models /home/app/.cache "
+            "/run/research-interactive /run/research-pdf /run/research-web",
+            dockerfile,
+        )
+        self.assertIn(
+            "chown -R app:app /app /data /home/app /run/research-interactive "
+            "/run/research-pdf /run/research-web",
+            dockerfile,
+        )
+
     def test_performance_settings_reach_the_services_that_use_them(self):
         worker_environment = self.services["research-worker"]["environment"]
         gateway_environment = self.services["mcp-gateway"]["environment"]
@@ -992,12 +1039,20 @@ class ComposeIsolationTests(unittest.TestCase):
 
     def test_worker_receives_only_the_credentials_needed_for_unified_research(self):
         worker_environment = self.services["research-worker"]["environment"]
+        runner_environment = self.services["research-runner"]["environment"]
         persistence_environment = self.services["persistence-worker"]["environment"]
         self.assertNotIn("MCP_AUTH_TOKEN", worker_environment)
         self.assertNotIn("MCP_AUTH_TOKENS_JSON", worker_environment)
         self.assertEqual(worker_environment["GITHUB_TOKEN"], "${GITHUB_TOKEN:-}")
         self.assertEqual(
             worker_environment["GITHUB_ALLOWED_REPOSITORIES"],
+            "${GITHUB_ALLOWED_REPOSITORIES:-}",
+        )
+        self.assertNotIn("MCP_AUTH_TOKEN", runner_environment)
+        self.assertNotIn("MCP_AUTH_TOKENS_JSON", runner_environment)
+        self.assertEqual(runner_environment["GITHUB_TOKEN"], "${GITHUB_TOKEN:-}")
+        self.assertEqual(
+            runner_environment["GITHUB_ALLOWED_REPOSITORIES"],
             "${GITHUB_ALLOWED_REPOSITORIES:-}",
         )
         for setting in (
@@ -1016,20 +1071,25 @@ class ComposeIsolationTests(unittest.TestCase):
     def test_unified_tool_and_internal_model_settings_reach_only_their_owners(self):
         gateway_environment = self.services["mcp-gateway"]["environment"]
         research_environment = self.services["research-worker"]["environment"]
+        runner_environment = self.services["research-runner"]["environment"]
         persistence_environment = self.services["persistence-worker"]["environment"]
 
         self.assertEqual(
             gateway_environment["MCP_TOOL_PROFILE"],
-            "${MCP_TOOL_PROFILE:-all}",
+            "${MCP_TOOL_PROFILE:-unified}",
         )
         self.assertNotIn("RESEARCH_MODEL_API_KEY", gateway_environment)
         self.assertNotIn("RESEARCH_MODEL_API_KEY", persistence_environment)
         self.assertEqual(
             research_environment["MCP_TOOL_PROFILE"],
-            "${MCP_TOOL_PROFILE:-all}",
+            "${MCP_TOOL_PROFILE:-unified}",
         )
         self.assertEqual(
             research_environment["RESEARCH_MODEL_API_KEY"],
+            "${RESEARCH_MODEL_API_KEY:-}",
+        )
+        self.assertEqual(
+            runner_environment["RESEARCH_MODEL_API_KEY"],
             "${RESEARCH_MODEL_API_KEY:-}",
         )
         for setting in (

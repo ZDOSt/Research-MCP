@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hashlib
+import json
 import logging
 import math
 import os
@@ -44,6 +45,12 @@ _INGESTING_JOB_KINDS = {
     "ingest_text",
     "persist_research_source",
 }
+_RESULT_DELIVERY_ATTEMPTS = 3
+_RESULT_DELIVERY_MAX_BACKOFF_SECONDS = 1.0
+
+
+class _DeliveryCancellationRequested(Exception):
+    """Internal signal used when cancellation wins during terminal delivery."""
 
 
 def _env_float(name: str, default: float, minimum: float = 0.05) -> float:
@@ -405,9 +412,7 @@ async def dispatch_job(kind: str, payload: Mapping[str, Any]) -> Any:
         if not isinstance(mode, str):
             raise ValueError("mode must be a string")
         proposed_queries = normalize_proposed_queries(
-            payload.get("proposed_queries")
-            if "proposed_queries" in payload
-            else None
+            payload.get("proposed_queries") if "proposed_queries" in payload else None
         )
         research_kwargs = {
             "query": _required_string(payload, "query"),
@@ -472,7 +477,9 @@ async def dispatch_job(kind: str, payload: Mapping[str, Any]) -> Any:
             raise ValueError("deferred artifact owner does not match its job")
         source_artifact_path = str(raw_source.get("artifact_path") or "")
         if source_artifact_path != artifact_path:
-            raise ValueError("deferred source artifact metadata does not match its path")
+            raise ValueError(
+                "deferred source artifact metadata does not match its path"
+            )
         content = await artifacts.read_text(
             artifact_path,
             max_chars=max_ingest_chars + 1,
@@ -720,6 +727,219 @@ def compact_result_metadata(result: Any, artifact: Mapping[str, Any]) -> dict[st
     return metadata
 
 
+def _inline_text(value: object, max_chars: int) -> str:
+    return str(value or "").replace("\x00", "")[:max_chars]
+
+
+def _inline_mapping(
+    value: object,
+    *,
+    allowed_keys: tuple[str, ...],
+    max_string_chars: int = 2000,
+) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    output: dict[str, Any] = {}
+    for key in allowed_keys:
+        item = value.get(key)
+        if isinstance(item, str):
+            output[key] = _inline_text(item, max_string_chars)
+        elif item is None or isinstance(item, (bool, int)):
+            if item is not None:
+                output[key] = item
+        elif isinstance(item, float) and math.isfinite(item):
+            output[key] = item
+    return output
+
+
+def _inline_records(
+    value: object,
+    *,
+    allowed_keys: tuple[str, ...],
+    limit: int,
+) -> list[dict[str, Any]]:
+    if not isinstance(value, (list, tuple)):
+        return []
+    records = []
+    for item in value[:limit]:
+        record = _inline_mapping(item, allowed_keys=allowed_keys)
+        if record:
+            records.append(record)
+    return records
+
+
+def _inline_research_summary(value: object) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    summary = _inline_mapping(
+        value,
+        allowed_keys=(
+            "sources_consulted",
+            "evidence_items",
+            "pages_crawled",
+            "github_operations",
+            "images_found",
+            "public_query_redactions_applied",
+            "synthesis_fallback",
+            "planning_warning",
+            "duration_seconds",
+        ),
+    )
+    queries = value.get("queries")
+    if isinstance(queries, (list, tuple)):
+        summary["queries"] = [_inline_text(item, 500) for item in queries[:8]]
+    plan = _inline_mapping(
+        value.get("plan"),
+        allowed_keys=("generated_by", "mode", "query", "answer_focus"),
+        max_string_chars=1000,
+    )
+    if plan:
+        summary["plan"] = plan
+    follow_up = _inline_mapping(
+        value.get("follow_up"),
+        allowed_keys=("attempted", "needed", "reason"),
+        max_string_chars=1000,
+    )
+    if follow_up:
+        summary["follow_up"] = follow_up
+    durations = _inline_mapping(
+        value.get("phase_durations_seconds"),
+        allowed_keys=("planning", "acquisition", "follow_up", "synthesis"),
+    )
+    if durations:
+        summary["phase_durations_seconds"] = durations
+    errors = _inline_records(
+        value.get("acquisition_errors"),
+        allowed_keys=("source", "error", "detail"),
+        limit=16,
+    )
+    if errors:
+        summary["acquisition_errors"] = errors
+    return summary
+
+
+def inline_assistant_result_metadata(
+    result: object,
+    *,
+    max_bytes: int,
+) -> Optional[dict[str, Any]]:
+    """Build a bounded Redis fallback for an already-finished assistant answer."""
+    if not isinstance(result, Mapping):
+        return None
+    answer = _inline_text(result.get("answer_markdown"), 250_000).strip()
+    if not answer:
+        return None
+
+    inline_result: dict[str, Any] = {
+        "status": _inline_text(result.get("status") or "partial", 32),
+        "answer_markdown": "",
+        "citations": _inline_records(
+            result.get("citations"),
+            allowed_keys=(
+                "evidence_id",
+                "title",
+                "url",
+                "published_at",
+                "evidence_type",
+            ),
+            limit=64,
+        ),
+        "limitations": [
+            _inline_text(item, 2000) for item in (result.get("limitations") or [])[:32]
+        ]
+        if isinstance(result.get("limitations"), (list, tuple))
+        else [],
+        "confidence": _inline_text(result.get("confidence"), 50),
+        "research_summary": _inline_research_summary(result.get("research_summary")),
+        "retrieval_context": _inline_mapping(
+            result.get("retrieval_context"),
+            allowed_keys=(
+                "current_date_utc",
+                "retrieved_at_utc",
+                "freshness",
+                "guidance",
+            ),
+        ),
+        "answering_instructions": [
+            _inline_text(item, 1000)
+            for item in (result.get("answering_instructions") or [])[:8]
+        ]
+        if isinstance(result.get("answering_instructions"), (list, tuple))
+        else [],
+    }
+    images = _inline_records(
+        result.get("images"),
+        allowed_keys=("title", "url", "source_url", "thumbnail_url", "width", "height"),
+        limit=24,
+    )
+    if images:
+        inline_result["images"] = images
+    citation_validation = _inline_mapping(
+        result.get("citation_validation"),
+        allowed_keys=("valid", "reason", "citation_count", "unsupported_claims"),
+    )
+    if citation_validation:
+        inline_result["citation_validation"] = citation_validation
+    generated_by = result.get("generated_by")
+    if isinstance(generated_by, str):
+        inline_result["generated_by"] = _inline_text(generated_by, 500)
+
+    byte_limit = max(1024, int(max_bytes))
+
+    def encoded_size(value: Mapping[str, Any]) -> int:
+        return len(
+            json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode(
+                "utf-8"
+            )
+        )
+
+    metadata = {
+        "result_storage": "inline_fallback",
+        "result_type": "dict",
+        "inline_result": inline_result,
+    }
+    inline_result["answer_markdown"] = answer
+
+    # Preserve the finished answer and its source URLs before optional diagnostics.
+    # Large model metadata must never disable the fallback it is meant to protect.
+    for key in (
+        "research_summary",
+        "answering_instructions",
+        "retrieval_context",
+        "citation_validation",
+        "images",
+        "limitations",
+        "generated_by",
+    ):
+        if encoded_size(metadata) <= byte_limit:
+            break
+        inline_result.pop(key, None)
+    while encoded_size(metadata) > byte_limit and len(inline_result["citations"]) > 1:
+        inline_result["citations"].pop()
+    if encoded_size(metadata) > byte_limit and inline_result["citations"]:
+        citation = inline_result["citations"][0]
+        inline_result["citations"] = [
+            {
+                key: _inline_text(citation[key], 1000)
+                for key in ("title", "url")
+                if citation.get(key)
+            }
+        ]
+
+    if encoded_size(metadata) <= byte_limit:
+        return metadata
+
+    marker = "\n\n[Answer truncated because artifact storage was unavailable.]"
+    inline_result["answer_markdown"] = ""
+    available = byte_limit - encoded_size(metadata) - len(marker.encode("utf-8"))
+    if available <= 0:
+        return None
+    inline_result["answer_markdown"] = (
+        answer.encode("utf-8")[:available].decode("utf-8", errors="ignore") + marker
+    )
+    return metadata if encoded_size(metadata) <= byte_limit else None
+
+
 class JobWorker:
     def __init__(
         self,
@@ -731,9 +951,7 @@ class JobWorker:
         poll_interval: Optional[float] = None,
     ) -> None:
         self.store = store or get_job_store()
-        self.primary_queue_name = os.getenv(
-            "RESEARCH_PRIMARY_QUEUE", "research:jobs"
-        )
+        self.primary_queue_name = os.getenv("RESEARCH_PRIMARY_QUEUE", "research:jobs")
         self.persistence_queue_name = os.getenv(
             "RESEARCH_PERSISTENCE_QUEUE", "research:persistence"
         )
@@ -742,10 +960,7 @@ class JobWorker:
                 "RESEARCH_PERSISTENCE_QUEUE must differ from RESEARCH_PRIMARY_QUEUE"
             )
         self.persistence_store = persistence_store
-        if (
-            self.persistence_store is None
-            and isinstance(self.store, RedisJobStore)
-        ):
+        if self.persistence_store is None and isinstance(self.store, RedisJobStore):
             if self.persistence_queue_name != self.store.queue_key:
                 self.persistence_store = RedisJobStore(
                     redis_url=self.store.redis_url,
@@ -755,7 +970,10 @@ class JobWorker:
                     redis_client=self.store.redis,
                 )
         self._artifact_protection_stores = [self.store]
-        if self.persistence_store is not None and self.persistence_store is not self.store:
+        if (
+            self.persistence_store is not None
+            and self.persistence_store is not self.store
+        ):
             self._artifact_protection_stores.append(self.persistence_store)
         if isinstance(self.store, RedisJobStore):
             known_queues = {
@@ -873,6 +1091,312 @@ class JobWorker:
     def stop(self) -> None:
         self._stopping.set()
 
+    async def _wait_after_iteration_failure(self) -> None:
+        backoff = min(5.0, max(0.1, self.poll_interval))
+        try:
+            await asyncio.wait_for(self._stopping.wait(), timeout=backoff)
+        except TimeoutError:
+            pass
+
+    async def _deliver_success(
+        self,
+        job_id: str,
+        operation: Callable[[], Awaitable[Any]],
+        *,
+        non_retryable: tuple[type[BaseException], ...] = (),
+        cancellation_check: Optional[Callable[[], Awaitable[bool]]] = None,
+    ) -> Any:
+        """Retry a terminal success write without re-running completed research."""
+        last_error: Optional[Exception] = None
+        for attempt in range(1, _RESULT_DELIVERY_ATTEMPTS + 1):
+            if cancellation_check is not None and await cancellation_check():
+                raise _DeliveryCancellationRequested
+            try:
+                return await operation()
+            except asyncio.CancelledError:
+                raise
+            except JobLeaseLostError:
+                raise
+            except non_retryable:
+                raise
+            except Exception as exc:
+                last_error = exc
+                if attempt >= _RESULT_DELIVERY_ATTEMPTS:
+                    break
+                logger.warning(
+                    "Successful result delivery for job %s failed with %s; retrying (%d/%d)",
+                    job_id,
+                    type(exc).__name__,
+                    attempt + 1,
+                    _RESULT_DELIVERY_ATTEMPTS,
+                )
+                await asyncio.sleep(
+                    min(
+                        _RESULT_DELIVERY_MAX_BACKOFF_SECONDS,
+                        max(0.05, self.poll_interval) * (2 ** (attempt - 1)),
+                    )
+                )
+                if cancellation_check is not None and await cancellation_check():
+                    raise _DeliveryCancellationRequested
+        assert last_error is not None
+        raise last_error
+
+    async def _preserve_completed_result_for_retry(
+        self,
+        job_id: str,
+        lease_token: str,
+        error: Exception,
+        delivery_payload: Optional[Mapping[str, Any]] = None,
+    ) -> bool:
+        logger.error(
+            "Job %s finished computation but result delivery failed with %s; "
+            "preserving artifacts and requeueing instead of marking research failed",
+            job_id,
+            type(error).__name__,
+        )
+        if not isinstance(delivery_payload, Mapping):
+            logger.error(
+                "Completed job %s has no delivery-only payload; retaining its lease "
+                "for stale recovery",
+                job_id,
+            )
+            return False
+        requeue_delivery = getattr(self.store, "requeue_completed_delivery", None)
+        if not callable(requeue_delivery):
+            logger.error(
+                "Job store cannot preserve completed result %s without rerunning it",
+                job_id,
+            )
+            return False
+        try:
+            return bool(
+                await requeue_delivery(
+                    job_id,
+                    delivery_payload,
+                    lease_token=lease_token,
+                )
+            )
+        except JobLeaseLostError:
+            logger.warning(
+                "Could not requeue completed job %s after losing its worker lease; "
+                "retained artifacts for the current owner",
+                job_id,
+            )
+            return False
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Leave the running lease intact. Stale-job recovery will requeue it
+            # once Redis is available again, and artifact cleanup protects it.
+            logger.exception(
+                "Could not requeue completed job %s; retained its artifacts for stale recovery",
+                job_id,
+            )
+            return False
+
+    async def _prepare_delivery_payload(
+        self,
+        job_id: str,
+        lease_token: str,
+        payload: Optional[Mapping[str, Any]],
+    ) -> bool:
+        """Persist delivery-only state before attempting terminal completion."""
+        if not isinstance(payload, Mapping):
+            raise InvalidJobError("completed result delivery payload is missing")
+        prepare = getattr(self.store, "prepare_completed_delivery", None)
+        if not callable(prepare):
+            # Lightweight test stores and legacy adapters may not expose the
+            # durability primitive; the outer delivery fallback still retains
+            # the artifact and can use requeue_completed_delivery when present.
+            return True
+        return bool(
+            await self._deliver_success(
+                job_id,
+                lambda: prepare(
+                    job_id,
+                    payload,
+                    lease_token=lease_token,
+                ),
+                non_retryable=(InvalidJobError, JobQueueFullError),
+            )
+        )
+
+    async def _write_delivery_manifest(
+        self,
+        job_id: str,
+        payload: Mapping[str, Any],
+    ) -> None:
+        """Best-effort local manifest for recovery across a Redis outage."""
+        if not isinstance(payload, Mapping) or payload.get("_delivery_only") is not True:
+            raise InvalidJobError("completed result delivery payload is invalid")
+        encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        max_bytes = _env_int("JOB_MAX_PAYLOAD_BYTES", 1_048_576, minimum=1024)
+        if len(encoded.encode("utf-8")) > max_bytes:
+            raise InvalidJobError(
+                f"delivery manifest exceeds JOB_MAX_PAYLOAD_BYTES ({max_bytes} bytes)"
+            )
+        writer = getattr(self.artifacts, "write_delivery_json", None)
+        if not callable(writer):
+            writer = self.artifacts.write_json
+        try:
+            await writer(job_id, dict(payload), name="delivery")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Redis remains the authoritative queue; a local manifest is only
+            # an additional crash-recovery path and must not hide a result.
+            logger.warning(
+                "Could not write delivery manifest for job %s; continuing with Redis delivery",
+                job_id,
+                exc_info=True,
+            )
+
+    async def _load_delivery_manifest(
+        self,
+        job_id: str,
+    ) -> Optional[dict[str, Any]]:
+        try:
+            value = await self.artifacts.read_json(f"{job_id}/delivery.json")
+        except FileNotFoundError:
+            return None
+        except Exception:
+            logger.warning("Could not read delivery manifest for job %s", job_id)
+            return None
+        if not isinstance(value, Mapping) or value.get("_delivery_only") is not True:
+            return None
+        return dict(value)
+
+    async def _process_delivery_job(self, job: Mapping[str, Any]) -> None:
+        """Complete a previously finished computation without dispatching it again."""
+        job_id = str(job["job_id"])
+        lease_token = str(job.get("lease_token") or "")
+        payload = dict(job.get("payload") or {})
+        if payload.get("_delivery_only") is not True:
+            raise InvalidJobError("delivery job payload is not marked delivery-only")
+
+        artifact = payload.get("artifact")
+        artifact_path = payload.get("artifact_path")
+        if isinstance(artifact, Mapping):
+            artifact_path = artifact.get("relative_path") or artifact.get("path")
+        if artifact_path:
+            try:
+                # Reading the artifact before terminal delivery catches deletion
+                # or corruption explicitly; it must never trigger a fresh search.
+                value = await self.artifacts.read_json(str(artifact_path))
+                if not isinstance(value, (Mapping, list, tuple)):
+                    raise ValueError("delivery artifact contains an unsupported value")
+            except Exception as exc:
+                logger.error(
+                    "Preserved result artifact for job %s is unavailable: %s",
+                    job_id,
+                    type(exc).__name__,
+                )
+                try:
+                    await self.store.fail_job(
+                        job_id,
+                        {
+                            "type": "ArtifactUnavailable",
+                            "message": "preserved research result artifact is unavailable",
+                        },
+                        lease_token=lease_token,
+                    )
+                except JobLeaseLostError:
+                    logger.warning(
+                        "Could not record missing-artifact failure for job %s after lease loss",
+                        job_id,
+                    )
+                return
+
+        async def cancellation_requested() -> bool:
+            return await self.store.is_cancellation_requested(job_id)
+
+        if await cancellation_requested():
+            with suppress(Exception):
+                await self.artifacts.delete_job_artifacts(job_id)
+            with suppress(JobLeaseLostError):
+                await self.store.mark_cancelled(
+                    job_id,
+                    reason="cancellation requested",
+                    lease_token=lease_token,
+                )
+            return
+
+        result_metadata = payload.get("result_metadata")
+        if not isinstance(result_metadata, Mapping):
+            raise InvalidJobError("delivery job result metadata is invalid")
+        successful_attempt_id = payload.get("successful_ingestion_attempt_id")
+        completion_mode = str(payload.get("completion_mode") or "single")
+
+        async def complete() -> Any:
+            if completion_mode == "children":
+                complete_with_children = getattr(
+                    self.store,
+                    "complete_job_with_children",
+                    None,
+                )
+                child_jobs = payload.get("child_jobs")
+                if not callable(complete_with_children) or not isinstance(
+                    child_jobs, list
+                ):
+                    raise InvalidJobError("delivery child completion metadata is invalid")
+                return await complete_with_children(
+                    job_id,
+                    dict(result_metadata),
+                    lease_token=lease_token,
+                    child_queue_name=str(payload.get("child_queue_name") or ""),
+                    child_jobs=child_jobs,
+                )
+            return await self.store.complete_job(
+                job_id,
+                dict(result_metadata),
+                lease_token=lease_token,
+                successful_ingestion_attempt_id=(
+                    str(successful_attempt_id)
+                    if successful_attempt_id
+                    else None
+                ),
+            )
+
+        try:
+            completion = await self._deliver_success(
+                job_id,
+                complete,
+                non_retryable=(InvalidJobError, JobQueueFullError),
+                cancellation_check=cancellation_requested,
+            )
+            if (
+                isinstance(completion, Mapping)
+                and completion.get("status") == "cancelled"
+            ):
+                with suppress(Exception):
+                    await self.artifacts.delete_job_artifacts(job_id)
+            return
+        except _DeliveryCancellationRequested:
+            with suppress(Exception):
+                await self.artifacts.delete_job_artifacts(job_id)
+            with suppress(JobLeaseLostError):
+                await self.store.mark_cancelled(
+                    job_id,
+                    reason="cancellation requested",
+                    lease_token=lease_token,
+                )
+            return
+        except JobLeaseLostError:
+            logger.warning(
+                "Delivery-only job %s lost its lease; did not rerun computation",
+                job_id,
+            )
+            return
+        except (InvalidJobError, JobQueueFullError):
+            raise
+        except Exception as exc:
+            await self._preserve_completed_result_for_retry(
+                job_id,
+                lease_token,
+                exc,
+                payload,
+            )
+
     async def run(self) -> None:
         await self.store.ping()
         await self.store.record_worker_heartbeat(
@@ -890,16 +1414,24 @@ class JobWorker:
         )
 
         while not self._stopping.is_set():
-            await self._maybe_repair_qdrant_lifecycle()
-            await self._maybe_prune_artifacts()
-            await self._maybe_recover_stale_jobs()
-            await self._maybe_replay_ingestion_invalidations()
-            await self.store.record_worker_heartbeat(
-                self.worker_id,
-                state="ready",
-                host_id=self.host_id,
-            )
-            await self.run_once(timeout=max(1, math.ceil(self.poll_interval)))
+            try:
+                await self._maybe_repair_qdrant_lifecycle()
+                await self._maybe_prune_artifacts()
+                await self._maybe_recover_stale_jobs()
+                await self._maybe_replay_ingestion_invalidations()
+                await self.store.record_worker_heartbeat(
+                    self.worker_id,
+                    state="ready",
+                    host_id=self.host_id,
+                )
+                await self.run_once(timeout=max(1, math.ceil(self.poll_interval)))
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # Redis or artifact failures for one job must not terminate the
+                # worker and strand every queued request until Docker restarts it.
+                logger.exception("Worker iteration failed; continuing after backoff")
+                await self._wait_after_iteration_failure()
 
         await self.store.record_worker_heartbeat(
             self.worker_id,
@@ -1130,6 +1662,19 @@ class JobWorker:
         lease_token = str(job.get("lease_token") or "")
         if not lease_token:
             raise RuntimeError(f"claimed job {job_id} did not include a lease token")
+        # A delivery replay contains a completed artifact and terminal metadata.
+        # It must never enter the provider dispatcher a second time.
+        delivery_payload = (
+            dict(job["payload"])
+            if isinstance(job.get("payload"), Mapping)
+            and job["payload"].get("_delivery_only") is True
+            else await self._load_delivery_manifest(job_id)
+        )
+        if delivery_payload is not None:
+            delivery_job = dict(job)
+            delivery_job["payload"] = delivery_payload
+            await self._process_delivery_job(delivery_job)
+            return
         ingestion_attempt_id, ingestion_order_ns = _claimed_attempt_context(
             job,
             job_id=job_id,
@@ -1150,27 +1695,6 @@ class JobWorker:
         payload[_INTERNAL_ATTEMPT_ORDER_NS] = ingestion_order_ns
         if kind in {"research_web", "research_assistant", "investigate_url"}:
             payload["research_run_id"] = job_id
-        if kind == "research_assistant" and payload.get("mode") != "deep":
-            configured_budget = _env_float(
-                "RESEARCH_ASSISTANT_INTERACTIVE_TIMEOUT_SECONDS",
-                36.0,
-                minimum=1.0,
-            )
-            synchronous_wait = _env_float(
-                "RESEARCH_ASSISTANT_SYNC_WAIT_SECONDS",
-                45.0,
-                minimum=1.0,
-            )
-            configured_budget = min(
-                configured_budget,
-                max(1.0, synchronous_wait - 5.0),
-            )
-            if gateway_budget is not None:
-                configured_budget = min(configured_budget, gateway_budget)
-            payload[_INTERNAL_ASSISTANT_TIME_BUDGET] = max(
-                1.0,
-                configured_budget - _queued_seconds(job),
-            )
         may_have_ingested = _job_may_ingest(kind, payload)
         owner_id = str(job.get("owner_id") or "").strip()
         scope_identity = f"owner\x00{owner_id}" if owner_id else "anonymous"
@@ -1239,7 +1763,12 @@ class JobWorker:
                     )
                 return
 
+        interactive_deadline_error: Optional[TimeoutError] = None
+
         async def guarded_dispatch() -> Any:
+            if interactive_deadline_error is not None:
+                raise interactive_deadline_error
+
             from shared import reset_ingestion_commit_guard, set_ingestion_commit_guard
 
             async def lease_is_current() -> bool:
@@ -1255,11 +1784,43 @@ class JobWorker:
             finally:
                 reset_ingestion_commit_guard(guard_token)
 
+        if kind == "research_assistant" and payload.get("mode") != "deep":
+            # Owner binding and compensation setup can await external stores.
+            # Recalculate immediately before dispatch so those waits cannot
+            # silently extend the gateway's original interactive deadline.
+            configured_budget = _env_float(
+                "RESEARCH_ASSISTANT_INTERACTIVE_TIMEOUT_SECONDS",
+                36.0,
+                minimum=1.0,
+            )
+            synchronous_wait = _env_float(
+                "RESEARCH_ASSISTANT_SYNC_WAIT_SECONDS",
+                45.0,
+                minimum=1.0,
+            )
+            configured_budget = min(
+                configured_budget,
+                max(1.0, synchronous_wait - 5.0),
+            )
+            if gateway_budget is not None:
+                configured_budget = min(configured_budget, gateway_budget)
+            remaining_budget = configured_budget - _queued_seconds(job)
+            if remaining_budget < 1.0:
+                interactive_deadline_error = TimeoutError(
+                    "interactive research deadline expired while waiting in queue"
+                )
+            else:
+                payload[_INTERNAL_ASSISTANT_TIME_BUDGET] = remaining_budget
+
         task = asyncio.create_task(guarded_dispatch(), name=f"job-{job_id}")
+        computation_succeeded = False
+        delivery_payload: Optional[dict[str, Any]] = None
 
         try:
             while not task.done():
                 await asyncio.wait({task}, timeout=self.poll_interval)
+                if task.done():
+                    break
                 if not await self.store.heartbeat_job(
                     job_id, self.worker_id, lease_token
                 ):
@@ -1299,7 +1860,30 @@ class JobWorker:
                         )
                     return
 
+            # Check cancellation before observing the task result. A completed
+            # task may contain a provider exception; cancellation that arrived
+            # at the same boundary must still win over recording that failure.
+            if await self.store.is_cancellation_requested(job_id):
+                # A task that completed with an exception cannot be cancelled.
+                # Retrieve its outcome so cancellation can win without leaving
+                # an unobserved provider exception on the event loop.
+                with suppress(asyncio.CancelledError, Exception):
+                    task.result()
+                await self.store.mark_cancelled(
+                    job_id,
+                    reason="cancellation requested",
+                    lease_token=lease_token,
+                )
+                if may_have_ingested:
+                    await self._invalidate_ingestion_attempt(
+                        job_id,
+                        ingestion_attempt_id,
+                        reason="job_cancelled",
+                    )
+                return
+
             result = await task
+            computation_succeeded = True
             if await self.store.is_cancellation_requested(job_id):
                 await self.store.mark_cancelled(
                     job_id,
@@ -1397,11 +1981,87 @@ class JobWorker:
                                     result,
                                     status="accepted",
                                 )
-            artifact = await self.artifacts.write_json(
-                job_id,
-                result,
-                name=f"result-{ingestion_attempt_id[:16]}",
-            )
+
+            async def archive_result_or_complete_inline() -> Optional[dict[str, Any]]:
+                nonlocal delivery_payload
+                try:
+                    return await self.artifacts.write_json(
+                        job_id,
+                        result,
+                        name=f"result-{ingestion_attempt_id[:16]}",
+                    )
+                except Exception as exc:
+                    if kind != "research_assistant":
+                        raise
+                    if deferred_children:
+                        self._mark_deferred_persistence(
+                            result,
+                            status="unavailable",
+                            detail=(
+                                "background indexing was skipped because the completed "
+                                "answer could not be archived"
+                            ),
+                        )
+                    store_limit = int(
+                        getattr(
+                            self.store,
+                            "max_payload_bytes",
+                            _env_int("JOB_MAX_PAYLOAD_BYTES", 1_048_576, minimum=1024),
+                        )
+                    )
+                    inline_limit = min(
+                        store_limit,
+                        _env_int(
+                            "JOB_INLINE_RESULT_MAX_BYTES",
+                            262_144,
+                            minimum=1024,
+                        ),
+                    )
+                    inline_metadata = inline_assistant_result_metadata(
+                        result,
+                        max_bytes=inline_limit,
+                    )
+                    if inline_metadata is None:
+                        raise
+                    logger.error(
+                        "Artifact archival failed for completed assistant job %s with %s; "
+                        "returning its bounded answer from Redis",
+                        job_id,
+                        type(exc).__name__,
+                    )
+                    delivery_payload = {
+                        "_delivery_only": True,
+                        "completion_mode": "single",
+                        "result_metadata": inline_metadata,
+                        "successful_ingestion_attempt_id": (
+                            ingestion_attempt_id if may_have_ingested else None
+                        ),
+                    }
+                    await self._write_delivery_manifest(job_id, delivery_payload)
+                    await self._prepare_delivery_payload(
+                        job_id,
+                        lease_token,
+                        delivery_payload,
+                    )
+                    await self._deliver_success(
+                        job_id,
+                        lambda: self.store.complete_job(
+                            job_id,
+                            inline_metadata,
+                            lease_token=lease_token,
+                            successful_ingestion_attempt_id=(
+                                ingestion_attempt_id if may_have_ingested else None
+                            ),
+                        ),
+                    )
+                    for child in deferred_children:
+                        with suppress(Exception):
+                            await self.artifacts.delete_job_artifacts(child["job_id"])
+                    return None
+
+            artifact = await archive_result_or_complete_inline()
+            if artifact is None:
+                return
             if await self.store.is_cancellation_requested(job_id):
                 if not await self.store.heartbeat_job(
                     job_id, self.worker_id, lease_token
@@ -1433,6 +2093,16 @@ class JobWorker:
                     )
                 return
             compact_metadata = compact_result_metadata(result, artifact)
+            delivery_payload = {
+                "_delivery_only": True,
+                "completion_mode": "single",
+                "result_metadata": compact_metadata,
+                "artifact": dict(artifact),
+                "artifact_path": artifact.get("relative_path") or artifact.get("path"),
+                "successful_ingestion_attempt_id": (
+                    ingestion_attempt_id if may_have_ingested else None
+                ),
+            }
             complete_with_children = getattr(
                 self.store,
                 "complete_job_with_children",
@@ -1440,12 +2110,35 @@ class JobWorker:
             )
             if deferred_children and callable(complete_with_children):
                 try:
-                    completion = await complete_with_children(
+                    delivery_payload = {
+                        "_delivery_only": True,
+                        "completion_mode": "children",
+                        "result_metadata": compact_metadata,
+                        "artifact": dict(artifact),
+                        "artifact_path": artifact.get("relative_path")
+                        or artifact.get("path"),
+                        "child_queue_name": self.persistence_queue_name,
+                        "child_jobs": deferred_children,
+                        "artifact_owner_ids": [
+                            str(item["job_id"]) for item in deferred_children
+                        ],
+                    }
+                    await self._write_delivery_manifest(job_id, delivery_payload)
+                    await self._prepare_delivery_payload(
                         job_id,
-                        compact_metadata,
-                        lease_token=lease_token,
-                        child_queue_name=self.persistence_queue_name,
-                        child_jobs=deferred_children,
+                        lease_token,
+                        delivery_payload,
+                    )
+                    completion = await self._deliver_success(
+                        job_id,
+                        lambda: complete_with_children(
+                            job_id,
+                            compact_metadata,
+                            lease_token=lease_token,
+                            child_queue_name=self.persistence_queue_name,
+                            child_jobs=deferred_children,
+                        ),
+                        non_retryable=(InvalidJobError, JobQueueFullError),
                     )
                 except (InvalidJobError, JobQueueFullError) as exc:
                     detail = _safe_background_error(exc)
@@ -1454,23 +2147,43 @@ class JobWorker:
                         status="queue_failed",
                         detail=f"background indexing was not accepted: {detail}",
                     )
-                    artifact = await self.artifacts.write_json(
+                    artifact = await archive_result_or_complete_inline()
+                    if artifact is None:
+                        return
+                    compact_metadata = compact_result_metadata(result, artifact)
+                    delivery_payload = {
+                        "_delivery_only": True,
+                        "completion_mode": "single",
+                        "result_metadata": compact_metadata,
+                        "artifact": dict(artifact),
+                        "artifact_path": artifact.get("relative_path")
+                        or artifact.get("path"),
+                        "successful_ingestion_attempt_id": (
+                            ingestion_attempt_id if may_have_ingested else None
+                        ),
+                    }
+                    await self._write_delivery_manifest(job_id, delivery_payload)
+                    await self._prepare_delivery_payload(
                         job_id,
-                        result,
-                        name=f"result-{ingestion_attempt_id[:16]}",
+                        lease_token,
+                        delivery_payload,
                     )
-                    await self.store.complete_job(
+                    await self._deliver_success(
                         job_id,
-                        compact_result_metadata(result, artifact),
-                        lease_token=lease_token,
+                        lambda: self.store.complete_job(
+                            job_id,
+                            compact_metadata,
+                            lease_token=lease_token,
+                            successful_ingestion_attempt_id=(
+                                ingestion_attempt_id if may_have_ingested else None
+                            ),
+                        ),
                     )
                 else:
                     if completion.get("status") == "cancelled":
                         await self.artifacts.delete_job_artifacts(job_id)
                         for child in deferred_children:
-                            await self.artifacts.delete_job_artifacts(
-                                child["job_id"]
-                            )
+                            await self.artifacts.delete_job_artifacts(child["job_id"])
                 return
             if deferred_children:
                 self._mark_deferred_persistence(
@@ -1478,17 +2191,32 @@ class JobWorker:
                     status="unavailable",
                     detail="atomic background persistence queue is unavailable",
                 )
-                artifact = await self.artifacts.write_json(
-                    job_id,
-                    result,
-                    name=f"result-{ingestion_attempt_id[:16]}",
-                )
-            await self.store.complete_job(
+                artifact = await archive_result_or_complete_inline()
+                if artifact is None:
+                    return
+                compact_metadata = compact_result_metadata(result, artifact)
+                delivery_payload = {
+                    "_delivery_only": True,
+                    "completion_mode": "single",
+                    "result_metadata": compact_metadata,
+                    "artifact": dict(artifact),
+                    "artifact_path": artifact.get("relative_path") or artifact.get("path"),
+                }
+                await self._write_delivery_manifest(job_id, delivery_payload)
+            await self._prepare_delivery_payload(
                 job_id,
-                compact_result_metadata(result, artifact),
-                lease_token=lease_token,
-                successful_ingestion_attempt_id=(
-                    ingestion_attempt_id if may_have_ingested else None
+                lease_token,
+                delivery_payload,
+            )
+            await self._deliver_success(
+                job_id,
+                lambda: self.store.complete_job(
+                    job_id,
+                    compact_result_metadata(result, artifact),
+                    lease_token=lease_token,
+                    successful_ingestion_attempt_id=(
+                        ingestion_attempt_id if may_have_ingested else None
+                    ),
                 ),
             )
         except asyncio.CancelledError:
@@ -1512,6 +2240,16 @@ class JobWorker:
             task.cancel()
             with suppress(asyncio.CancelledError):
                 await task
+            if computation_succeeded:
+                # A completion retry may race with a Redis reply timeout: the
+                # terminal write can have succeeded even though the client saw
+                # an error. Never invalidate or relabel that successful attempt.
+                logger.warning(
+                    "Completion lease was already resolved for successful job %s; "
+                    "retained its artifacts",
+                    job_id,
+                )
+                return
             if may_have_ingested:
                 await self._invalidate_ingestion_attempt(
                     job_id,
@@ -1520,6 +2258,17 @@ class JobWorker:
                 )
             logger.warning("Ignored stale terminal write for job %s", job_id)
         except Exception as exc:
+            if computation_succeeded:
+                await self._preserve_completed_result_for_retry(
+                    job_id,
+                    lease_token,
+                    exc,
+                    delivery_payload,
+                )
+                # The replay carries the same successful ingestion attempt and
+                # must not invalidate its Qdrant chunks. Invalidation is only
+                # appropriate when computation itself is abandoned or cancelled.
+                return
             try:
                 if await self.store.is_cancellation_requested(job_id):
                     await self.store.mark_cancelled(
@@ -1587,12 +2336,6 @@ class JobWorker:
 async def worker_healthcheck() -> bool:
     if os.getenv("JOB_BACKEND", "redis").strip().lower() != "redis":
         return False
-    if os.getenv("MCP_TOOL_PROFILE", "all").strip().lower() == "unified":
-        from planner import research_model_configured
-
-        if not research_model_configured():
-            logger.error("Unified worker healthcheck requires RESEARCH_MODEL_* configuration")
-            return False
     store = get_job_store()
     try:
         if not await store.ping():

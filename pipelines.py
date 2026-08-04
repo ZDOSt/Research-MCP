@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import ipaddress
 import math
 import os
 import re
@@ -8,7 +9,7 @@ import uuid
 from dataclasses import replace
 from statistics import median
 from typing import Dict, List, Optional
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 from browser import ABSOLUTE_MAX_CHARS, DEFAULT_MAX_CHARS, playwright_explore_page
 from artifact_store import get_artifact_store
@@ -79,6 +80,7 @@ SEARCH_RERANKER_MAX_CANDIDATES = max(
     1,
     min(50, int(os.getenv("SEARCH_RERANKER_MAX_CANDIDATES", "24"))),
 )
+LOW_RELEVANCE_FALLBACK_LIMIT = 3
 
 
 def _validated_search_query_concurrency(value: Optional[str] = None) -> int:
@@ -180,6 +182,32 @@ PRODUCT_URL_RE = re.compile(
 def _safe_error_detail(value: object, limit: int = 1000) -> str:
     redacted, _ = redact_sensitive_text(str(value or ""))
     return redacted[:limit]
+
+
+def _safe_crawl_destination(value: object) -> dict:
+    """Return non-sensitive destination diagnostics without paths or queries."""
+    try:
+        parsed = urlsplit(str(value or ""))
+        host = (parsed.hostname or "").casefold().rstrip(".")
+        port = parsed.port
+    except ValueError:
+        return {"destination_type": "invalid_url"}
+    if not host:
+        return {"destination_type": "invalid_url"}
+    try:
+        address = ipaddress.ip_address(host.strip("[]"))
+    except ValueError:
+        destination_type = "hostname"
+    else:
+        destination_type = "public_ip_literal" if address.is_global else "non_public_ip_literal"
+        host = address.compressed
+    output = {
+        "destination_host": host[:253],
+        "destination_type": destination_type,
+    }
+    if port is not None:
+        output["destination_port"] = port
+    return output
 
 
 def _compact_search_diagnostics(
@@ -1368,6 +1396,105 @@ def _filter_relevant_search_candidates(
     return accepted, diagnostics
 
 
+def _retain_low_confidence_search_fallback(
+    candidates: list[dict],
+    query: str,
+    *,
+    limit: int = LOW_RELEVANCE_FALLBACK_LIMIT,
+) -> list[dict]:
+    """Retain a few tentative leads when bounded relevance recovery rejects all."""
+    output = []
+    for candidate in candidates:
+        if len(output) >= max(0, limit):
+            break
+        if not _search_snippet_candidate_is_usable(candidate):
+            continue
+        relevance = _candidate_topical_relevance(candidate, query)
+        existing_relevance = candidate.get("topical_relevance")
+        if isinstance(existing_relevance, dict):
+            relevance = existing_relevance
+        item = dict(candidate)
+        rerank_score = item.get("rerank_score")
+        if (
+            rerank_score is not None
+            and not (
+                isinstance(rerank_score, (int, float))
+                and not isinstance(rerank_score, bool)
+                and math.isfinite(float(rerank_score))
+            )
+        ):
+            item.pop("rerank_score", None)
+        item["topical_relevance"] = {
+            "score": round(float(relevance.get("score") or 0.0), 4),
+            "is_relevant": False,
+            "matched_terms": list(relevance.get("matched_terms") or ())[:20],
+            "matched_phrases": list(relevance.get("matched_phrases") or ())[:10],
+            "threshold": relevance.get("threshold"),
+            "reason": relevance.get("reason") or "relevance_gate_rejected",
+            "relevant_intents": [],
+        }
+        item["relevance_fallback"] = True
+        item["discovery_confidence"] = "low"
+        output.append(item)
+    return output
+
+
+def _retain_relevant_snippet_fallback(
+    candidates: list[dict],
+    query: str,
+    *,
+    existing_evidence: list[dict] | None = None,
+    limit: int = LOW_RELEVANCE_FALLBACK_LIMIT,
+) -> list[dict]:
+    """Keep relevant snippets when every full-page extraction path is empty.
+
+    This is an emergency discovery fallback, not a second relevance gate. Only
+    candidates that pass the deterministic topical check are retained, and the
+    marker is carried into the evidence limitations so a caller cannot mistake
+    snippets for verified page content.
+    """
+    existing_urls = {
+        normalize_search_url(value)
+        for item in (existing_evidence or [])
+        for value in (item.get("url"), item.get("requested_url"))
+        if value
+    }
+    output: list[dict] = []
+    for candidate in sorted(candidates, key=_candidate_rank_key, reverse=True):
+        if len(output) >= max(0, limit):
+            break
+        url = normalize_search_url(candidate.get("url") or "")
+        if not url or url in existing_urls:
+            continue
+        if not _search_snippet_candidate_is_usable(candidate):
+            continue
+        relevance = candidate.get("topical_relevance")
+        if not isinstance(relevance, dict):
+            relevance = _candidate_topical_relevance(candidate, query)
+        if not relevance.get("is_relevant"):
+            continue
+        item = dict(candidate)
+        item["snippet_fallback"] = True
+        item["discovery_confidence"] = "low"
+        item["snippet_fallback_reason"] = "full_page_extraction_unavailable"
+        output.append(item)
+        existing_urls.add(url)
+    return output
+
+
+def _search_snippet_candidate_is_usable(candidate: dict) -> bool:
+    """Match the minimum eligibility required to emit search-snippet evidence."""
+    url = normalize_search_url(candidate.get("url") or "")
+    snippet = str(candidate.get("snippet") or "").strip()
+    freshness_status = str(candidate.get("freshness_status") or "")
+    return bool(
+        url
+        and snippet
+        and freshness_status
+        not in {"outside_window", "outside_requested_window", "stale"}
+    )
+
+
 async def _invalidate_ingestion_attempt_bounded(
     ingestion_attempt_id: str,
     *,
@@ -2039,6 +2166,40 @@ async def crawl_source(
     crawl_error = None
 
     try:
+        requested_host = (urlsplit(requested_url).hostname or "").strip("[]")
+        requested_address = ipaddress.ip_address(requested_host)
+    except ValueError:
+        requested_address = None
+    if requested_address is not None:
+        failure_retrieval_context = _failed_crawl_retrieval_context(
+            result,
+            retrieval_context,
+        )
+        return {
+            "ok": False,
+            "url": requested_url,
+            "title": result.get("title"),
+            "domain": result.get("domain"),
+            "retrieval_context": failure_retrieval_context,
+            "retrieved_at_utc": failure_retrieval_context.get("retrieved_at_utc"),
+            "retrieval_current_date_utc": failure_retrieval_context.get(
+                "current_date_utc"
+            ),
+            "freshness": failure_retrieval_context.get("freshness"),
+            "published_at": result.get("published_at"),
+            "freshness_status": result.get("freshness_status"),
+            "freshness_unverified": bool(result.get("freshness_unverified")),
+            **discovery_provenance,
+            "search_engine": result.get("engine"),
+            "search_rank": result.get("search_rank"),
+            **_safe_crawl_destination(requested_url),
+            "reason": (
+                "Search provider returned an IP-literal source URL; page extraction was "
+                "skipped because the original hostname and TLS identity were unavailable"
+            ),
+        }
+
+    try:
         crawl_data = await crawl_url_impl(requested_url)
         content = extract_content(crawl_data)
         title = extract_title(crawl_data, fallback=result.get("title"))
@@ -2233,6 +2394,16 @@ async def stage_crawled_source_for_deferred_persistence(
     output = dict(source)
     content = str(output.pop("_content", "") or "")
     errors = list(output.get("errors") or [])
+    if output.get("relevance_fallback"):
+        output.update(
+            {
+                "stored_chunks": 0,
+                "memory_indexed": False,
+                "memory_index_state": "skipped_low_relevance_fallback",
+                "errors": errors,
+            }
+        )
+        return output, None
     if not content:
         output.update(
             {
@@ -2327,6 +2498,15 @@ async def persist_crawled_source(
     """Persist one accepted extraction; callers must await this operation."""
     output = dict(source)
     content = str(output.pop("_content", "") or "")
+    if output.get("relevance_fallback"):
+        output.update(
+            {
+                "stored_chunks": 0,
+                "memory_indexed": False,
+                "memory_index_state": "skipped_low_relevance_fallback",
+            }
+        )
+        return output
     if not content:
         return output
 
@@ -2552,7 +2732,12 @@ def build_evidence_pack(results: List[dict]) -> List[dict]:
     evidence = []
 
     for index, item in enumerate(results, start=1):
-        text = item.get("text") or ""
+        text = str(item.get("text") or "").strip()
+        # A vector record without extractable text is metadata, not evidence.
+        # Let the caller retain the corresponding search snippet instead of
+        # allowing an empty record to suppress that usable fallback by URL.
+        if not text:
+            continue
 
         artifact_path = item.get("artifact_path")
         evidence_item = {
@@ -2590,6 +2775,19 @@ def build_evidence_pack(results: List[dict]) -> List[dict]:
             "content_trust": "untrusted_external_content",
             "evidence_type": item.get("evidence_type") or "extracted_page_content",
         }
+        if item.get("relevance_fallback"):
+            evidence_item.update(
+                {
+                    "relevance_fallback": True,
+                    "discovery_confidence": "low",
+                    "confidence": "low",
+                    "limitations": (
+                        "This page was extracted from a tentative search lead that did not "
+                        "pass the topical relevance gate after bounded recovery. Use it only "
+                        "when its quoted content directly supports the answer."
+                    ),
+                }
+            )
         if artifact_path:
             evidence_item["artifact_reference"] = {
                 "artifact_id": item.get("artifact_id"),
@@ -2664,17 +2862,30 @@ def build_search_snippet_evidence(
     for candidate in candidates:
         url = normalize_search_url(candidate.get("url") or "")
         snippet = str(candidate.get("snippet") or "").strip()
-        freshness_status = str(candidate.get("freshness_status") or "")
         if (
-            not url
-            or not snippet
+            not _search_snippet_candidate_is_usable(candidate)
             or url in existing_urls
-            or freshness_status
-            in {"outside_window", "outside_requested_window", "stale"}
         ):
             continue
         stale_cache = candidate.get("search_cache_status") == "stale_fallback"
         limitations = "Discovery snippet only; the linked page was not available as extracted evidence."
+        relevance_fallback = bool(candidate.get("relevance_fallback"))
+        reranker_deprioritized = bool(candidate.get("reranker_deprioritized"))
+        if relevance_fallback:
+            limitations += (
+                " This result did not pass the topical relevance gate after bounded recovery "
+                "and is retained only as a tentative lead."
+            )
+        elif reranker_deprioritized:
+            limitations += (
+                " The optional reranker deprioritized this otherwise topically relevant result; "
+                "it is retained as low-confidence discovery evidence."
+            )
+        if candidate.get("snippet_fallback"):
+            limitations += (
+                " Full-page extraction was unavailable; this is retained as low-confidence "
+                "discovery evidence rather than verified page content."
+            )
         if stale_cache:
             limitations += (
                 " Discovery came from an explicitly stale cache fallback after a transient "
@@ -2702,6 +2913,11 @@ def build_search_snippet_evidence(
                 "content_trust": "untrusted_external_content",
                 "evidence_type": "search_result_snippet",
                 "confidence": "low",
+                "relevance_fallback": relevance_fallback,
+                "reranker_deprioritized": reranker_deprioritized,
+                "snippet_fallback": bool(candidate.get("snippet_fallback")),
+                "discovery_confidence": candidate.get("discovery_confidence")
+                or "low",
                 "limitations": limitations,
             }
         )
@@ -3382,12 +3598,42 @@ async def _research_pipeline_impl(
         provisional_candidates,
         timeout_seconds=max(0.0, research_deadline - time.monotonic()),
     )
+    ranked_provisional_candidates = provisional_candidates
     provisional_candidates, topical_relevance = _filter_relevant_search_candidates(
-        provisional_candidates,
+        ranked_provisional_candidates,
         query,
         reranking_status=str(discovery_reranking.get("status") or ""),
         allow_reranker_rejection=len(planned_intent_order) == 1,
     )
+    accepted_candidate_urls = {
+        normalize_search_url(item.get("url") or "") for item in provisional_candidates
+    }
+    reranker_deprioritized_snippet_candidates = []
+    if topical_relevance.get("reranker_signal_used"):
+        for candidate in ranked_provisional_candidates:
+            candidate_url = normalize_search_url(candidate.get("url") or "")
+            if (
+                not candidate_url
+                or candidate_url in accepted_candidate_urls
+                or not _candidate_topical_relevance(candidate, query).get("is_relevant")
+            ):
+                continue
+            fallback_candidate = dict(candidate)
+            fallback_candidate["reranker_deprioritized"] = True
+            fallback_candidate["discovery_confidence"] = "low"
+            reranker_deprioritized_snippet_candidates.append(fallback_candidate)
+    if not provisional_candidates and topical_relevance["status"] == "low_relevance":
+        provisional_candidates = _retain_low_confidence_search_fallback(
+            ranked_provisional_candidates,
+            query,
+            limit=min(LOW_RELEVANCE_FALLBACK_LIMIT, search_results_value),
+        )
+        topical_relevance.update(
+            {
+                "fallback_candidates_retained": len(provisional_candidates),
+                "fallback_policy": "bounded_tentative_leads",
+            }
+        )
     relevance_recoveries = [
         item
         for item in recovery_diagnostics
@@ -3407,6 +3653,18 @@ async def _research_pipeline_impl(
         search_results_value,
         search_intent_ids,
     )
+    # Keep crawl selection bounded without discarding already acquired SearXNG
+    # evidence. Every deterministically relevant candidate remains eligible for
+    # snippet fallback even when it falls below the crawl/search-result cap.
+    snippet_candidates = list(provisional_candidates)
+    snippet_candidate_urls = {
+        normalize_search_url(item.get("url") or "") for item in snippet_candidates
+    }
+    for candidate in reranker_deprioritized_snippet_candidates:
+        candidate_url = normalize_search_url(candidate.get("url") or "")
+        if candidate_url and candidate_url not in snippet_candidate_urls:
+            snippet_candidates.append(candidate)
+            snippet_candidate_urls.add(candidate_url)
 
     selected = []
     crawled_sources = []
@@ -3431,8 +3689,7 @@ async def _research_pipeline_impl(
         source_timeout = _source_crawl_timeout_seconds(crawl_budget_seconds)
 
         def record_failure(original: dict, reason: object) -> None:
-            failed_sources.append(
-                {
+            failed_source = {
                     "url": original["url"],
                     "title": original.get("title"),
                     "domain": original.get("domain"),
@@ -3452,9 +3709,12 @@ async def _research_pipeline_impl(
                     **_search_discovery_provenance(original),
                     "search_engine": original.get("engine"),
                     "search_rank": original.get("search_rank"),
+                    "relevance_fallback": bool(original.get("relevance_fallback")),
+                    "discovery_confidence": original.get("discovery_confidence"),
                     "reason": _safe_error_detail(reason),
                 }
-            )
+            failed_source.update(_safe_crawl_destination(original.get("url")))
+            failed_sources.append(failed_source)
 
         def harvest_done(tasks: Optional[set[asyncio.Task]] = None) -> None:
             nonlocal quota_attempts
@@ -3479,6 +3739,16 @@ async def _research_pipeline_impl(
                     elif result.get("ok"):
                         successful_result = dict(result)
                         successful_result.pop("ok", None)
+                        if original.get("relevance_fallback"):
+                            successful_result.update(
+                                {
+                                    "relevance_fallback": True,
+                                    "discovery_confidence": "low",
+                                    "topical_relevance": original.get(
+                                        "topical_relevance"
+                                    ),
+                                }
+                            )
                         identity = normalize_search_url(
                             successful_result.get("url")
                             or successful_result.get("requested_url")
@@ -3498,6 +3768,11 @@ async def _research_pipeline_impl(
                     else:
                         failed_result = dict(result)
                         failed_result.pop("ok", None)
+                        failed_result.update(
+                            _safe_crawl_destination(
+                                failed_result.get("url") or original.get("url")
+                            )
+                        )
                         failed_sources.append(failed_result)
 
         def schedule_available() -> None:
@@ -3852,6 +4127,7 @@ async def _research_pipeline_impl(
     if (
         retrieval_top_k > 0
         and selected
+        and any(not item.get("relevance_fallback") for item in selected)
         and not persistence_timed_out
         and not defer_persistence
     ):
@@ -3903,20 +4179,33 @@ async def _research_pipeline_impl(
 
     web_evidence = build_evidence_pack(current_rag_results)
     web_evidence.extend(build_crawled_source_evidence(crawled_sources, web_evidence))
-    web_evidence_source_urls = {
-        normalize_search_url(item.get("url") or "")
-        for item in web_evidence
-        if item.get("url")
-    }
-    snippet_limit = max(0, max_urls_value - len(web_evidence_source_urls))
+    snippet_limit = len(snippet_candidates)
     if snippet_limit:
         web_evidence.extend(
             build_search_snippet_evidence(
-                candidates,
+                snippet_candidates,
                 web_evidence,
                 snippet_limit,
             )
         )
+    # A valid SearXNG hit must remain answerable even when every selected page
+    # fails extraction. Keep only deterministic topical matches and mark them
+    # as low-confidence discovery evidence; never promote an off-topic result.
+    if not web_evidence:
+        emergency_snippets = _retain_relevant_snippet_fallback(
+            ranked_provisional_candidates,
+            query,
+            existing_evidence=web_evidence,
+            limit=min(LOW_RELEVANCE_FALLBACK_LIMIT, search_results_value),
+        )
+        if emergency_snippets:
+            web_evidence.extend(
+                build_search_snippet_evidence(
+                    emergency_snippets,
+                    web_evidence,
+                    len(emergency_snippets),
+                )
+            )
     verification = build_verification_metadata(
         web_evidence,
         requested=verify,
@@ -4137,19 +4426,46 @@ async def _research_pipeline_impl(
 
     if synthesize:
         synthesis_remaining = max(0.0, research_deadline - time.monotonic())
-        try:
-            if synthesis_remaining <= 0:
-                raise TimeoutError
-            async with asyncio.timeout(synthesis_remaining):
-                report = await synthesize_report(query, evidence)
-        except TimeoutError:
+        synthesis_unavailable_reason = None
+        synthesis_evidence = [
+            item for item in evidence if not item.get("relevance_fallback")
+        ]
+        if not synthesis_evidence and evidence:
             report = None
+            synthesis_unavailable_reason = (
+                "Synthesis was skipped because the remaining search results did not pass "
+                "the topical relevance gate; they are retained only as tentative leads."
+            )
+        else:
+            try:
+                if synthesis_remaining <= 0:
+                    raise TimeoutError
+                async with asyncio.timeout(synthesis_remaining):
+                    report = await synthesize_report(query, synthesis_evidence)
+            except TimeoutError:
+                report = None
+                synthesis_unavailable_reason = (
+                    "Synthesis did not complete within the research time budget; "
+                    "the retrieved evidence remains available."
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                report = None
+                logger.error(
+                    "Research synthesis failed after evidence retrieval: %s",
+                    _safe_error_detail(exc),
+                )
+                synthesis_unavailable_reason = (
+                    "Synthesis failed after evidence retrieval; the retrieved evidence "
+                    "remains available."
+                )
         if report:
             response["report"] = report
         else:
-            response["report_unavailable"] = (
-                "Synthesis requires a configured private OpenAI-compatible planner model and "
-                "PLANNER_ENABLE_SYNTHESIS=true."
+            response["report_unavailable"] = synthesis_unavailable_reason or (
+                "Synthesis requires a configured private OpenAI-compatible planner model "
+                "and PLANNER_ENABLE_SYNTHESIS=true."
             )
 
     response["duration_seconds"] = round(time.monotonic() - start, 2)

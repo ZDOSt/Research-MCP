@@ -56,7 +56,9 @@ def load_mcp_server(*, backend="redis", auth_token=""):
     browser = types.ModuleType("browser")
     browser.DEFAULT_MAX_CHARS = 300000
     extractors = types.ModuleType("extractors")
-    extractors.clamp_int = lambda value, minimum, maximum: max(minimum, min(int(value), maximum))
+    extractors.clamp_int = lambda value, minimum, maximum: max(
+        minimum, min(int(value), maximum)
+    )
     github = types.ModuleType("github_connector")
     github.get_github_file = _unused_async
     github.inspect_github_repository = _unused_async
@@ -97,10 +99,15 @@ def load_mcp_server(*, backend="redis", auth_token=""):
         "shared": shared,
     }
     module_path = Path(__file__).resolve().parents[1] / "mcp_server.py"
-    spec = importlib.util.spec_from_file_location(f"mcp_server_test_{uuid.uuid4().hex}", module_path)
+    spec = importlib.util.spec_from_file_location(
+        f"mcp_server_test_{uuid.uuid4().hex}", module_path
+    )
     module = importlib.util.module_from_spec(spec)
     environment = {"JOB_BACKEND": backend, "MCP_AUTH_TOKEN": auth_token}
-    with patch.dict(sys.modules, stubs, clear=False), patch.dict(os.environ, environment, clear=False):
+    with (
+        patch.dict(sys.modules, stubs, clear=False),
+        patch.dict(os.environ, environment, clear=False),
+    ):
         spec.loader.exec_module(module)
     return module
 
@@ -198,7 +205,9 @@ class MCPJobIntegrationTests(unittest.IsolatedAsyncioTestCase):
         job_id = uuid.uuid4().hex
 
         with patch.object(
-            server, "get_job_status", AsyncMock(return_value={"job_id": job_id, "status": "running"})
+            server,
+            "get_job_status",
+            AsyncMock(return_value={"job_id": job_id, "status": "running"}),
         ) as status:
             self.assertEqual(
                 (await server.research_job("status", job_id, wait_seconds=0))["status"],
@@ -211,13 +220,16 @@ class MCPJobIntegrationTests(unittest.IsolatedAsyncioTestCase):
             "status": "succeeded",
             "result": {"artifact_id": "a", "artifact_path": f"{job_id}/result.json"},
         }
-        with patch.object(
-            server,
-            "get_job_status",
-            AsyncMock(return_value={"job_id": job_id, "status": "succeeded"}),
-        ), patch.object(
-            server, "get_job_result", AsyncMock(return_value=metadata_result)
-        ) as get_result:
+        with (
+            patch.object(
+                server,
+                "get_job_status",
+                AsyncMock(return_value={"job_id": job_id, "status": "succeeded"}),
+            ),
+            patch.object(
+                server, "get_job_result", AsyncMock(return_value=metadata_result)
+            ) as get_result,
+        ):
             self.assertEqual(
                 await server.research_job(
                     "result",
@@ -230,11 +242,16 @@ class MCPJobIntegrationTests(unittest.IsolatedAsyncioTestCase):
             get_result.assert_awaited_once_with(job_id)
 
         full_result = {"query": "q", "job": {"job_id": job_id}}
-        with patch.object(
-            server,
-            "get_job_status",
-            AsyncMock(return_value={"job_id": job_id, "status": "succeeded"}),
-        ), patch.object(server, "_load_completed_job", AsyncMock(return_value=full_result)) as load:
+        with (
+            patch.object(
+                server,
+                "get_job_status",
+                AsyncMock(return_value={"job_id": job_id, "status": "succeeded"}),
+            ),
+            patch.object(
+                server, "_load_completed_job", AsyncMock(return_value=full_result)
+            ) as load,
+        ):
             self.assertEqual(
                 await server.research_job("result", job_id, wait_seconds=0),
                 full_result,
@@ -242,39 +259,121 @@ class MCPJobIntegrationTests(unittest.IsolatedAsyncioTestCase):
             load.assert_awaited_once_with(job_id)
 
         cancelled = {"job_id": job_id, "status": "cancelled"}
-        with patch.object(server, "request_cancellation", AsyncMock(return_value=cancelled)) as cancel:
+        with patch.object(
+            server, "request_cancellation", AsyncMock(return_value=cancelled)
+        ) as cancel:
             self.assertEqual(await server.research_job("cancel", job_id), cancelled)
             cancel.assert_awaited_once_with(job_id)
 
-    async def test_research_job_long_poll_returns_completed_result_without_busy_loop(self):
+    async def test_research_job_long_poll_returns_completed_result_without_busy_loop(
+        self,
+    ):
         server = load_mcp_server()
         job_id = uuid.uuid4().hex
         running = {"job_id": job_id, "status": "running"}
         succeeded = {"job_id": job_id, "status": "succeeded"}
         full_result = {"query": "q", "job": {"job_id": job_id}}
 
-        with patch.object(
-            server, "get_job_status", AsyncMock(return_value=running)
-        ), patch.object(
-            server, "_wait_for_terminal_job", AsyncMock(return_value=succeeded)
-        ) as wait, patch.object(
-            server, "_load_completed_job", AsyncMock(return_value=full_result)
-        ) as load:
+        with (
+            patch.object(server, "get_job_status", AsyncMock(return_value=running)),
+            patch.object(
+                server, "_wait_for_terminal_job", AsyncMock(return_value=succeeded)
+            ) as wait,
+            patch.object(
+                server, "_load_completed_job", AsyncMock(return_value=full_result)
+            ) as load,
+        ):
             result = await server.research_job("result", job_id, wait_seconds=12)
 
         self.assertEqual(result, full_result)
         wait.assert_awaited_once_with(job_id, 12)
         load.assert_awaited_once_with(job_id)
 
+    async def test_research_job_authorizes_owner_before_long_polling(self):
+        server = load_mcp_server(auth_token="top-secret")
+        job_id = uuid.uuid4().hex
+        token = types.SimpleNamespace(
+            client_id="client-a",
+            scopes=["research"],
+            claims={"scopes": ["research"], "namespaces": ["*"]},
+        )
+        status = {
+            "job_id": job_id,
+            "status": "running",
+            "owner_id": "client-b",
+        }
+        with (
+            patch.object(server, "_current_access_token", return_value=token),
+            patch.object(
+                server,
+                "get_job_status",
+                AsyncMock(return_value=status),
+            ) as get_status,
+            patch.object(
+                server,
+                "_wait_for_terminal_job",
+                AsyncMock(return_value=status),
+            ) as wait,
+            patch.object(server, "_load_completed_job", AsyncMock()) as load,
+        ):
+            result = await server.research_job("result", job_id, wait_seconds=30)
+
+        self.assertEqual(result["error"], "forbidden")
+        get_status.assert_awaited_once_with(job_id)
+        wait.assert_not_awaited()
+        load.assert_not_awaited()
+
+    async def test_research_job_bounds_completed_result_loading(self):
+        server = load_mcp_server()
+        job_id = uuid.uuid4().hex
+
+        async def never_returns(_job_id):
+            await asyncio.Event().wait()
+
+        with (
+            patch.object(
+                server,
+                "get_job_status",
+                AsyncMock(return_value={"job_id": job_id, "status": "succeeded"}),
+            ),
+            patch.object(server, "_load_completed_job", never_returns),
+            patch.object(server, "MCP_JOB_RESULT_TIMEOUT_SECONDS", 0.02),
+        ):
+            started = time.monotonic()
+            result = await server.research_job("result", job_id, wait_seconds=0)
+
+        self.assertLess(time.monotonic() - started, 0.2)
+        self.assertEqual(result["error"], "job_operation_failed")
+        self.assertEqual(result["job_id"], job_id)
+
+    async def test_research_job_bounds_hung_cancellation(self):
+        server = load_mcp_server()
+        job_id = uuid.uuid4().hex
+
+        async def never_returns(_job_id):
+            await asyncio.Event().wait()
+
+        with (
+            patch.object(server, "request_cancellation", never_returns),
+            patch.object(server, "MCP_JOB_STATUS_TIMEOUT_SECONDS", 0.02),
+        ):
+            started = time.monotonic()
+            result = await server.research_job("cancel", job_id)
+
+        self.assertLess(time.monotonic() - started, 0.2)
+        self.assertEqual(result["error"], "job_operation_failed")
+        self.assertEqual(result["job_id"], job_id)
+
     async def test_research_job_running_response_discourages_same_turn_polling(self):
         server = load_mcp_server()
         job_id = uuid.uuid4().hex
         running = {"job_id": job_id, "status": "running"}
 
-        with patch.object(
-            server, "get_job_status", AsyncMock(return_value=running)
-        ), patch.object(
-            server, "_wait_for_terminal_job", AsyncMock(return_value=running)
+        with (
+            patch.object(server, "get_job_status", AsyncMock(return_value=running)),
+            patch.object(
+                server, "_wait_for_terminal_job", AsyncMock(return_value=running)
+            ),
         ):
             result = await server.research_job("result", job_id, wait_seconds=5)
 
@@ -319,7 +418,9 @@ class MCPJobIntegrationTests(unittest.IsolatedAsyncioTestCase):
         job_id = uuid.uuid4().hex
         with tempfile.TemporaryDirectory() as temp_dir:
             store = ArtifactStore(temp_dir)
-            artifact = await store.write_json(job_id, {"query": "q", "evidence": [1, 2]})
+            artifact = await store.write_json(
+                job_id, {"query": "q", "evidence": [1, 2]}
+            )
             stored = {
                 "job_id": job_id,
                 "status": "succeeded",
@@ -328,8 +429,9 @@ class MCPJobIntegrationTests(unittest.IsolatedAsyncioTestCase):
                     "artifact_path": artifact["relative_path"],
                 },
             }
-            with patch.object(server, "get_job_result", AsyncMock(return_value=stored)), patch.object(
-                server, "get_artifact_store", return_value=store
+            with (
+                patch.object(server, "get_job_result", AsyncMock(return_value=stored)),
+                patch.object(server, "get_artifact_store", return_value=store),
             ):
                 result = await server._load_completed_job(job_id)
 
@@ -340,7 +442,9 @@ class MCPJobIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["job"]["result_payload_complete"])
         self.assertTrue(result["result_payload_complete"])
         self.assertTrue(result["artifact_guidance"]["result_payload_complete"])
-        self.assertFalse(result["artifact_guidance"]["job_result_artifact_path_exposed"])
+        self.assertFalse(
+            result["artifact_guidance"]["job_result_artifact_path_exposed"]
+        )
         self.assertFalse(
             result["artifact_guidance"]["call_get_research_artifact_for_job_artifact"]
         )
@@ -348,6 +452,44 @@ class MCPJobIntegrationTests(unittest.IsolatedAsyncioTestCase):
             "Do not call get_research_artifact",
             " ".join(result["answering_instructions"]),
         )
+
+    async def test_completed_job_loads_inline_assistant_fallback(self):
+        server = load_mcp_server()
+        job_id = uuid.uuid4().hex
+        stored = {
+            "job_id": job_id,
+            "status": "succeeded",
+            "result": {
+                "result_storage": "inline_fallback",
+                "inline_result": {
+                    "status": "complete",
+                    "answer_markdown": "Use the current documented procedure.",
+                    "citations": [
+                        {
+                            "title": "Official guide",
+                            "url": "https://docs.example.com/guide",
+                        }
+                    ],
+                },
+            },
+        }
+        with (
+            patch.object(
+                server,
+                "get_job_result",
+                AsyncMock(return_value=stored),
+            ),
+            patch.object(server, "get_artifact_store") as artifacts,
+        ):
+            result = await server._load_completed_job(job_id)
+
+        self.assertEqual(
+            result["answer_markdown"],
+            "Use the current documented procedure.",
+        )
+        self.assertEqual(result["job"]["result_storage"], "inline_fallback")
+        self.assertTrue(result["result_payload_complete"])
+        artifacts.assert_not_called()
 
     async def test_full_result_hides_only_job_archive_path(self):
         server = load_mcp_server()
@@ -382,7 +524,9 @@ class MCPJobIntegrationTests(unittest.IsolatedAsyncioTestCase):
             source_path,
         )
 
-    async def test_completed_result_keeps_evidence_authoritative_and_hides_deferred_manifest(self):
+    async def test_completed_result_keeps_evidence_authoritative_and_hides_deferred_manifest(
+        self,
+    ):
         server = load_mcp_server()
         evidence = [
             {
@@ -432,6 +576,27 @@ class MCPJobIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("do not poll or delay", instructions)
         self.assertNotIn("private staging data", str(result))
         self.assertNotIn("job/private-source.txt", str(result))
+
+    async def test_completed_tentative_only_result_reports_evidence_gap(self):
+        server = load_mcp_server()
+        result = server._complete_research_result(
+            {
+                "query": "specific current fact",
+                "evidence": [
+                    {
+                        "url": "https://unrelated.example/result",
+                        "quote": "A tentative search-provider excerpt.",
+                        "relevance_fallback": True,
+                    }
+                ],
+            }
+        )
+
+        instructions = " ".join(result["answering_instructions"]).lower()
+        self.assertIn("only tentative leads", instructions)
+        self.assertIn("evidence gap", instructions)
+        self.assertIn("do not present them as an answer", instructions)
+        self.assertNotIn("answer from it now", instructions)
 
     async def test_sync_research_tool_uses_queue_when_backend_is_redis(self):
         server = load_mcp_server(backend="redis")
@@ -514,26 +679,32 @@ class MCPJobIntegrationTests(unittest.IsolatedAsyncioTestCase):
         payload = enqueue.await_args.args[1]
         self.assertNotIn("proposed_queries", payload)
 
-    async def test_authenticated_inline_research_does_not_create_unowned_artifacts(self):
+    async def test_authenticated_inline_research_does_not_create_unowned_artifacts(
+        self,
+    ):
         server = load_mcp_server(backend="inline", auth_token="top-secret")
         pipeline = AsyncMock(return_value={"query": "question"})
-        with patch.object(server, "_authorization_failure", return_value=None), patch.object(
-            server, "research_pipeline", pipeline
+        with (
+            patch.object(server, "_authorization_failure", return_value=None),
+            patch.object(server, "research_pipeline", pipeline),
         ):
             result = await server.research_web("question", namespace="project-a")
 
         self.assertEqual(result["query"], "question")
         self.assertTrue(result["artifact_guidance"]["result_payload_complete"])
         self.assertTrue(
-            result["artifact_guidance"]["source_artifacts_may_contain_additional_content"]
+            result["artifact_guidance"][
+                "source_artifacts_may_contain_additional_content"
+            ]
         )
         self.assertFalse(pipeline.await_args.kwargs["persist_source_artifacts"])
 
     async def test_authenticated_stdio_tool_call_uses_local_trust_boundary(self):
         server = load_mcp_server(backend="inline", auth_token="top-secret")
         pipeline = AsyncMock(return_value={"query": "question"})
-        with patch.dict(server.os.environ, {"MCP_TRANSPORT": "stdio"}, clear=False), patch.object(
-            server, "research_pipeline", pipeline
+        with (
+            patch.dict(server.os.environ, {"MCP_TRANSPORT": "stdio"}, clear=False),
+            patch.object(server, "research_pipeline", pipeline),
         ):
             result = await server.research_web("question", namespace="project-a")
 
@@ -546,11 +717,14 @@ class MCPJobIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_authenticated_http_tool_call_still_requires_access_token(self):
         server = load_mcp_server(backend="inline", auth_token="top-secret")
         query = AsyncMock(return_value={"results": []})
-        with patch.dict(
-            server.os.environ,
-            {"MCP_TRANSPORT": "streamable-http"},
-            clear=False,
-        ), patch.object(server, "rag_query_impl", query):
+        with (
+            patch.dict(
+                server.os.environ,
+                {"MCP_TRANSPORT": "streamable-http"},
+                clear=False,
+            ),
+            patch.object(server, "rag_query_impl", query),
+        ):
             result = await server.query_memory("question")
 
         self.assertEqual(result, {"error": "authentication_required"})
@@ -568,8 +742,9 @@ class MCPJobIntegrationTests(unittest.IsolatedAsyncioTestCase):
             }
         )
         ingest = AsyncMock(return_value={"stored": 1})
-        with patch.object(server, "explore_url_pipeline", explore), patch.object(
-            server, "rag_ingest_impl", ingest
+        with (
+            patch.object(server, "explore_url_pipeline", explore),
+            patch.object(server, "rag_ingest_impl", ingest),
         ):
             result = await server.investigate_url(
                 requested_url,
@@ -586,19 +761,46 @@ class MCPJobIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_polling_failure_preserves_enqueued_job_id(self):
         server = load_mcp_server(backend="redis")
         job_id = uuid.uuid4().hex
-        with patch.object(
-            server,
-            "enqueue_job",
-            AsyncMock(return_value={"job_id": job_id, "status": "queued"}),
-        ), patch.object(
-            server,
-            "get_job_status",
-            AsyncMock(side_effect=OSError("redis temporarily unavailable")),
+        with (
+            patch.object(
+                server,
+                "enqueue_job",
+                AsyncMock(return_value={"job_id": job_id, "status": "queued"}),
+            ),
+            patch.object(
+                server,
+                "get_job_status",
+                AsyncMock(side_effect=OSError("redis temporarily unavailable")),
+            ),
         ):
-            result = await server._enqueue_and_wait("research_web", {"query": "q"}, "research_web")
+            result = await server._enqueue_and_wait(
+                "research_web", {"query": "q"}, "research_web"
+            )
 
         self.assertEqual(result["job_id"], job_id)
         self.assertEqual(result["warning"], "job_status_temporarily_unavailable")
+
+    async def test_sync_wait_bounds_a_hung_enqueue(self):
+        server = load_mcp_server(backend="redis")
+
+        async def never_returns(*_args, **_kwargs):
+            await asyncio.Event().wait()
+
+        with (
+            patch.object(server, "enqueue_job", never_returns),
+            patch.object(server, "MCP_JOB_STATUS_TIMEOUT_SECONDS", 0.02),
+        ):
+            started = time.monotonic()
+            result = await server._enqueue_and_wait(
+                "research_assistant",
+                {"request": "current information", "mode": "balanced"},
+                "research_assistant",
+                wait_seconds=0.1,
+            )
+
+        self.assertLess(time.monotonic() - started, 0.2)
+        self.assertEqual(result["error"], "job_queue_unavailable")
+        self.assertTrue(result["retryable"])
 
     async def test_coalesced_sync_request_continues_waiting_for_completed_result(self):
         server = load_mcp_server(backend="redis")
@@ -607,30 +809,35 @@ class MCPJobIntegrationTests(unittest.IsolatedAsyncioTestCase):
             "query": "same",
             "evidence": [{"url": "https://example.com/result"}],
         }
-        with patch.object(
-            server,
-            "enqueue_job",
-            AsyncMock(
-                return_value={
-                    "job_id": job_id,
-                    "status": "running",
-                    "coalesced": True,
-                }
+        with (
+            patch.object(
+                server,
+                "enqueue_job",
+                AsyncMock(
+                    return_value={
+                        "job_id": job_id,
+                        "status": "running",
+                        "coalesced": True,
+                    }
+                ),
             ),
-        ), patch.object(
-            server,
-            "get_job_status",
-            AsyncMock(
-                side_effect=[
-                    {"job_id": job_id, "status": "running"},
-                    {"job_id": job_id, "status": "succeeded"},
-                ]
-            ),
-        ) as status, patch.object(
-            server,
-            "_load_completed_job",
-            AsyncMock(return_value=completed),
-        ) as load, patch.object(server.asyncio, "sleep", AsyncMock()) as sleep:
+            patch.object(
+                server,
+                "get_job_status",
+                AsyncMock(
+                    side_effect=[
+                        {"job_id": job_id, "status": "running"},
+                        {"job_id": job_id, "status": "succeeded"},
+                    ]
+                ),
+            ) as status,
+            patch.object(
+                server,
+                "_load_completed_job",
+                AsyncMock(return_value=completed),
+            ) as load,
+            patch.object(server.asyncio, "sleep", AsyncMock()) as sleep,
+        ):
             result = await server._enqueue_and_wait(
                 "research_web",
                 {"query": "same"},
@@ -649,24 +856,28 @@ class MCPJobIntegrationTests(unittest.IsolatedAsyncioTestCase):
             "status": "complete",
             "answer_markdown": "Finished at the deadline.",
         }
-        with patch.object(
-            server,
-            "enqueue_job",
-            AsyncMock(return_value={"job_id": job_id, "status": "running"}),
-        ), patch.object(
-            server,
-            "get_job_status",
-            AsyncMock(
-                side_effect=[
-                    {"job_id": job_id, "status": "running"},
-                    {"job_id": job_id, "status": "succeeded"},
-                ]
+        with (
+            patch.object(
+                server,
+                "enqueue_job",
+                AsyncMock(return_value={"job_id": job_id, "status": "running"}),
             ),
-        ) as status, patch.object(
-            server,
-            "_load_completed_job",
-            AsyncMock(return_value=completed),
-        ) as load:
+            patch.object(
+                server,
+                "get_job_status",
+                AsyncMock(
+                    side_effect=[
+                        {"job_id": job_id, "status": "running"},
+                        {"job_id": job_id, "status": "succeeded"},
+                    ]
+                ),
+            ) as status,
+            patch.object(
+                server,
+                "_load_completed_job",
+                AsyncMock(return_value=completed),
+            ) as load,
+        ):
             result = await server._enqueue_and_wait(
                 "research_assistant",
                 {"request": "current information", "mode": "balanced"},
@@ -685,11 +896,14 @@ class MCPJobIntegrationTests(unittest.IsolatedAsyncioTestCase):
         async def never_returns(_job_id):
             await asyncio.Event().wait()
 
-        with patch.object(
-            server,
-            "enqueue_job",
-            AsyncMock(return_value={"job_id": job_id, "status": "running"}),
-        ), patch.object(server, "get_job_status", never_returns):
+        with (
+            patch.object(
+                server,
+                "enqueue_job",
+                AsyncMock(return_value={"job_id": job_id, "status": "running"}),
+            ),
+            patch.object(server, "get_job_status", never_returns),
+        ):
             started = time.monotonic()
             result = await server._enqueue_and_wait(
                 "research_assistant",
@@ -701,24 +915,61 @@ class MCPJobIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(time.monotonic() - started, 0.2)
         self.assertEqual(result["status"], "running")
 
-    async def test_redis_assistant_enqueues_gateway_bounded_worker_budget(self):
+    async def test_sync_wait_retries_transient_status_failure_until_deadline(self):
+        server = load_mcp_server(backend="redis")
+        job_id = uuid.uuid4().hex
+        completed = {
+            "status": "complete",
+            "answer_markdown": "Recovered completed answer.",
+        }
+        with (
+            patch.object(
+                server,
+                "enqueue_job",
+                AsyncMock(return_value={"job_id": job_id, "status": "running"}),
+            ),
+            patch.object(
+                server,
+                "get_job_status",
+                AsyncMock(
+                    side_effect=[
+                        RuntimeError("temporary Redis read failure"),
+                        {"job_id": job_id, "status": "succeeded"},
+                    ]
+                ),
+            ) as status,
+            patch.object(
+                server,
+                "_load_completed_job",
+                AsyncMock(return_value=completed),
+            ) as load,
+        ):
+            result = await server._enqueue_and_wait(
+                "research_assistant",
+                {"request": "current information", "mode": "balanced"},
+                "research_assistant",
+                wait_seconds=0.1,
+            )
+
+        self.assertEqual(result, completed)
+        self.assertEqual(status.await_count, 2)
+        load.assert_awaited_once_with(job_id)
+
+    async def test_redis_assistant_uses_private_runner_with_bounded_budget(self):
         server = load_mcp_server(backend="redis")
         with patch.object(
             server,
-            "_enqueue_and_wait",
+            "_run_interactive_assistant",
             AsyncMock(return_value={"status": "complete"}),
-        ) as enqueue:
+        ) as runner:
             result = await server.research_assistant(
                 "Find the current installation guide",
                 mode="balanced",
             )
 
-        self.assertEqual(result, {"status": "complete"})
-        payload = enqueue.await_args.args[1]
-        self.assertEqual(
-            payload[server._INTERNAL_ASSISTANT_TIME_BUDGET],
-            server.RESEARCH_ASSISTANT_INTERACTIVE_TIMEOUT_SECONDS,
-        )
+        self.assertEqual(result["status"], "complete")
+        payload = runner.await_args.args[0]
+        self.assertEqual(payload["time_budget_seconds"], server.RESEARCH_ASSISTANT_INTERACTIVE_TIMEOUT_SECONDS)
 
     async def test_redis_deep_assistant_omits_interactive_worker_budget(self):
         server = load_mcp_server(backend="redis")
@@ -732,16 +983,39 @@ class MCPJobIntegrationTests(unittest.IsolatedAsyncioTestCase):
         payload = enqueue.await_args.args[1]
         self.assertNotIn(server._INTERNAL_ASSISTANT_TIME_BUDGET, payload)
 
+    async def test_redis_assistant_runner_failure_is_terminal_and_never_queues(self):
+        server = load_mcp_server(backend="redis")
+        runner_failure = {
+            "error": "interactive_runner_unavailable",
+            "terminal": True,
+        }
+        with (
+            patch.object(
+                server,
+                "_run_interactive_assistant",
+                AsyncMock(return_value=runner_failure),
+            ),
+            patch.object(server, "_enqueue_and_wait", AsyncMock()) as enqueue,
+        ):
+            result = await server.research_assistant("Find the current guide")
+
+        self.assertEqual(result, runner_failure)
+        enqueue.assert_not_awaited()
+
     async def test_disabled_backend_and_queue_failures_return_stable_errors(self):
         disabled = load_mcp_server(backend="inline")
-        self.assertEqual((await disabled.start_research("q"))["error"], "durable_jobs_disabled")
+        self.assertEqual(
+            (await disabled.start_research("q"))["error"], "durable_jobs_disabled"
+        )
         self.assertEqual(
             (await disabled.research_job("status", uuid.uuid4().hex))["error"],
             "durable_jobs_disabled",
         )
 
         server = load_mcp_server()
-        with patch.object(server, "enqueue_job", AsyncMock(side_effect=OSError("redis down"))):
+        with patch.object(
+            server, "enqueue_job", AsyncMock(side_effect=OSError("redis down"))
+        ):
             result = await server.start_research("q")
         self.assertEqual(result["error"], "job_queue_unavailable")
         self.assertTrue(result["retryable"])
@@ -754,6 +1028,27 @@ class MCPJobIntegrationTests(unittest.IsolatedAsyncioTestCase):
             result = await server.start_research("q")
         self.assertEqual(result["error"], "job_queue_full")
         self.assertTrue(result["retryable"])
+
+    async def test_start_research_bounds_a_hung_enqueue(self):
+        server = load_mcp_server()
+        enqueue_cancelled = asyncio.Event()
+
+        async def hung_enqueue(*_args, **_kwargs):
+            try:
+                await asyncio.Event().wait()
+            finally:
+                enqueue_cancelled.set()
+
+        with (
+            patch.object(server, "MCP_JOB_STATUS_TIMEOUT_SECONDS", 0.01),
+            patch.object(server, "enqueue_job", AsyncMock(side_effect=hung_enqueue)),
+        ):
+            result = await asyncio.wait_for(server.start_research("q"), timeout=0.2)
+
+        self.assertEqual(result["error"], "job_queue_unavailable")
+        self.assertTrue(result["retryable"])
+        self.assertIn("queue deadline", result["detail"])
+        self.assertTrue(enqueue_cancelled.is_set())
 
     async def test_research_admission_limit_is_a_structured_tool_response(self):
         server = load_mcp_server()
@@ -808,10 +1103,13 @@ class MCPJobIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_inline_backend_does_not_use_redis_admission(self):
         server = load_mcp_server(backend="inline")
         pipeline = AsyncMock(return_value={"query": "local", "evidence": []})
-        with patch.object(server, "enqueue_job", AsyncMock()) as enqueue, patch.object(
-            server,
-            "research_pipeline",
-            pipeline,
+        with (
+            patch.object(server, "enqueue_job", AsyncMock()) as enqueue,
+            patch.object(
+                server,
+                "research_pipeline",
+                pipeline,
+            ),
         ):
             result = await server.research_web("local")
 
@@ -823,11 +1121,14 @@ class MCPJobIntegrationTests(unittest.IsolatedAsyncioTestCase):
         server = load_mcp_server(backend="inline")
         pipeline = AsyncMock(return_value={"query": "local", "evidence": []})
 
-        with patch.object(
-            server,
-            "_current_principal_id",
-            return_value="client-a",
-        ), patch.object(server, "research_pipeline", pipeline):
+        with (
+            patch.object(
+                server,
+                "_current_principal_id",
+                return_value="client-a",
+            ),
+            patch.object(server, "research_pipeline", pipeline),
+        ):
             await server.research_web("local")
 
         expected_scope = hashlib.sha256(b"owner\x00client-a").hexdigest()
@@ -854,11 +1155,21 @@ class MCPJobIntegrationTests(unittest.IsolatedAsyncioTestCase):
             scopes=["research"],
             claims={"scopes": ["research"], "namespaces": ["*"]},
         )
-        with patch.object(server, "_current_access_token", return_value=token), patch.object(
-            server,
-            "get_job_status",
-            AsyncMock(return_value={"job_id": job_id, "status": "running", "owner_id": "client-b"}),
-        ), patch.object(server, "request_cancellation", AsyncMock()) as cancel:
+        with (
+            patch.object(server, "_current_access_token", return_value=token),
+            patch.object(
+                server,
+                "get_job_status",
+                AsyncMock(
+                    return_value={
+                        "job_id": job_id,
+                        "status": "running",
+                        "owner_id": "client-b",
+                    }
+                ),
+            ),
+            patch.object(server, "request_cancellation", AsyncMock()) as cancel,
+        ):
             result = await server.research_job("cancel", job_id)
 
         self.assertEqual(result["error"], "forbidden")
@@ -881,11 +1192,17 @@ class MCPJobIntegrationTests(unittest.IsolatedAsyncioTestCase):
             victim = await store.write_text(victim_id, "victim secret")
             traversal = f"{owned_id}/../{victim['relative_path']}"
             status = AsyncMock(
-                return_value={"job_id": owned_id, "status": "succeeded", "owner_id": "client-a"}
+                return_value={
+                    "job_id": owned_id,
+                    "status": "succeeded",
+                    "owner_id": "client-a",
+                }
             )
-            with patch.object(server, "_current_access_token", return_value=token), patch.object(
-                server, "get_job_status", status
-            ), patch.object(server, "get_artifact_store", return_value=store):
+            with (
+                patch.object(server, "_current_access_token", return_value=token),
+                patch.object(server, "get_job_status", status),
+                patch.object(server, "get_artifact_store", return_value=store),
+            ):
                 result = await server.get_research_artifact(traversal)
 
         self.assertEqual(result["error"], "artifact_unavailable")
@@ -905,19 +1222,29 @@ class MCPJobIntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
         with tempfile.TemporaryDirectory() as temp_dir:
             store = ArtifactStore(temp_dir)
-            with patch.object(server, "_current_access_token", return_value=token), patch.object(
-                server,
-                "get_job_status",
-                AsyncMock(
-                    return_value={"job_id": job_id, "status": "succeeded", "owner_id": "client-a"}
+            with (
+                patch.object(server, "_current_access_token", return_value=token),
+                patch.object(
+                    server,
+                    "get_job_status",
+                    AsyncMock(
+                        return_value={
+                            "job_id": job_id,
+                            "status": "succeeded",
+                            "owner_id": "client-a",
+                        }
+                    ),
                 ),
-            ), patch.object(server, "get_artifact_store", return_value=store):
+                patch.object(server, "get_artifact_store", return_value=store),
+            ):
                 result = await server.get_research_artifact(f"{job_id}/missing.json")
 
         self.assertEqual(result["error"], "artifact_unavailable")
         self.assertNotIn(temp_dir, str(result))
 
-    async def test_persistent_binding_authorizes_artifact_after_job_metadata_expires(self):
+    async def test_persistent_binding_authorizes_artifact_after_job_metadata_expires(
+        self,
+    ):
         server = load_mcp_server(auth_token="top-secret")
         job_id = uuid.uuid4().hex
         token = types.SimpleNamespace(
@@ -929,9 +1256,11 @@ class MCPJobIntegrationTests(unittest.IsolatedAsyncioTestCase):
             store = ArtifactStore(temp_dir)
             await store.bind_owner_principal(job_id, "client-a")
             artifact = await store.write_text(job_id, "owned evidence")
-            with patch.object(server, "_current_access_token", return_value=token), patch.object(
-                server, "get_job_status", AsyncMock(return_value=None)
-            ), patch.object(server, "get_artifact_store", return_value=store):
+            with (
+                patch.object(server, "_current_access_token", return_value=token),
+                patch.object(server, "get_job_status", AsyncMock(return_value=None)),
+                patch.object(server, "get_artifact_store", return_value=store),
+            ):
                 result = await server.get_research_artifact(artifact["relative_path"])
 
         self.assertEqual(result["content"], "owned evidence")
@@ -948,17 +1277,21 @@ class MCPJobIntegrationTests(unittest.IsolatedAsyncioTestCase):
             store = ArtifactStore(temp_dir)
             await store.bind_owner_principal(job_id, "client-b")
             artifact = await store.write_text(job_id, "other evidence")
-            with patch.object(server, "_current_access_token", return_value=token), patch.object(
-                server,
-                "get_job_status",
-                AsyncMock(
-                    return_value={
-                        "job_id": job_id,
-                        "status": "succeeded",
-                        "owner_id": "client-a",
-                    }
+            with (
+                patch.object(server, "_current_access_token", return_value=token),
+                patch.object(
+                    server,
+                    "get_job_status",
+                    AsyncMock(
+                        return_value={
+                            "job_id": job_id,
+                            "status": "succeeded",
+                            "owner_id": "client-a",
+                        }
+                    ),
                 ),
-            ), patch.object(server, "get_artifact_store", return_value=store):
+                patch.object(server, "get_artifact_store", return_value=store),
+            ):
                 result = await server.get_research_artifact(artifact["relative_path"])
 
         self.assertEqual(result["error"], "forbidden")
@@ -975,9 +1308,11 @@ class MCPJobIntegrationTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             store = ArtifactStore(temp_dir)
             await store.bind_owner_principal(job_id, "client-a")
-            with patch.object(server, "_current_access_token", return_value=token), patch.object(
-                server, "get_job_status", AsyncMock(return_value=None)
-            ), patch.object(server, "get_artifact_store", return_value=store):
+            with (
+                patch.object(server, "_current_access_token", return_value=token),
+                patch.object(server, "get_job_status", AsyncMock(return_value=None)),
+                patch.object(server, "get_artifact_store", return_value=store),
+            ):
                 result = await server.get_research_artifact(f"{job_id}/_owner.json")
 
         self.assertEqual(result["error"], "forbidden")
@@ -995,9 +1330,11 @@ class MCPJobIntegrationTests(unittest.IsolatedAsyncioTestCase):
             },
         )
         search = AsyncMock(return_value={"results": []})
-        with patch.object(server, "_current_access_token", return_value=token), patch.object(
-            server, "search_github", search
-        ), patch.dict(server.os.environ, {"GITHUB_TOKEN": ""}):
+        with (
+            patch.object(server, "_current_access_token", return_value=token),
+            patch.object(server, "search_github", search),
+            patch.dict(server.os.environ, {"GITHUB_TOKEN": ""}),
+        ):
             result = await server.github_research(
                 "search",
                 query="repo:owner/forbidden secret",
@@ -1019,8 +1356,9 @@ class MCPJobIntegrationTests(unittest.IsolatedAsyncioTestCase):
             },
         )
         queued = AsyncMock(return_value={"status": "complete"})
-        with patch.object(server, "_current_access_token", return_value=token), patch.object(
-            server, "_enqueue_and_wait", queued
+        with (
+            patch.object(server, "_current_access_token", return_value=token),
+            patch.object(server, "_enqueue_and_wait", queued),
         ):
             result = await server.github_research(
                 "inspect",
@@ -1120,21 +1458,27 @@ class MCPJobIntegrationTests(unittest.IsolatedAsyncioTestCase):
             "MCP_HOST": "127.0.0.1",
             "MCP_EXTERNAL_BIND_ADDRESS": "127.0.0.1",
         }
-        with patch.dict(
-            server.os.environ,
-            {**base, "MCP_ALLOWED_HOSTS": "*", "MCP_ALLOWED_ORIGINS": ""},
-            clear=False,
-        ), self.assertRaisesRegex(ValueError, "global"):
+        with (
+            patch.dict(
+                server.os.environ,
+                {**base, "MCP_ALLOWED_HOSTS": "*", "MCP_ALLOWED_ORIGINS": ""},
+                clear=False,
+            ),
+            self.assertRaisesRegex(ValueError, "global"),
+        ):
             server._build_run_kwargs()
-        with patch.dict(
-            server.os.environ,
-            {
-                **base,
-                "MCP_ALLOWED_HOSTS": "localhost",
-                "MCP_ALLOWED_ORIGINS": "https://user:pass@example.com",
-            },
-            clear=False,
-        ), self.assertRaisesRegex(ValueError, "origins"):
+        with (
+            patch.dict(
+                server.os.environ,
+                {
+                    **base,
+                    "MCP_ALLOWED_HOSTS": "localhost",
+                    "MCP_ALLOWED_ORIGINS": "https://user:pass@example.com",
+                },
+                clear=False,
+            ),
+            self.assertRaisesRegex(ValueError, "origins"),
+        ):
             server._build_run_kwargs()
 
 

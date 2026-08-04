@@ -64,6 +64,129 @@ class RedisJobStoreTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(await self.redis.lrange(self.store.processing_key, 0, -1), [])
 
+    async def test_prepare_completed_delivery_replaces_payload_and_replays_without_rerun(self):
+        created = await self.store.create_job(
+            "research_web",
+            {"query": "expensive search"},
+        )
+        claimed = await self.store.claim_job(worker_id="worker-1")
+        delivery = {
+            "_delivery_only": True,
+            "result_metadata": {"artifact_path": f"{created['job_id']}/result.json"},
+            "artifact_path": f"{created['job_id']}/result.json",
+        }
+        self.assertTrue(
+            await self.store.prepare_completed_delivery(
+                created["job_id"],
+                delivery,
+                lease_token=claimed["lease_token"],
+            )
+        )
+        current = await self.store.get_job(created["job_id"], include_payload=True)
+        self.assertEqual(current["payload"], delivery)
+        raw_record = await self.redis.hgetall(self.store._job_key(created["job_id"]))
+        raw_delivery = raw_record.get("delivery_payload") or raw_record.get(b"delivery_payload")
+        if isinstance(raw_delivery, bytes):
+            raw_delivery = raw_delivery.decode("utf-8")
+        self.assertEqual(raw_delivery, job_store._json_dumps(delivery))
+
+        await self.store.requeue_completed_delivery(
+            created["job_id"],
+            delivery,
+            lease_token=claimed["lease_token"],
+        )
+        replay = await self.store.claim_job(worker_id="worker-2")
+        self.assertEqual(replay["payload"], delivery)
+
+    async def test_interactive_assistant_is_claimed_before_standard_backlog(self):
+        standard = await self.store.create_job(
+            "query_memory",
+            {"query": "older standard work"},
+        )
+        interactive = await self.store.create_job(
+            "research_assistant",
+            {"request": "current installation instructions", "mode": "balanced"},
+        )
+
+        self.assertEqual(
+            await self.redis.lrange(self.store.interactive_queue_key, 0, -1),
+            [interactive["job_id"]],
+        )
+        claimed = await self.store.claim_job(worker_id="worker-1")
+        self.assertEqual(claimed["job_id"], interactive["job_id"])
+        await self.store.complete_job(
+            interactive["job_id"],
+            {"result_storage": "test"},
+            lease_token=claimed["lease_token"],
+        )
+
+        next_claimed = await self.store.claim_job(worker_id="worker-1")
+        self.assertEqual(next_claimed["job_id"], standard["job_id"])
+
+    async def test_deep_assistant_remains_on_durable_standard_queue(self):
+        deep = await self.store.create_job(
+            "research_assistant",
+            {"request": "long investigation", "mode": "deep"},
+        )
+
+        self.assertEqual(await self.redis.llen(self.store.interactive_queue_key), 0)
+        self.assertEqual(
+            await self.redis.lrange(self.store.queue_key, 0, -1),
+            [deep["job_id"]],
+        )
+
+    async def test_waiting_claimer_notices_new_interactive_job_promptly(self):
+        claim = asyncio.create_task(
+            self.store.claim_job(timeout=1, worker_id="worker-1")
+        )
+        await asyncio.sleep(0.02)
+        interactive = await self.store.create_job(
+            "research_assistant",
+            {"request": "current installation instructions", "mode": "balanced"},
+        )
+
+        claimed = await asyncio.wait_for(claim, timeout=0.5)
+
+        self.assertEqual(claimed["job_id"], interactive["job_id"])
+
+    async def test_standard_job_remains_claimable_without_interactive_work(self):
+        standard = await self.store.create_job(
+            "query_memory",
+            {"query": "standard work"},
+        )
+
+        claimed = await self.store.claim_job(timeout=1, worker_id="worker-1")
+
+        self.assertEqual(claimed["job_id"], standard["job_id"])
+
+    async def test_interactive_priority_yields_to_standard_after_bounded_burst(self):
+        self.store.interactive_claim_burst = 2
+        standard = await self.store.create_job(
+            "query_memory",
+            {"query": "durable standard work"},
+        )
+        interactive_jobs = [
+            await self.store.create_job(
+                "research_assistant",
+                {"request": f"interactive {index}", "mode": "balanced"},
+            )
+            for index in range(3)
+        ]
+
+        first = await self.store.claim_job(worker_id="worker-1")
+        await self.store.complete_job(
+            first["job_id"], {}, lease_token=first["lease_token"]
+        )
+        second = await self.store.claim_job(worker_id="worker-1")
+        await self.store.complete_job(
+            second["job_id"], {}, lease_token=second["lease_token"]
+        )
+        third = await self.store.claim_job(worker_id="worker-1")
+
+        self.assertIn(first["job_id"], {job["job_id"] for job in interactive_jobs})
+        self.assertIn(second["job_id"], {job["job_id"] for job in interactive_jobs})
+        self.assertEqual(third["job_id"], standard["job_id"])
+
     async def test_active_coalescing_is_opt_in_and_canonical(self):
         first_default = await self.store.create_job(
             "query_memory",
@@ -555,9 +678,7 @@ class RedisJobStoreTests(unittest.IsolatedAsyncioTestCase):
 
         admitted = [item for item in outcomes if isinstance(item, dict)]
         rejected = [
-            item
-            for item in outcomes
-            if isinstance(item, ResearchAdmissionLimitedError)
+            item for item in outcomes if isinstance(item, ResearchAdmissionLimitedError)
         ]
         self.assertEqual(len(admitted), 1)
         self.assertEqual(len(rejected), 1)

@@ -11,6 +11,17 @@ import research_agent
 import searching
 
 
+@pytest.fixture(autouse=True)
+def _stub_immediate_baseline_search(monkeypatch):
+    # Unit tests mock the higher-level pipeline and must not reach a real
+    # SearXNG service through the assistant's immediate discovery wave.
+    monkeypatch.setattr(
+        research_agent,
+        "searxng_search",
+        AsyncMock(return_value=[]),
+    )
+
+
 def _evidence(evidence_id=1, url="https://docs.example.com/guide"):
     return {
         "evidence_id": evidence_id,
@@ -22,18 +33,216 @@ def _evidence(evidence_id=1, url="https://docs.example.com/guide"):
 
 
 @pytest.mark.asyncio
-async def test_unified_agent_fails_clearly_without_internal_model(monkeypatch):
+async def test_unified_agent_searches_without_internal_model(monkeypatch):
     monkeypatch.setattr(research_agent, "research_model_configured", lambda: False)
+    pipeline = AsyncMock(return_value={"evidence": [_evidence()]})
+    monkeypatch.setattr(research_agent, "research_pipeline", pipeline)
+    monkeypatch.setattr(research_agent, "RESEARCH_AGENT_MAX_FOLLOW_UP_ROUNDS", 0)
 
     result = await research_agent.run_research_assistant("Find the current setup guide")
 
-    assert result["status"] == "configuration_required"
-    assert result["error"] == "internal_research_model_not_configured"
-    assert result["required_settings"] == [
-        "RESEARCH_MODEL_BASE_URL",
-        "RESEARCH_MODEL_NAME",
-    ]
-    assert "API_KEY" not in result["detail"]
+    assert result["status"] == "partial"
+    assert result["citations"][0]["url"] == _evidence()["url"]
+    assert result["generated_by"] == "deterministic:evidence-digest"
+    assert "not configured" in result["research_summary"]["planning_warning"]
+    assert result["research_summary"]["synthesis_fallback"] == (
+        "skipped_to_preserve_search_budget"
+    )
+    instructions = " ".join(result["answering_instructions"])
+    assert "answer the user's original request directly" in instructions
+    assert "unsupported" in instructions
+    assert "Present answer_markdown directly" not in instructions
+    pipeline.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_unified_agent_recovers_pipeline_metadata_when_evidence_is_empty(
+    monkeypatch,
+):
+    """Qdrant/deferred-index responses must not erase fresh crawl discovery."""
+    url = "https://docs.example.com/install"
+    pipeline = AsyncMock(
+        return_value={
+            "evidence": [],
+            "searched": [
+                {
+                    "title": "Install guide",
+                    "url": url,
+                    "domain": "docs.example.com",
+                    "snippet": "Install ExampleApp with Docker Compose.",
+                    "score": 10,
+                },
+            ],
+            "crawled_sources": [
+                {
+                    "title": "Install guide",
+                    "url": url,
+                    "requested_url": url,
+                    "domain": "docs.example.com",
+                    "evidence_text": "Run docker compose up -d after configuring the environment.",
+                },
+            ],
+            "completion": {"status": "partial"},
+        }
+    )
+    monkeypatch.setattr(research_agent, "research_model_configured", lambda: False)
+    monkeypatch.setattr(research_agent, "research_pipeline", pipeline)
+    monkeypatch.setattr(research_agent, "RESEARCH_AGENT_MAX_FOLLOW_UP_ROUNDS", 0)
+
+    result = await research_agent.run_research_assistant(
+        "How do I install ExampleApp?"
+    )
+
+    assert result["research_summary"]["evidence_items"] == 1
+    assert result["citations"][0]["url"] == url
+    assert "docker compose up -d" in result["answer_markdown"]
+    assert "search-result snippet only" not in result["answer_markdown"]
+
+
+@pytest.mark.asyncio
+async def test_unified_agent_prefers_crawled_page_over_legacy_snippet_same_url(
+    monkeypatch,
+):
+    """A low-confidence legacy snippet must not hide a successful page crawl."""
+    url = "https://docs.example.com/install"
+    pipeline = AsyncMock(
+        return_value={
+            "evidence": [
+                {
+                    "evidence_id": 1,
+                    "title": "Install guide",
+                    "url": url,
+                    "quote": "Install snippet from the search index.",
+                    "evidence_type": "search_result_snippet",
+                    "confidence": "low",
+                }
+            ],
+            "searched": [],
+            "crawled_sources": [
+                {
+                    "title": "Install guide",
+                    "url": url,
+                    "requested_url": url,
+                    "domain": "docs.example.com",
+                    "evidence_text": "Run docker compose up -d after configuring the environment.",
+                }
+            ],
+        }
+    )
+    monkeypatch.setattr(research_agent, "research_model_configured", lambda: False)
+    monkeypatch.setattr(research_agent, "research_pipeline", pipeline)
+    monkeypatch.setattr(research_agent, "RESEARCH_AGENT_MAX_FOLLOW_UP_ROUNDS", 0)
+
+    result = await research_agent.run_research_assistant(
+        "How do I install ExampleApp?"
+    )
+
+    assert result["research_summary"]["evidence_items"] == 1
+    assert result["citations"][0]["url"] == url
+    assert "docker compose up -d" in result["answer_markdown"]
+    assert "search index" not in result["answer_markdown"]
+    assert result["citations"][0]["evidence_type"] == "extracted_page_content"
+
+
+@pytest.mark.asyncio
+async def test_unified_agent_never_synthesizes_tentative_low_relevance_leads(
+    monkeypatch,
+):
+    tentative = {
+        **_evidence(),
+        "relevance_fallback": True,
+        "confidence": "low",
+        "limitations": "Tentative lead that failed the topical relevance gate.",
+    }
+    monkeypatch.setattr(research_agent, "research_model_configured", lambda: True)
+    monkeypatch.setattr(
+        research_agent,
+        "build_assistant_plan",
+        AsyncMock(
+            return_value={
+                **research_agent.deterministic_assistant_plan("Find Android TV boxes"),
+                "generated_by": "model:private-model",
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        research_agent,
+        "research_pipeline",
+        AsyncMock(return_value={"evidence": [tentative]}),
+    )
+    write = AsyncMock()
+    monkeypatch.setattr(research_agent, "_write_answer", write)
+    monkeypatch.setattr(research_agent, "RESEARCH_AGENT_MAX_FOLLOW_UP_ROUNDS", 0)
+
+    result = await research_agent.run_research_assistant("Find Android TV boxes")
+
+    write.assert_not_awaited()
+    assert result["status"] == "partial"
+    assert result["confidence"] == "low"
+    assert result["research_summary"]["synthesis_fallback"] == (
+        "skipped_low_topical_relevance"
+    )
+    assert "tentative leads" in result["limitations"][-1]
+    assert "only the following tentative leads" in result["answer_markdown"]
+    assert "failed topical relevance gate" in result["answer_markdown"]
+
+
+@pytest.mark.asyncio
+async def test_interactive_search_starts_before_optional_planner_finishes(monkeypatch):
+    baseline_started = asyncio.Event()
+    baseline_url = "https://docs.example.com/current-install"
+
+    async def baseline_search(query, **_kwargs):
+        baseline_started.set()
+        return [
+            {
+                "title": "Current installation guide",
+                "url": baseline_url,
+                "snippet": "Install the current release with Docker Compose.",
+                "domain": "docs.example.com",
+            }
+        ]
+
+    async def planner_after_search(request, mode, **_kwargs):
+        await asyncio.wait_for(baseline_started.wait(), timeout=0.5)
+        return {
+            **research_agent.deterministic_assistant_plan(request, mode),
+            "generated_by": "model:private-model",
+        }
+
+    monkeypatch.setattr(research_agent, "research_model_configured", lambda: True)
+    monkeypatch.setattr(research_agent, "searxng_search", baseline_search)
+    monkeypatch.setattr(research_agent, "build_assistant_plan", planner_after_search)
+    monkeypatch.setattr(
+        research_agent,
+        "research_pipeline",
+        AsyncMock(return_value={"evidence": [], "searched": []}),
+    )
+    monkeypatch.setattr(
+        research_agent,
+        "_write_answer",
+        AsyncMock(
+            return_value={
+                "answer_markdown": "Use the current installation guide.",
+                "citations": [{"evidence_id": 1, "url": baseline_url}],
+                "citation_validation": {"valid": True},
+                "generated_by": "model:private-model",
+            }
+        ),
+    )
+    monkeypatch.setattr(research_agent, "RESEARCH_AGENT_MAX_FOLLOW_UP_ROUNDS", 0)
+
+    result = await asyncio.wait_for(
+        research_agent.run_research_assistant(
+            "How do I install the current product release?",
+            time_budget_seconds=5,
+        ),
+        timeout=2,
+    )
+
+    assert baseline_started.is_set()
+    assert result["citations"][0]["url"] == baseline_url
+    assert result["research_summary"]["evidence_items"] == 1
 
 
 @pytest.mark.asyncio
@@ -868,13 +1077,20 @@ async def test_planner_failure_uses_deterministic_search_fallback(monkeypatch):
     monkeypatch.setattr(research_agent, "RESEARCH_AGENT_MAX_FOLLOW_UP_ROUNDS", 0)
 
     result = await research_agent.run_research_assistant(
-        "How do I install Docker for internal project Apollo Blue?"
+        "How do I install Docker for internal project Apollo Blue?",
+        time_budget_seconds=36,
     )
 
-    assert result["status"] == "complete"
+    assert result["status"] == "partial"
     assert result["research_summary"]["plan"]["generated_by"] == "deterministic-fallback"
     assert result["research_summary"]["planning_warning"] == "internal research model timed out"
     assert "Apollo Blue" not in pipeline.await_args.kwargs["query"]
+    write.assert_not_awaited()
+    assert result["generated_by"] == "deterministic:evidence-digest"
+    assert result["research_summary"]["synthesis_fallback"] == (
+        "skipped_to_preserve_search_budget"
+    )
+    assert pipeline.await_args.kwargs["time_budget_seconds"] > 30
 
 
 @pytest.mark.asyncio
@@ -1195,11 +1411,31 @@ def test_public_research_task_does_not_reuse_private_request_details():
 
     public_task, redactions = research_agent._public_research_task(request, plan)
 
-    assert public_task == "official Docker installation documentation; installation steps"
+    assert public_task == "official Docker installation documentation installation steps"
     assert "Apollo" not in public_task
     assert "123-45-6789" not in public_task
     assert "/srv/private" not in public_task
     assert redactions >= 3
+
+
+def test_public_research_task_keeps_complete_intent_and_does_not_join_plan_clauses():
+    request = (
+        "Find today's most important AI news and rank the top three developments. "
+        "Explain why each matters and cite its publication date."
+    )
+    plan = {
+        "queries": [
+            "AI news today",
+            "AI model company regulation chip news",
+        ],
+        "answer_focus": "rank three items with dates and importance",
+    }
+
+    public_task, redactions = research_agent._public_research_task(request, plan)
+
+    assert public_task == request
+    assert ";" not in public_task
+    assert redactions == 0
 
 
 def test_model_repeated_private_identifiers_are_removed_from_public_queries():
@@ -1306,7 +1542,7 @@ def test_legitimate_private_cloud_and_registry_queries_keep_specificity(user_req
         {"queries": [expected], "answer_focus": ""},
     )
 
-    assert public_task == expected
+    assert public_task == user_request
     assert redactions == 0
 
 
@@ -1419,6 +1655,21 @@ def test_url_redaction_covers_semicolon_phpsessionid():
     assert "page=2" in sanitized
 
 
+def test_public_query_redaction_covers_inline_secret_assignments():
+    value = (
+        "Fix Docker with API_KEY=supersecretvalue123 and "
+        "foo_token:anothersecretvalue456"
+    )
+
+    sanitized, count = redaction.redact_public_query_text(value)
+
+    assert count == 2
+    assert "supersecretvalue123" not in sanitized
+    assert "anothersecretvalue456" not in sanitized
+    assert "API_KEY=[REDACTED]" in sanitized
+    assert "foo_token:[REDACTED]" in sanitized
+
+
 def test_model_markdown_sanitizer_handles_many_unmatched_brackets_linearly():
     content = "[" * 12_000 + "unmatched"
 
@@ -1453,6 +1704,52 @@ def test_confidence_uses_only_cited_source_diversity():
     citations = [
         {"evidence_id": value, "url": f"https://one.example/{value}"}
         for value in range(1, 4)
+    ]
+
+    assert research_agent._confidence(evidence, citations, []) == "medium"
+
+
+def test_confidence_stays_low_for_only_tentative_relevance_fallbacks():
+    evidence = [{**_evidence(), "relevance_fallback": True, "confidence": "low"}]
+    citations = [{"evidence_id": 1, "url": _evidence()["url"]}]
+
+    assert research_agent._confidence(evidence, citations, []) == "low"
+
+
+def test_confidence_stays_low_for_search_snippet_only_evidence():
+    evidence = [
+        {
+            **_evidence(index, f"https://source{index}.example/article"),
+            "evidence_type": "search_result_snippet",
+            "confidence": "low",
+        }
+        for index in range(1, 4)
+    ]
+    citations = [
+        {"evidence_id": item["evidence_id"], "url": item["url"]}
+        for item in evidence
+    ]
+
+    assert research_agent._confidence(evidence, citations, []) == "low"
+
+
+def test_confidence_requires_independent_extracted_support_for_high():
+    evidence = [
+        _evidence(1, "https://one.example/page"),
+        {
+            **_evidence(2, "https://two.example/result"),
+            "evidence_type": "search_result_snippet",
+            "confidence": "low",
+        },
+        {
+            **_evidence(3, "https://three.example/result"),
+            "evidence_type": "search_result_snippet",
+            "confidence": "low",
+        },
+    ]
+    citations = [
+        {"evidence_id": item["evidence_id"], "url": item["url"]}
+        for item in evidence
     ]
 
     assert research_agent._confidence(evidence, citations, []) == "medium"
@@ -1639,6 +1936,10 @@ async def test_synthesis_failure_returns_cited_digest_and_omits_image_urls(
     assert result["citations"][0]["url"] == _evidence()["url"]
     assert result["citation_validation"]["reason"] == "deterministic_evidence_digest"
     assert any("untrusted" in item for item in result["answering_instructions"])
+    assert any(
+        "answer the user's original request directly" in item
+        for item in result["answering_instructions"]
+    )
     assert result["images"][0]["source_url"] == "https://docs.example.com/screenshots"
     assert result["images"][0]["direct_image_url_omitted"] is True
     assert "image_url" not in result["images"][0]

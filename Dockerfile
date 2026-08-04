@@ -61,8 +61,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* /var/cache/apt/* \
     && groupadd --gid "${APP_GID}" app \
     && useradd --uid "${APP_UID}" --gid "${APP_GID}" --create-home --shell /usr/sbin/nologin app \
-    && mkdir -p /data/artifacts /data/models /home/app/.cache /run/research-pdf /run/research-web \
-    && chown -R app:app /app /data /home/app /run/research-pdf /run/research-web \
+    && mkdir -p /data/artifacts /data/models /home/app/.cache /run/research-interactive /run/research-pdf /run/research-web \
+    && chown -R app:app /app /data /home/app /run/research-interactive /run/research-pdf /run/research-web \
     && chmod -R a+rX /ms-playwright
 
 COPY --chown=app:app *.py ./

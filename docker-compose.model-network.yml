@@ -6,6 +6,13 @@ services:
       - search-control
       - research-model
 
+  research-runner:
+    networks:
+      - backend
+      - egress
+      - search-control
+      - research-model
+
 networks:
   research-model:
     external: true

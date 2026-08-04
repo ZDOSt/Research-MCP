@@ -135,6 +135,24 @@ class ArtifactStore:
         return await asyncio.to_thread(read)
 
     async def write_json(self, job_id: str, value: Any, name: str = "result") -> dict[str, Any]:
+        return await self._write_json(job_id, value, name=name)
+
+    async def write_delivery_json(
+        self,
+        job_id: str,
+        value: Any,
+        name: str = "delivery",
+    ) -> dict[str, Any]:
+        """Write a delivery-retry artifact through an independent code path."""
+        return await self._write_json(job_id, value, name=name)
+
+    async def _write_json(
+        self,
+        job_id: str,
+        value: Any,
+        *,
+        name: str,
+    ) -> dict[str, Any]:
         name_value = str(name or "").strip().lower()
         target = self.path_for(job_id, name_value)
         try:

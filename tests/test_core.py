@@ -30,6 +30,37 @@ def test_deterministic_technical_plan_uses_multiple_queries():
     assert any("GitHub issues" in item for item in plan["queries"])
 
 
+@pytest.mark.parametrize(
+    ("source_query", "expected_terms"),
+    [
+        (
+            "This is the error I get when starting Docker: connection refused",
+            ("starting Docker", "connection refused"),
+        ),
+        ("Here is the error: connection refused", ("connection refused",)),
+        ("That is the error I received: connection refused", ("connection refused",)),
+    ],
+)
+def test_error_introduction_filler_is_removed_from_search_query(source_query, expected_terms):
+    compact = compact_search_query(source_query)
+
+    assert "error" not in compact.lower()
+    assert all(term.lower() in compact.lower() for term in expected_terms)
+
+
+def test_android_tv_query_keeps_product_and_display_context():
+    source_query = (
+        "Which Android TV box should I buy? I want something powerful, with good "
+        "software support, for my Sony Bravia XR-65X90CK."
+    )
+
+    compact = compact_search_query(source_query)
+
+    assert "Android TV box" in compact
+    assert "Sony Bravia XR-65X90CK" in compact
+    assert "should I buy" not in compact.lower()
+
+
 VERBOSE_AI_NEWS_QUERY = (
     "Today's most important AI news. Identify and rank the top three substantive AI news "
     "articles published today, prioritizing major developments in AI models, companies, "
@@ -270,11 +301,40 @@ def test_hacker_news_api_documentation_keeps_technical_variants():
     [
         ("Tell me today's AI news.", "today's AI news"),
         ("Can you find the Docker Compose installation guide?", "the Docker Compose installation guide"),
+        ("Find me information about Android TV boxes.", "information about Android TV boxes"),
+        ("Search me for the latest Docker installation guide.", "the latest Docker installation guide"),
         ("Determine the current PostgreSQL version.", "the current PostgreSQL version"),
+        ("I got this error: connection refused when starting container", "connection refused when starting container"),
+        ("I am getting a connection refused error when starting a Docker container", "connection refused when starting a Docker container"),
+        ("The error is: failed to connect to Redis", "failed to connect to Redis"),
     ],
 )
 def test_short_request_language_is_removed_from_search_query(source_query, expected):
     assert compact_search_query(source_query) == expected
+
+
+def test_error_framing_is_not_reintroduced_in_deterministic_variants():
+    queries = deterministic_plan(
+        "I got this error: connection refused when starting container",
+        "balanced",
+    )["queries"]
+
+    assert queries
+    assert all("I got this error" not in query for query in queries)
+    assert all("connection refused" in query for query in queries)
+
+
+def test_generic_followup_keeps_prior_error_context_in_search_queries():
+    source_query = "I got error 502 when deploying Foo container. How fix?"
+
+    compact = compact_search_query(source_query)
+    queries = deterministic_plan(source_query, "technical")["queries"]
+
+    assert "502" in compact
+    assert "Foo" in compact
+    assert "container" in compact.lower()
+    assert any("502" in query and "Foo" in query for query in queries)
+    assert all(query.strip().lower() not in {"how fix", "how fix?"} for query in queries)
 
 
 @pytest.mark.parametrize(
@@ -1037,8 +1097,10 @@ def test_contextual_product_comparison_becomes_focused_search_queries(monkeypatc
     assert "shield alternative" in compact.lower()
     assert "Bravia XR-65X90CK" in compact
     assert "2026" in compact
+    assert "As powerful as that thing is" not in compact
+    assert "serious limitations" not in compact
+    assert compact.lower().startswith("powerful android tv box")
     assert any("benchmarks specifications" in query for query in plan["queries"])
-    assert "benchmarks specifications" in plan["queries"][1]
     assert all(query.lower().count("shield") == 1 for query in plan["queries"])
     assert all('"shield-killer"' not in query.lower() for query in plan["queries"])
     assert all("200" not in query for query in plan["queries"])

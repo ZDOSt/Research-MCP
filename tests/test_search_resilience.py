@@ -28,6 +28,19 @@ def _payload(count=4, *, unresponsive=None):
     }
 
 
+def test_engine_stages_never_use_broken_bing_news_adapter():
+    configured = [
+        engine
+        for stages in searching._ENGINE_STAGES.values()
+        for stage in stages
+        for engine in stage
+    ]
+
+    # The pinned SearXNG release can raise when Bing omits a news thumbnail.
+    # Keep this adapter out of every stage; the general Bing adapter is safe.
+    assert "bing news" not in {engine.casefold() for engine in configured}
+
+
 class _Response:
     def __init__(self, payload, *, delay=0.0, tracker=None):
         self.payload = payload

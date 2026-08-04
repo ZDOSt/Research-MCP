@@ -11,6 +11,45 @@ from searching import SearchResults
 
 
 @pytest.mark.asyncio
+async def test_pipeline_dispatches_subject_focused_queries_not_generic_news(
+    monkeypatch,
+):
+    """Exercise the real planner-to-search boundary used by deployed workers."""
+    calls = []
+
+    async def search(*, query, **_kwargs):
+        calls.append(query)
+        return [
+            {
+                "title": "Iran war latest developments",
+                "snippet": "Current reporting about the Iran war.",
+                "url": "https://news.example/iran-war",
+                "domain": "news.example",
+                "score": 10,
+            }
+        ]
+
+    monkeypatch.setattr(pipelines, "searxng_search", search)
+
+    result = await pipelines.research_pipeline(
+        "Today's latest news on the Iran war",
+        mode="balanced",
+        max_sources=0,
+        verify=False,
+        persist_source_artifacts=False,
+        allow_model_planning=False,
+    )
+
+    assert calls
+    assert all(query.strip().casefold() != "news" for query in calls)
+    assert all(
+        "iran" in query.casefold() and "war" in query.casefold()
+        for query in calls
+    )
+    assert result["completion"]["evidence_items"] == 1
+
+
+@pytest.mark.asyncio
 async def test_proposed_primary_cannot_resolve_without_canonical_relevance(monkeypatch):
     calls = []
     planner_inputs = []
@@ -853,15 +892,25 @@ async def test_low_relevance_after_repair_is_reported_as_insufficient(monkeypatc
 
     result = await pipelines.research_pipeline(
         "Find a powerful Android TV box that is an Nvidia Shield alternative",
-        max_sources=1,
+        max_sources=0,
         verify=False,
         persist_source_artifacts=False,
     )
 
     assert calls == ["powerful shield killer", repair_query]
-    assert result["searched"] == []
-    assert result["evidence"] == []
+    assert len(result["searched"]) == 2
+    assert all(item["relevance_fallback"] for item in result["searched"])
+    assert all(
+        item["topical_relevance"]["is_relevant"] is False
+        and item["topical_relevance"]["relevant_intents"] == []
+        for item in result["searched"]
+    )
+    assert len(result["evidence"]) == 2
+    assert all(item["relevance_fallback"] for item in result["evidence"])
+    assert all("tentative lead" in item["limitations"] for item in result["evidence"])
     assert result["topical_relevance"]["status"] == "low_relevance"
+    assert result["topical_relevance"]["fallback_candidates_retained"] == 2
+    assert result["intent_coverage"]["android-tv"]["status"] == "unresolved"
     assert result["completion"]["status"] == "insufficient"
     assert result["completion"]["reason"] == "low_topical_relevance"
     assert "low_web_topical_relevance" in result["completion"]["reasons"]
@@ -869,6 +918,207 @@ async def test_low_relevance_after_repair_is_reported_as_insufficient(monkeypatc
         "Do not repeat the same research_web request" in instruction
         for instruction in result["answering_instructions"]
     )
+
+
+@pytest.mark.asyncio
+async def test_zero_crawl_quota_still_returns_bounded_search_snippet_evidence(
+    monkeypatch,
+):
+    query = "install ExampleApp with Docker"
+    candidates = [
+        {
+            "title": "ExampleApp Docker installation guide",
+            "snippet": "Install ExampleApp with Docker Compose using the documented image.",
+            "url": "https://docs.example/exampleapp/docker",
+            "domain": "docs.example",
+            "score": 10,
+        },
+        {
+            "title": "ExampleApp container setup",
+            "snippet": "Configure and start the ExampleApp Docker container.",
+            "url": "https://guide.example/exampleapp-container",
+            "domain": "guide.example",
+            "score": 9,
+        },
+    ]
+    crawl = AsyncMock()
+
+    async def plan(request, mode):
+        return {"query": request, "mode": mode, "queries": [request]}
+
+    monkeypatch.setattr(pipelines, "build_research_plan", plan)
+    monkeypatch.setattr(
+        pipelines,
+        "searxng_search",
+        AsyncMock(return_value=candidates),
+    )
+    monkeypatch.setattr(pipelines, "crawl_source_limited", crawl)
+
+    result = await pipelines.research_pipeline(
+        query,
+        max_sources=0,
+        verify=False,
+        persist_source_artifacts=False,
+    )
+
+    crawl.assert_not_awaited()
+    assert result["selected_for_crawl"] == []
+    assert [item["url"] for item in result["evidence"]] == [
+        candidate["url"] for candidate in candidates
+    ]
+    assert all(
+        item["evidence_type"] == "search_result_snippet"
+        for item in result["evidence"]
+    )
+
+
+def test_relevant_snippet_fallback_is_bounded_and_never_promotes_irrelevant_results():
+    candidates = [
+        {
+            "title": "Relevant installation guide",
+            "snippet": "Install ExampleApp with Docker Compose.",
+            "url": "https://docs.example/install",
+            "score": 2,
+            "topical_relevance": {"is_relevant": True, "score": 0.9},
+        },
+        {
+            "title": "Unrelated result",
+            "snippet": "A guide to gardening.",
+            "url": "https://garden.example/guide",
+            "score": 99,
+            "topical_relevance": {"is_relevant": False, "score": 0.1},
+        },
+    ]
+
+    retained = pipelines._retain_relevant_snippet_fallback(
+        candidates,
+        "install ExampleApp with Docker",
+        limit=1,
+    )
+
+    assert [item["url"] for item in retained] == ["https://docs.example/install"]
+    assert retained[0]["snippet_fallback"] is True
+    assert retained[0]["discovery_confidence"] == "low"
+    assert retained[0]["snippet_fallback_reason"] == "full_page_extraction_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_synthesis_failure_preserves_retrieved_evidence(monkeypatch):
+    query = "install ExampleApp with Docker"
+    candidate = {
+        "title": "ExampleApp Docker installation guide",
+        "snippet": "Install ExampleApp with Docker Compose using the documented image.",
+        "url": "https://docs.example/exampleapp/docker",
+        "domain": "docs.example",
+        "score": 10,
+    }
+
+    async def plan(request, mode):
+        return {"query": request, "mode": mode, "queries": [request]}
+
+    monkeypatch.setattr(pipelines, "build_research_plan", plan)
+    monkeypatch.setattr(
+        pipelines,
+        "searxng_search",
+        AsyncMock(return_value=[candidate]),
+    )
+    monkeypatch.setattr(
+        pipelines,
+        "synthesize_report",
+        AsyncMock(side_effect=RuntimeError("model endpoint unavailable")),
+    )
+
+    result = await pipelines.research_pipeline(
+        query,
+        max_sources=0,
+        verify=False,
+        synthesize=True,
+        persist_source_artifacts=False,
+    )
+
+    assert result["evidence"][0]["url"] == candidate["url"]
+    assert result["completion"]["evidence_items"] == 1
+    assert result["report_unavailable"] == (
+        "Synthesis failed after evidence retrieval; the retrieved evidence remains available."
+    )
+
+
+@pytest.mark.asyncio
+async def test_synthesis_never_promotes_low_relevance_fallback(monkeypatch):
+    query = "Find a powerful Android TV box"
+    irrelevant = {
+        "title": "Traditional cider guide",
+        "snippet": "Apple varieties and orchard events",
+        "url": "https://cider.example/guide",
+        "domain": "cider.example",
+        "score": 8,
+    }
+    synthesis = AsyncMock(return_value={"text": "Off-topic report"})
+
+    async def plan(request, mode):
+        return {"query": request, "mode": mode, "queries": [request]}
+
+    monkeypatch.setattr(pipelines, "build_research_plan", plan)
+    monkeypatch.setattr(
+        pipelines,
+        "searxng_search",
+        AsyncMock(return_value=[irrelevant]),
+    )
+    monkeypatch.setattr(pipelines, "synthesize_report", synthesis)
+
+    result = await pipelines.research_pipeline(
+        query,
+        max_sources=0,
+        verify=False,
+        synthesize=True,
+        persist_source_artifacts=False,
+    )
+
+    synthesis.assert_not_awaited()
+    assert "report" not in result
+    assert result["completion"]["status"] == "insufficient"
+    assert result["evidence"][0]["relevance_fallback"] is True
+    assert result["report_unavailable"] == (
+        "Synthesis was skipped because the remaining search results did not pass "
+        "the topical relevance gate; they are retained only as tentative leads."
+    )
+
+
+@pytest.mark.asyncio
+async def test_low_relevance_fallback_is_not_written_to_durable_memory(monkeypatch):
+    source = {
+        "url": "https://tentative.example/guide",
+        "evidence_text": "Tentative extracted content",
+        "relevance_fallback": True,
+        "discovery_confidence": "low",
+        "_content": "Full tentative extracted content",
+    }
+    ingest = AsyncMock()
+    write_artifact = AsyncMock()
+    monkeypatch.setattr(pipelines, "rag_ingest_impl", ingest)
+    monkeypatch.setattr(pipelines, "_write_crawled_source_artifact", write_artifact)
+
+    persisted = await pipelines.persist_crawled_source(
+        source,
+        query="install ExampleApp",
+        research_run_id="run-id",
+    )
+    staged, manifest = await pipelines.stage_crawled_source_for_deferred_persistence(
+        source,
+        query="install ExampleApp",
+        namespace="default",
+        research_run_id="run-id",
+        persist_source_artifacts=True,
+        ingestion_attempt_id=None,
+    )
+
+    ingest.assert_not_awaited()
+    write_artifact.assert_not_awaited()
+    assert persisted["memory_index_state"] == "skipped_low_relevance_fallback"
+    assert staged["memory_index_state"] == "skipped_low_relevance_fallback"
+    assert "_content" not in persisted
+    assert "_content" not in staged
+    assert manifest is None
 
 
 @pytest.mark.asyncio
@@ -1018,7 +1268,15 @@ async def test_low_web_relevance_with_memory_is_partial_not_insufficient(monkeyp
         result["completion"]["reason"]
         == "memory_evidence_without_relevant_web_evidence"
     )
-    assert result["evidence"][0]["url"] == "https://memory.example/android-tv"
+    assert any(
+        item["url"] == "https://memory.example/android-tv"
+        for item in result["evidence"]
+    )
+    fallback_evidence = [
+        item for item in result["evidence"] if item.get("relevance_fallback")
+    ]
+    assert len(fallback_evidence) == 1
+    assert fallback_evidence[0]["url"] == "https://cider.example/guide"
     assert any(
         "no topically relevant web evidence" in instruction.lower()
         for instruction in result["answering_instructions"]
@@ -2726,6 +2984,214 @@ def test_relevance_gate_ignores_nonfinite_reranker_scores():
         or math.isfinite(item["rerank_score"])
         for item in gated
     )
+
+
+def test_low_relevance_fallback_skips_candidates_that_cannot_emit_snippet_evidence():
+    candidates = [
+        {
+            "title": f"Unusable result {index}",
+            "url": f"https://unusable{index}.example/result",
+            "snippet": "",
+        }
+        for index in range(3)
+    ]
+    candidates.extend(
+        [
+            {
+                "title": "Usable tentative result",
+                "url": "https://usable.example/result",
+                "snippet": "A search-provider excerpt remains available.",
+            },
+            {
+                "title": "Stale result",
+                "url": "https://stale.example/result",
+                "snippet": "This must not be emitted as current evidence.",
+                "freshness_status": "stale",
+            },
+        ]
+    )
+
+    retained = pipelines._retain_low_confidence_search_fallback(
+        candidates,
+        "specific topic",
+        limit=3,
+    )
+
+    assert [item["url"] for item in retained] == ["https://usable.example/result"]
+    assert retained[0]["relevance_fallback"] is True
+    assert retained[0]["discovery_confidence"] == "low"
+
+
+@pytest.mark.asyncio
+async def test_reranker_rejection_does_not_erase_usable_searxng_snippet(
+    monkeypatch,
+):
+    query = "powerful Android TV box Nvidia Shield alternative"
+    candidates = [
+        {
+            "title": f"Android TV box benchmark {index}",
+            "url": f"https://accepted{index}.example/android-tv",
+            "domain": f"accepted{index}.example",
+            "snippet": "",
+            "score": 10 - index,
+        }
+        for index in range(3)
+    ]
+    rejected_url = "https://deprioritized.example/android-tv"
+    candidates.append(
+        {
+            "title": "Android TV box product comparison",
+            "url": rejected_url,
+            "domain": "deprioritized.example",
+            "snippet": "A powerful Android TV box compared with Nvidia Shield alternatives.",
+            "score": 1,
+        }
+    )
+
+    async def plan(_query, _mode):
+        return {
+            "query": query,
+            "mode": "balanced",
+            "queries": [query],
+            "query_intent_ids": ["intent-1"],
+            "intent_contexts": {"intent-1": query},
+            "query_roles": ["deterministic"],
+            "subquestions": [],
+            "generated_by": "test",
+        }
+
+    async def search(**_kwargs):
+        return candidates
+
+    async def rerank(_query, docs, _top_k):
+        scores = [0.92, 0.80, 0.75, 0.01]
+        return [
+            {**doc, "rerank_score": scores[doc["candidate_index"]]}
+            for doc in docs
+        ]
+
+    async def crawl(_semaphore, source, **_kwargs):
+        return {
+            "ok": False,
+            "url": source["url"],
+            "title": source.get("title"),
+            "reason": "page extraction unavailable",
+        }
+
+    async def query_memory(_request):
+        return {"results": []}
+
+    monkeypatch.setitem(
+        pipelines.RESEARCH_MODE_CONFIG,
+        "balanced",
+        {
+            "max_urls": 1,
+            "search_results": 4,
+            "top_k": 0,
+            "planner_budget": 0.2,
+            "search_budget": 0.2,
+            "crawl_budget": 0.2,
+            "total_budget": 1,
+        },
+    )
+    monkeypatch.setattr(pipelines, "build_research_plan", plan)
+    monkeypatch.setattr(pipelines, "searxng_search", search)
+    monkeypatch.setattr(pipelines, "SEARCH_RERANKER_ENABLED", True)
+    monkeypatch.setattr(pipelines, "SEARCH_RERANKER_TIMEOUT_SECONDS", 0.1)
+    monkeypatch.setattr(pipelines, "rerank_docs", rerank)
+    monkeypatch.setattr(pipelines, "crawl_source_limited", crawl)
+    monkeypatch.setattr(pipelines, "rag_query_impl", query_memory)
+
+    result = await pipelines.research_pipeline(
+        query,
+        max_sources=1,
+        verify=False,
+        persist_source_artifacts=False,
+    )
+
+    assert result["discovery_reranking"]["status"] == "applied"
+    assert result["topical_relevance"]["reranker_rejections"] == 1
+    assert [item["url"] for item in result["evidence"]] == [rejected_url]
+    assert result["evidence"][0]["evidence_type"] == "search_result_snippet"
+    assert result["evidence"][0]["reranker_deprioritized"] is True
+    assert result["evidence"][0]["confidence"] == "low"
+    assert "optional reranker deprioritized" in result["evidence"][0]["limitations"]
+
+
+@pytest.mark.asyncio
+async def test_snippet_fallback_retains_all_relevant_candidates_before_crawl_cap(
+    monkeypatch,
+):
+    query = "install ExampleApp with Docker Compose"
+    candidates = [
+        {
+            "title": f"ExampleApp Docker Compose installation source {index}",
+            "url": f"https://source{index}.example/exampleapp-install",
+            "domain": f"source{index}.example",
+            "snippet": f"Install ExampleApp with Docker Compose using source {index}.",
+            "score": 10 - index,
+        }
+        for index in range(5)
+    ]
+
+    async def plan(_query, _mode):
+        return {"query": query, "mode": "balanced", "queries": [query]}
+
+    async def search(**_kwargs):
+        return candidates
+
+    async def crawl(_semaphore, source, **_kwargs):
+        return {
+            "ok": True,
+            "title": source["title"],
+            "url": source["url"],
+            "requested_url": source["url"],
+            "domain": source["domain"],
+            "evidence_text": f"Extracted installation instructions from {source['url']}.",
+        }
+
+    monkeypatch.setitem(
+        pipelines.RESEARCH_MODE_CONFIG,
+        "balanced",
+        {
+            "max_urls": 1,
+            "search_results": 2,
+            "top_k": 0,
+            "planner_budget": 0.2,
+            "search_budget": 0.2,
+            "crawl_budget": 0.2,
+            "total_budget": 1,
+        },
+    )
+    monkeypatch.setattr(pipelines, "build_research_plan", plan)
+    monkeypatch.setattr(pipelines, "searxng_search", search)
+    monkeypatch.setattr(pipelines, "crawl_source_limited", crawl)
+    monkeypatch.setattr(
+        pipelines,
+        "rag_query_impl",
+        AsyncMock(return_value={"results": []}),
+    )
+
+    result = await pipelines.research_pipeline(
+        query,
+        max_sources=1,
+        verify=False,
+        persist_source_artifacts=False,
+    )
+
+    assert len(result["searched"]) == 2
+    assert len(result["selected_for_crawl"]) == 1
+    assert {item["url"] for item in result["evidence"]} == {
+        item["url"] for item in candidates
+    }
+    assert sum(
+        item["evidence_type"] == "extracted_page_content"
+        for item in result["evidence"]
+    ) == 1
+    assert sum(
+        item["evidence_type"] == "search_result_snippet"
+        for item in result["evidence"]
+    ) == 4
 
 
 @pytest.mark.asyncio

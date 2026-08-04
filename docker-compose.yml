@@ -20,6 +20,8 @@ x-app-environment: &app-environment
   GITHUB_TIMEOUT_SECONDS: ${GITHUB_TIMEOUT_SECONDS:-45}
   JOB_BACKEND: redis
   JOB_MAX_ATTEMPTS: ${JOB_MAX_ATTEMPTS:-3}
+  JOB_INTERACTIVE_CLAIM_BURST: ${JOB_INTERACTIVE_CLAIM_BURST:-8}
+  JOB_INLINE_RESULT_MAX_BYTES: ${JOB_INLINE_RESULT_MAX_BYTES:-262144}
   JOB_MAX_PAYLOAD_BYTES: ${JOB_MAX_PAYLOAD_BYTES:-1048576}
   JOB_MAX_QUEUED: ${JOB_MAX_QUEUED:-1000}
   JOB_INGESTION_WAITAOF_TIMEOUT_MS: ${JOB_INGESTION_WAITAOF_TIMEOUT_MS:-5000}
@@ -34,9 +36,9 @@ x-app-environment: &app-environment
   MCP_AUTH_TOKEN: ${MCP_AUTH_TOKEN:-}
   MCP_AUTH_TOKENS_JSON: "${MCP_AUTH_TOKENS_JSON:-}"
   MCP_ALLOWED_NAMESPACES: "${MCP_ALLOWED_NAMESPACES:-*}"
-  # Compatibility default: old .env files retain the advanced tools during an
-  # upgrade. New installs copy .env.example, which explicitly selects unified.
-  MCP_TOOL_PROFILE: ${MCP_TOOL_PROFILE:-all}
+  # The one-call assistant is the default. Select advanced or all explicitly
+  # when an installation still needs the legacy specialized tools.
+  MCP_TOOL_PROFILE: ${MCP_TOOL_PROFILE:-unified}
   MCP_MAX_INGEST_CHARS: ${MCP_MAX_INGEST_CHARS:-500000}
   MCP_MAX_QUERY_CHARS: ${MCP_MAX_QUERY_CHARS:-8000}
   MCP_CLIENT_TIMEOUT_SECONDS: ${MCP_CLIENT_TIMEOUT_SECONDS:-60}
@@ -46,6 +48,9 @@ x-app-environment: &app-environment
   RESEARCH_ADMISSION_MAX_NEW_JOBS: ${RESEARCH_ADMISSION_MAX_NEW_JOBS:-2}
   RESEARCH_ADMISSION_WINDOW_SECONDS: ${RESEARCH_ADMISSION_WINDOW_SECONDS:-60}
   RESEARCH_ASSISTANT_INTERACTIVE_TIMEOUT_SECONDS: ${RESEARCH_ASSISTANT_INTERACTIVE_TIMEOUT_SECONDS:-36}
+  RESEARCH_RUNNER_MAX_REQUEST_BYTES: ${RESEARCH_RUNNER_MAX_REQUEST_BYTES:-524288}
+  RESEARCH_RUNNER_MAX_RESPONSE_BYTES: ${RESEARCH_RUNNER_MAX_RESPONSE_BYTES:-8388608}
+  RESEARCH_RUNNER_SOCKET: /run/research-interactive/runner.sock
   PLANNER_ALLOW_INSECURE_HTTP: ${PLANNER_ALLOW_INSECURE_HTTP:-false}
   PLANNER_MAX_RESPONSE_BYTES: ${PLANNER_MAX_RESPONSE_BYTES:-1048576}
   QDRANT_COLLECTION: ${QDRANT_COLLECTION:-research_mcp}
@@ -170,6 +175,9 @@ x-worker-environment: &worker-environment
   RESEARCH_DEFER_PERSISTENCE: ${RESEARCH_DEFER_PERSISTENCE:-true}
   RESEARCH_ASSISTANT_INTERACTIVE_TIMEOUT_SECONDS: ${RESEARCH_ASSISTANT_INTERACTIVE_TIMEOUT_SECONDS:-36}
   RESEARCH_ASSISTANT_SYNC_WAIT_SECONDS: ${RESEARCH_ASSISTANT_SYNC_WAIT_SECONDS:-45}
+  RESEARCH_RUNNER_MAX_REQUEST_BYTES: ${RESEARCH_RUNNER_MAX_REQUEST_BYTES:-524288}
+  RESEARCH_RUNNER_MAX_RESPONSE_BYTES: ${RESEARCH_RUNNER_MAX_RESPONSE_BYTES:-8388608}
+  RESEARCH_RUNNER_SOCKET: /run/research-interactive/runner.sock
   RESEARCH_PERSISTENCE_QUEUE: ${RESEARCH_PERSISTENCE_QUEUE:-research:persistence}
   RESEARCH_PRIMARY_QUEUE: ${RESEARCH_QUEUE:-research:jobs}
   RESEARCH_QUEUE: ${RESEARCH_QUEUE:-research:jobs}
@@ -230,18 +238,27 @@ services:
       MCP_EXTERNAL_BIND_ADDRESS: ${MCP_BIND_ADDRESS:-127.0.0.1}
       MCP_JOB_LONG_POLL_SECONDS: ${MCP_JOB_LONG_POLL_SECONDS:-15}
       MCP_JOB_POLL_SECONDS: ${MCP_JOB_POLL_SECONDS:-0.5}
+      MCP_JOB_RESULT_TIMEOUT_SECONDS: ${MCP_JOB_RESULT_TIMEOUT_SECONDS:-4.0}
+      MCP_JOB_STATUS_TIMEOUT_SECONDS: ${MCP_JOB_STATUS_TIMEOUT_SECONDS:-1.0}
       MCP_PATH: ${MCP_PATH:-/mcp}
       MCP_PORT: "8001"
       MCP_SYNC_JOB_WAIT_SECONDS: ${MCP_SYNC_JOB_WAIT_SECONDS:-45}
       RESEARCH_ASSISTANT_SYNC_WAIT_SECONDS: ${RESEARCH_ASSISTANT_SYNC_WAIT_SECONDS:-45}
       MCP_TRANSPORT: ${MCP_TRANSPORT:-streamable-http}
+      RESEARCH_RUNNER_SOCKET: /run/research-interactive/runner.sock
+    volumes:
+      - artifacts:/data/artifacts
+      - model-cache:/data/models
+      - interactive-runner-control:/run/research-interactive:ro
     depends_on:
       qdrant:
-        condition: service_healthy
+        condition: service_started
       redis:
+        condition: service_started
+      research-runner:
         condition: service_healthy
       research-worker:
-        condition: service_healthy
+        condition: service_started
     networks:
       - backend
       - edge
@@ -265,6 +282,71 @@ services:
     pids_limit: ${GATEWAY_PIDS_LIMIT:-256}
     stop_grace_period: 5m
 
+  research-runner:
+    <<: *app-service
+    command:
+      - python
+      - research_runner.py
+    environment:
+      <<: *worker-environment
+      MCP_TOOL_PROFILE: ${MCP_TOOL_PROFILE:-unified}
+      GITHUB_ALLOWED_REPOSITORIES: ${GITHUB_ALLOWED_REPOSITORIES:-}
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      PLANNER_API_KEY: ${PLANNER_API_KEY:-}
+      PLANNER_ALLOW_INSECURE_HTTP: ${PLANNER_ALLOW_INSECURE_HTTP:-false}
+      PLANNER_BASE_URL: ${PLANNER_BASE_URL:-}
+      PLANNER_ENABLE_SYNTHESIS: ${PLANNER_ENABLE_SYNTHESIS:-false}
+      PLANNER_MAX_RESPONSE_BYTES: ${PLANNER_MAX_RESPONSE_BYTES:-1048576}
+      PLANNER_MODEL: ${PLANNER_MODEL:-}
+      PLANNER_TIMEOUT_SECONDS: ${PLANNER_TIMEOUT_SECONDS:-90}
+      RESEARCH_AGENT_MAX_EVIDENCE: ${RESEARCH_AGENT_MAX_EVIDENCE:-30}
+      RESEARCH_AGENT_MAX_EXPLICIT_URLS: ${RESEARCH_AGENT_MAX_EXPLICIT_URLS:-2}
+      RESEARCH_AGENT_MAX_FOLLOW_UP_ROUNDS: ${RESEARCH_AGENT_MAX_FOLLOW_UP_ROUNDS:-1}
+      RESEARCH_AGENT_MAX_IMAGES: ${RESEARCH_AGENT_MAX_IMAGES:-6}
+      RESEARCH_AGENT_PLAN_TIMEOUT_SECONDS: ${RESEARCH_AGENT_PLAN_TIMEOUT_SECONDS:-30}
+      RESEARCH_AGENT_REVIEW_TIMEOUT_SECONDS: ${RESEARCH_AGENT_REVIEW_TIMEOUT_SECONDS:-20}
+      RESEARCH_AGENT_SYNTHESIS_TIMEOUT_SECONDS: ${RESEARCH_AGENT_SYNTHESIS_TIMEOUT_SECONDS:-60}
+      RESEARCH_AGENT_QUICK_PLAN_TIMEOUT_SECONDS: ${RESEARCH_AGENT_QUICK_PLAN_TIMEOUT_SECONDS:-8}
+      RESEARCH_AGENT_QUICK_SYNTHESIS_TIMEOUT_SECONDS: ${RESEARCH_AGENT_QUICK_SYNTHESIS_TIMEOUT_SECONDS:-25}
+      RESEARCH_AGENT_QUICK_VERIFY: ${RESEARCH_AGENT_QUICK_VERIFY:-false}
+      RESEARCH_ASSISTANT_AUTO_MODE: ${RESEARCH_ASSISTANT_AUTO_MODE:-auto}
+      RESEARCH_MODEL_API_KEY: ${RESEARCH_MODEL_API_KEY:-}
+      RESEARCH_MODEL_ALLOW_INSECURE_HTTP: ${RESEARCH_MODEL_ALLOW_INSECURE_HTTP:-false}
+      RESEARCH_MODEL_BASE_URL: ${RESEARCH_MODEL_BASE_URL:-}
+      RESEARCH_MODEL_MAX_RESPONSE_BYTES: ${RESEARCH_MODEL_MAX_RESPONSE_BYTES:-1048576}
+      RESEARCH_MODEL_NAME: ${RESEARCH_MODEL_NAME:-}
+      RESEARCH_MODEL_TIMEOUT_SECONDS: ${RESEARCH_MODEL_TIMEOUT_SECONDS:-90}
+      RESEARCH_RUNNER_MAX_CONCURRENT: ${RESEARCH_RUNNER_MAX_CONCURRENT:-2}
+      RESEARCH_RUNNER_SOCKET: /run/research-interactive/runner.sock
+    volumes:
+      - artifacts:/data/artifacts
+      - model-cache:/data/models
+      - interactive-runner-control:/run/research-interactive
+      - pdf-runner-control:/run/research-pdf:ro
+      - web-runner-control:/run/research-web:ro
+    depends_on:
+      searxng:
+        condition: service_healthy
+    networks:
+      - backend
+      - egress
+      - search-control
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - research_runner.py
+        - --healthcheck
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 30s
+    cpus: ${RESEARCH_RUNNER_CPUS:-2.0}
+    mem_limit: ${RESEARCH_RUNNER_MEMORY_LIMIT:-4g}
+    pids_limit: ${RESEARCH_RUNNER_PIDS_LIMIT:-512}
+    shm_size: ${RESEARCH_RUNNER_SHM_SIZE:-1gb}
+    stop_grace_period: 2m
+
   research-worker:
     <<: *app-service
     command:
@@ -272,7 +354,7 @@ services:
       - worker.py
     environment:
       <<: *worker-environment
-      MCP_TOOL_PROFILE: ${MCP_TOOL_PROFILE:-all}
+      MCP_TOOL_PROFILE: ${MCP_TOOL_PROFILE:-unified}
       GITHUB_ALLOWED_REPOSITORIES: ${GITHUB_ALLOWED_REPOSITORIES:-}
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
       PLANNER_API_KEY: ${PLANNER_API_KEY:-}
@@ -748,6 +830,7 @@ networks:
 
 volumes:
   artifacts:
+  interactive-runner-control:
   model-cache:
   pdf-runner-control:
   qdrant-data:

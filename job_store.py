@@ -6,6 +6,7 @@ gateway can import this module even when it is configured for inline execution.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -13,6 +14,7 @@ import math
 import os
 import re
 import socket
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping, Optional
@@ -108,7 +110,9 @@ def utc_now_iso() -> str:
 def validate_job_id(job_id: str) -> str:
     value = str(job_id or "").strip().lower()
     if not _JOB_ID_RE.fullmatch(value):
-        raise InvalidJobError("job_id must be a 32-character lowercase hexadecimal UUID")
+        raise InvalidJobError(
+            "job_id must be a 32-character lowercase hexadecimal UUID"
+        )
     return value
 
 
@@ -149,7 +153,11 @@ def _validate_owner_id(owner_id: Optional[str]) -> Optional[str]:
     if owner_id is None:
         return None
     value = str(owner_id).strip()
-    if not value or len(value) > 128 or any(ord(char) < 32 or ord(char) == 127 for char in value):
+    if (
+        not value
+        or len(value) > 128
+        or any(ord(char) < 32 or ord(char) == 127 for char in value)
+    ):
         raise InvalidJobError("owner_id must be 1-128 printable characters")
     return value
 
@@ -191,7 +199,9 @@ def _parse_timestamp(value: Optional[str]) -> Optional[datetime]:
 
 def _json_dumps(value: Any) -> str:
     try:
-        return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        return json.dumps(
+            value, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        )
     except (TypeError, ValueError) as exc:
         raise InvalidJobError(f"value is not JSON serializable: {exc}") from exc
 
@@ -245,9 +255,12 @@ class RedisJobStore:
         self.redis_url = redis_url or os.getenv("REDIS_URL", "redis://redis:6379/0")
         self.queue_key = queue_name or os.getenv("RESEARCH_QUEUE", "research:jobs")
         if not self.queue_key or any(char.isspace() for char in self.queue_key):
-            raise ValueError("RESEARCH_QUEUE must be a non-empty Redis key without whitespace")
+            raise ValueError(
+                "RESEARCH_QUEUE must be a non-empty Redis key without whitespace"
+            )
 
         self.processing_key = f"{self.queue_key}:processing"
+        self.interactive_queue_key = f"{self.queue_key}:interactive"
         self.job_key_prefix = f"{self.queue_key}:job:"
         self.active_job_key_prefix = f"{self.queue_key}:active:"
         self.worker_heartbeat_key = f"{self.queue_key}:worker:heartbeat"
@@ -270,10 +283,14 @@ class RedisJobStore:
             _MIN_ACTIVE_JOB_INDEX_TTL_SECONDS,
             self.result_ttl_seconds,
         )
-        self.max_payload_bytes = _env_int("JOB_MAX_PAYLOAD_BYTES", 1_048_576, minimum=1024)
+        self.max_payload_bytes = _env_int(
+            "JOB_MAX_PAYLOAD_BYTES", 1_048_576, minimum=1024
+        )
         self.max_queued_jobs = _env_int("JOB_MAX_QUEUED", 1000, minimum=0)
         self.max_attempts = _env_int("JOB_MAX_ATTEMPTS", 3, minimum=1)
-        self.worker_heartbeat_ttl = _env_int("WORKER_HEARTBEAT_TTL_SECONDS", 60, minimum=10)
+        self.worker_heartbeat_ttl = _env_int(
+            "WORKER_HEARTBEAT_TTL_SECONDS", 60, minimum=10
+        )
         self.ingestion_waitaof_timeout_ms = (
             _env_int("JOB_INGESTION_WAITAOF_TIMEOUT_MS", 5000)
             if ingestion_waitaof_timeout_ms is None
@@ -308,6 +325,10 @@ class RedisJobStore:
                 "RESEARCH_ADMISSION_ANONYMOUS must be shared, off, or deny"
             )
         self.research_admission_anonymous = anonymous_mode
+        self.interactive_claim_burst = _env_int(
+            "JOB_INTERACTIVE_CLAIM_BURST", 8, minimum=1
+        )
+        self._interactive_claim_streak = 0
 
         if redis_client is not None:
             self.redis = redis_client
@@ -320,6 +341,20 @@ class RedisJobStore:
 
     def _job_key(self, job_id: str) -> str:
         return f"{self.job_key_prefix}{validate_job_id(job_id)}"
+
+    def _queue_for_job(self, kind: str, payload: Mapping[str, Any]) -> str:
+        mode = str(payload.get("mode") or "auto").strip().lower()
+        if kind == "research_assistant" and mode != "deep":
+            return self.interactive_queue_key
+        return self.queue_key
+
+    def _queue_for_record(self, record: Mapping[str, Any]) -> str:
+        if record.get("queue_lane") == "interactive":
+            return self.interactive_queue_key
+        payload = _json_loads(record.get("payload"), default={})
+        if not isinstance(payload, Mapping):
+            payload = {}
+        return self._queue_for_job(str(record.get("kind") or ""), payload)
 
     def _active_job_key(self, fingerprint: str) -> str:
         value = str(fingerprint or "").strip().lower()
@@ -404,7 +439,9 @@ class RedisJobStore:
         return f"{prefix}{digest}"
 
     async def close(self) -> None:
-        close = getattr(self.redis, "aclose", None) or getattr(self.redis, "close", None)
+        close = getattr(self.redis, "aclose", None) or getattr(
+            self.redis, "close", None
+        )
         if close is not None:
             result = close()
             if hasattr(result, "__await__"):
@@ -424,7 +461,9 @@ class RedisJobStore:
     ) -> dict[str, Any]:
         kind_value = str(kind or "").strip().lower()
         if not _KIND_RE.fullmatch(kind_value):
-            raise InvalidJobError("kind must use lowercase letters, digits, and underscores")
+            raise InvalidJobError(
+                "kind must use lowercase letters, digits, and underscores"
+            )
         if not isinstance(payload, Mapping):
             raise InvalidJobError("payload must be a mapping")
 
@@ -434,7 +473,9 @@ class RedisJobStore:
                 f"payload exceeds JOB_MAX_PAYLOAD_BYTES ({self.max_payload_bytes} bytes)"
             )
 
-        job_id_value = validate_job_id(job_id) if job_id is not None else uuid.uuid4().hex
+        job_id_value = (
+            validate_job_id(job_id) if job_id is not None else uuid.uuid4().hex
+        )
         owner_id_value = _validate_owner_id(owner_id)
         if not isinstance(coalesce_active, bool):
             raise InvalidJobError("coalesce_active must be a boolean")
@@ -471,6 +512,7 @@ class RedisJobStore:
         admission_active_key = admission_keys[0] if admission_keys else None
         admission_history_key = admission_keys[1] if admission_keys else None
         now = utc_now_iso()
+        target_queue = self._queue_for_job(kind_value, payload)
         record = {
             "job_id": job_id_value,
             "kind": kind_value,
@@ -480,6 +522,11 @@ class RedisJobStore:
             "created_at": now,
             "updated_at": now,
             "enqueued_at": now,
+            "queue_lane": (
+                "interactive"
+                if target_queue == self.interactive_queue_key
+                else "standard"
+            ),
         }
         if owner_id_value is not None:
             record["owner_id"] = owner_id_value
@@ -490,7 +537,7 @@ class RedisJobStore:
         for _ in range(_MAX_WATCH_RETRIES):
             async with self.redis.pipeline(transaction=True) as pipe:
                 try:
-                    watched_keys = [key, self.queue_key]
+                    watched_keys = [key, self.queue_key, self.interactive_queue_key]
                     if active_key is not None:
                         watched_keys.append(active_key)
                     if admission_active_key is not None:
@@ -564,8 +611,7 @@ class RedisJobStore:
                             float(redis_microseconds) / 1_000_000
                         )
                         admission_cutoff = (
-                            admission_now
-                            - self.research_admission_window_seconds
+                            admission_now - self.research_admission_window_seconds
                         )
                     active_admissions: list[str] = []
                     stale_admissions: list[str] = []
@@ -597,13 +643,11 @@ class RedisJobStore:
                     retry_after_seconds = 5
                     active_limited = (
                         admission_active_enabled
-                        and len(active_admissions)
-                        >= self.research_admission_max_active
+                        and len(active_admissions) >= self.research_admission_max_active
                     )
                     window_limited = (
                         admission_window_enabled
-                        and len(recent_scores)
-                        >= self.research_admission_max_new_jobs
+                        and len(recent_scores) >= self.research_admission_max_new_jobs
                     )
                     window_retry_after = (
                         max(
@@ -657,15 +701,20 @@ class RedisJobStore:
                             window_seconds=self.research_admission_window_seconds,
                         )
 
-                    queued_count = int(await pipe.llen(self.queue_key))
-                    if self.max_queued_jobs > 0 and queued_count >= self.max_queued_jobs:
+                    queued_count = int(await pipe.llen(self.queue_key)) + int(
+                        await pipe.llen(self.interactive_queue_key)
+                    )
+                    if (
+                        self.max_queued_jobs > 0
+                        and queued_count >= self.max_queued_jobs
+                    ):
                         await pipe.unwatch()
                         raise JobQueueFullError(
                             f"job queue has reached JOB_MAX_QUEUED ({self.max_queued_jobs})"
                         )
                     pipe.multi()
                     pipe.hset(key, mapping=record)
-                    pipe.lpush(self.queue_key, job_id_value)
+                    pipe.lpush(target_queue, job_id_value)
                     if active_key is not None:
                         pipe.set(
                             active_key,
@@ -759,15 +808,16 @@ class RedisJobStore:
 
         pipe = self.redis.pipeline(transaction=True)
         pipe.lrange(self.queue_key, 0, limit)
+        pipe.lrange(self.interactive_queue_key, 0, limit)
         pipe.lrange(self.processing_key, 0, limit)
-        queued, processing = await pipe.execute()
-        if len(queued) + len(processing) > limit:
+        queued, interactive, processing = await pipe.execute()
+        if len(queued) + len(interactive) + len(processing) > limit:
             raise JobStoreError(
                 f"active job scan exceeded its safety limit ({limit}); artifact cleanup was skipped"
             )
 
         active: set[str] = set()
-        for raw_job_id in [*queued, *processing]:
+        for raw_job_id in [*queued, *interactive, *processing]:
             try:
                 active.add(validate_job_id(_decode(raw_job_id)))
             except InvalidJobError:
@@ -821,7 +871,12 @@ class RedisJobStore:
         for _ in range(_MAX_WATCH_RETRIES):
             async with self.redis.pipeline(transaction=True) as pipe:
                 try:
-                    await pipe.watch(key, self.queue_key, self.processing_key)
+                    await pipe.watch(
+                        key,
+                        self.queue_key,
+                        self.interactive_queue_key,
+                        self.processing_key,
+                    )
                     raw_record = await pipe.hgetall(key)
                     if not raw_record:
                         await pipe.unwatch()
@@ -864,6 +919,7 @@ class RedisJobStore:
                         pipe.hset(key, mapping=fields)
                         pipe.hdel(key, "lease_token", "worker_id", "heartbeat_at")
                         pipe.lrem(self.queue_key, 0, job_id_value)
+                        pipe.lrem(self.interactive_queue_key, 0, job_id_value)
                         pipe.lrem(self.processing_key, 0, job_id_value)
                         if self.result_ttl_seconds > 0:
                             pipe.expire(key, self.result_ttl_seconds)
@@ -881,15 +937,46 @@ class RedisJobStore:
         value = await self.redis.hget(self._job_key(job_id), "cancel_requested")
         return _decode(value) == "1" if value is not None else False
 
-    async def claim_job(self, timeout: float = 1.0, worker_id: Optional[str] = None) -> Optional[dict[str, Any]]:
-        timeout_seconds = max(1, math.ceil(float(timeout)))
-        raw_job_id = await self.redis.brpoplpush(
-            self.queue_key,
-            self.processing_key,
-            timeout=timeout_seconds,
-        )
+    async def claim_job(
+        self, timeout: float = 1.0, worker_id: Optional[str] = None
+    ) -> Optional[dict[str, Any]]:
+        timeout_value = max(0.0, float(timeout))
+        deadline = time.monotonic() + timeout_value
+        raw_job_id = None
+        claimed_interactive = False
+        while raw_job_id is None:
+            prefer_standard = (
+                self._interactive_claim_streak >= self.interactive_claim_burst
+            )
+            queue_order = (
+                (self.queue_key, self.interactive_queue_key)
+                if prefer_standard
+                else (self.interactive_queue_key, self.queue_key)
+            )
+            for queue_key in queue_order:
+                raw_job_id = await self.redis.rpoplpush(
+                    queue_key,
+                    self.processing_key,
+                )
+                if raw_job_id is not None:
+                    claimed_interactive = queue_key == self.interactive_queue_key
+                    break
+            if raw_job_id is not None or timeout_value <= 0:
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            # Redis cannot atomically block-pop from multiple source lists into
+            # one processing list. Short, bounded rechecks let newly arriving
+            # interactive work retain priority without sacrificing the reliable
+            # source-to-processing move used for worker crash recovery.
+            await asyncio.sleep(min(0.2, remaining))
         if raw_job_id is None:
             return None
+        if claimed_interactive:
+            self._interactive_claim_streak += 1
+        else:
+            self._interactive_claim_streak = 0
 
         try:
             job_id = validate_job_id(_decode(raw_job_id))
@@ -903,15 +990,22 @@ class RedisJobStore:
         for _ in range(_MAX_WATCH_RETRIES):
             async with self.redis.pipeline(transaction=True) as pipe:
                 try:
-                    await pipe.watch(key, self.queue_key, self.processing_key)
+                    await pipe.watch(
+                        key,
+                        self.queue_key,
+                        self.interactive_queue_key,
+                        self.processing_key,
+                    )
                     raw_record = await pipe.hgetall(key)
                     processing = [
-                        _decode(item) for item in await pipe.lrange(self.processing_key, 0, -1)
+                        _decode(item)
+                        for item in await pipe.lrange(self.processing_key, 0, -1)
                     ]
                     if not raw_record:
                         pipe.multi()
                         pipe.lrem(self.processing_key, 0, job_id_value)
                         pipe.lrem(self.queue_key, 0, job_id_value)
+                        pipe.lrem(self.interactive_queue_key, 0, job_id_value)
                         await pipe.execute()
                         return None
 
@@ -926,6 +1020,7 @@ class RedisJobStore:
                         pipe.multi()
                         pipe.lrem(self.processing_key, 0, job_id_value)
                         pipe.lrem(self.queue_key, 0, job_id_value)
+                        pipe.lrem(self.interactive_queue_key, 0, job_id_value)
                         if active_key is not None:
                             pipe.delete(active_key)
                         await pipe.execute()
@@ -963,6 +1058,7 @@ class RedisJobStore:
                         pipe.hdel(key, "lease_token", "worker_id", "heartbeat_at")
                         pipe.lrem(self.processing_key, 0, job_id_value)
                         pipe.lrem(self.queue_key, 0, job_id_value)
+                        pipe.lrem(self.interactive_queue_key, 0, job_id_value)
                         if self.result_ttl_seconds > 0:
                             pipe.expire(key, self.result_ttl_seconds)
                         if active_key is not None:
@@ -981,6 +1077,7 @@ class RedisJobStore:
                     )
                     pipe.multi()
                     pipe.lrem(self.queue_key, 0, job_id_value)
+                    pipe.lrem(self.interactive_queue_key, 0, job_id_value)
                     pipe.lrem(self.processing_key, 0, job_id_value)
                     pipe.lpush(self.processing_key, job_id_value)
                     pipe.hset(
@@ -1011,7 +1108,9 @@ class RedisJobStore:
                     continue
         raise JobStoreError("could not claim job because its state kept changing")
 
-    async def heartbeat_job(self, job_id: str, worker_id: str, lease_token: str) -> bool:
+    async def heartbeat_job(
+        self, job_id: str, worker_id: str, lease_token: str
+    ) -> bool:
         job_id_value = validate_job_id(job_id)
         lease_token_value = _validate_lease_token(lease_token)
         worker_id_value = str(worker_id)
@@ -1023,7 +1122,9 @@ class RedisJobStore:
                     record = _decode_mapping(await pipe.hgetall(key))
                     owns_lease = (
                         record.get("status") == RUNNING
-                        and hmac.compare_digest(record.get("lease_token", ""), lease_token_value)
+                        and hmac.compare_digest(
+                            record.get("lease_token", ""), lease_token_value
+                        )
                         and record.get("worker_id") == worker_id_value
                     )
                     if not owns_lease:
@@ -1114,11 +1215,8 @@ class RedisJobStore:
                 try:
                     await pipe.watch(key)
                     record = _decode_mapping(await pipe.hgetall(key))
-                    if (
-                        record.get("status") != RUNNING
-                        or not hmac.compare_digest(
-                            record.get("lease_token", ""), lease_token_value
-                        )
+                    if record.get("status") != RUNNING or not hmac.compare_digest(
+                        record.get("lease_token", ""), lease_token_value
                     ):
                         await pipe.unwatch()
                         raise JobLeaseLostError(
@@ -1211,7 +1309,11 @@ class RedisJobStore:
         limit: int = 100,
         lease_seconds: float = 600.0,
     ) -> list[dict[str, str]]:
-        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= 1000
+        ):
             raise ValueError("invalidation replay limit must be between 1 and 1000")
         if isinstance(lease_seconds, bool) or float(lease_seconds) < 1:
             raise ValueError("invalidation delivery lease must be at least one second")
@@ -1241,9 +1343,7 @@ class RedisJobStore:
             hint = _json_loads(raw_hint, {})
             try:
                 job_id = validate_job_id(
-                    str(hint.get("job_id") or "")
-                    if isinstance(hint, Mapping)
-                    else ""
+                    str(hint.get("job_id") or "") if isinstance(hint, Mapping) else ""
                 )
             except InvalidJobError:
                 await self.redis.zrem(self.ingestion_invalidation_due_key, attempt_id)
@@ -1287,12 +1387,11 @@ class RedisJobStore:
 
                         record = _decode_mapping(await pipe.hgetall(key))
                         lease_until = now_timestamp + float(lease_seconds)
-                        active = (
-                            record.get("status") == RUNNING
-                            and hmac.compare_digest(
-                                record.get("ingestion_attempt_id", ""),
-                                attempt_id,
-                            )
+                        active = record.get(
+                            "status"
+                        ) == RUNNING and hmac.compare_digest(
+                            record.get("ingestion_attempt_id", ""),
+                            attempt_id,
                         )
                         pipe.multi()
                         pipe.zadd(
@@ -1427,6 +1526,77 @@ class RedisJobStore:
             successful_ingestion_attempt_id=successful_ingestion_attempt_id,
         )
 
+    async def prepare_completed_delivery(
+        self,
+        job_id: str,
+        delivery_payload: Mapping[str, Any],
+        *,
+        lease_token: str,
+    ) -> bool:
+        """Durably record terminal delivery work before attempting completion.
+
+        This closes the crash window between writing an artifact and the
+        terminal Redis write. Stale recovery can then replay the artifact
+        without dispatching the expensive provider computation again.
+        """
+        if not isinstance(delivery_payload, Mapping):
+            raise InvalidJobError("delivery_payload must be a mapping")
+        payload_value = dict(delivery_payload)
+        if payload_value.get("_delivery_only") is not True:
+            raise InvalidJobError("delivery_payload must be marked delivery-only")
+        payload_json = _json_dumps(payload_value)
+        if len(payload_json.encode("utf-8")) > self.max_payload_bytes:
+            raise InvalidJobError(
+                f"payload exceeds JOB_MAX_PAYLOAD_BYTES ({self.max_payload_bytes} bytes)"
+            )
+
+        job_id_value = validate_job_id(job_id)
+        lease_token_value = _validate_lease_token(lease_token)
+        key = self._job_key(job_id_value)
+        for _ in range(_MAX_WATCH_RETRIES):
+            async with self.redis.pipeline(transaction=True) as pipe:
+                try:
+                    await pipe.watch(key)
+                    record = _decode_mapping(await pipe.hgetall(key))
+                    if not record:
+                        await pipe.unwatch()
+                        raise JobNotFoundError(f"unknown job: {job_id_value}")
+                    if record.get("status") in TERMINAL_STATUSES:
+                        await pipe.unwatch()
+                        raise JobLeaseLostError(
+                            f"worker lease lost for job: {job_id_value}"
+                        )
+                    owns_lease = record.get("status") == RUNNING and hmac.compare_digest(
+                        record.get("lease_token", ""), lease_token_value
+                    )
+                    if not owns_lease:
+                        await pipe.unwatch()
+                        raise JobLeaseLostError(
+                            f"worker lease lost for job: {job_id_value}"
+                        )
+                    if record.get("cancel_requested") == "1":
+                        await pipe.unwatch()
+                        return False
+                    pipe.multi()
+                    pipe.hset(
+                        key,
+                        mapping={
+                            # Replace the original provider request before
+                            # terminal delivery. Stale recovery will therefore
+                            # replay this bounded payload, never the provider.
+                            "payload": payload_json,
+                            "delivery_payload": payload_json,
+                            "delivery_prepared_at": utc_now_iso(),
+                        },
+                    )
+                    await pipe.execute()
+                    return True
+                except WatchError:
+                    continue
+        raise JobStoreError(
+            "could not prepare completed result delivery because state kept changing"
+        )
+
     async def complete_job_with_children(
         self,
         job_id: str,
@@ -1505,6 +1675,7 @@ class RedisJobStore:
                             [
                                 parent_key,
                                 self.queue_key,
+                                self.interactive_queue_key,
                                 self.processing_key,
                                 queue_value,
                                 *child_keys,
@@ -1521,11 +1692,10 @@ class RedisJobStore:
                         raise JobLeaseLostError(
                             f"worker lease lost for job: {parent_id}"
                         )
-                    owns_lease = (
-                        parent.get("status") == RUNNING
-                        and hmac.compare_digest(
-                            parent.get("lease_token", ""), lease_token_value
-                        )
+                    owns_lease = parent.get(
+                        "status"
+                    ) == RUNNING and hmac.compare_digest(
+                        parent.get("lease_token", ""), lease_token_value
                     )
                     if not owns_lease:
                         await pipe.unwatch()
@@ -1584,6 +1754,7 @@ class RedisJobStore:
                     )
                     pipe.lrem(self.processing_key, 0, parent_id)
                     pipe.lrem(self.queue_key, 0, parent_id)
+                    pipe.lrem(self.interactive_queue_key, 0, parent_id)
                     if active_key is not None:
                         pipe.delete(active_key)
                     if self.result_ttl_seconds > 0:
@@ -1617,7 +1788,9 @@ class RedisJobStore:
         *,
         lease_token: Optional[str] = None,
     ) -> bool:
-        error_value = dict(error) if isinstance(error, Mapping) else {"message": str(error)}
+        error_value = (
+            dict(error) if isinstance(error, Mapping) else {"message": str(error)}
+        )
         return await self._mark_terminal(
             job_id,
             FAILED,
@@ -1652,19 +1825,23 @@ class RedisJobStore:
         for _ in range(_MAX_WATCH_RETRIES):
             async with self.redis.pipeline(transaction=True) as pipe:
                 try:
-                    await pipe.watch(key, self.queue_key, self.processing_key)
+                    await pipe.watch(
+                        key,
+                        self.queue_key,
+                        self.interactive_queue_key,
+                        self.processing_key,
+                    )
                     record = _decode_mapping(await pipe.hgetall(key))
                     if not record:
                         await pipe.unwatch()
                         raise JobNotFoundError(f"unknown job: {job_id_value}")
-                    if (
-                        record.get("status") != RUNNING
-                        or not hmac.compare_digest(
-                            record.get("lease_token", ""), lease_token_value
-                        )
+                    if record.get("status") != RUNNING or not hmac.compare_digest(
+                        record.get("lease_token", ""), lease_token_value
                     ):
                         await pipe.unwatch()
-                        raise JobLeaseLostError(f"worker lease lost for job: {job_id_value}")
+                        raise JobLeaseLostError(
+                            f"worker lease lost for job: {job_id_value}"
+                        )
 
                     now = utc_now_iso()
                     registered_attempt_id = _registered_ingestion_attempt(record)
@@ -1676,6 +1853,7 @@ class RedisJobStore:
                     pipe.multi()
                     pipe.lrem(self.processing_key, 0, job_id_value)
                     pipe.lrem(self.queue_key, 0, job_id_value)
+                    pipe.lrem(self.interactive_queue_key, 0, job_id_value)
                     if record.get("cancel_requested") == "1":
                         pipe.hset(
                             key,
@@ -1691,7 +1869,7 @@ class RedisJobStore:
                         if active_key is not None:
                             pipe.delete(active_key)
                     else:
-                        pipe.lpush(self.queue_key, job_id_value)
+                        pipe.lpush(self._queue_for_record(record), job_id_value)
                         pipe.hset(
                             key,
                             mapping={
@@ -1729,7 +1907,128 @@ class RedisJobStore:
                     continue
         raise JobStoreError("could not requeue job because its state kept changing")
 
-    async def requeue_stale_jobs(self, stale_after_seconds: Optional[int] = None) -> int:
+    async def requeue_completed_delivery(
+        self,
+        job_id: str,
+        delivery_payload: Mapping[str, Any],
+        *,
+        lease_token: str,
+    ) -> bool:
+        """Atomically replace a finished computation with delivery-only work."""
+        if not isinstance(delivery_payload, Mapping):
+            raise InvalidJobError("delivery_payload must be a mapping")
+        payload_value = dict(delivery_payload)
+        if payload_value.get("_delivery_only") is not True:
+            raise InvalidJobError("delivery_payload must be marked delivery-only")
+        payload_json = _json_dumps(payload_value)
+        if len(payload_json.encode("utf-8")) > self.max_payload_bytes:
+            raise InvalidJobError(
+                f"payload exceeds JOB_MAX_PAYLOAD_BYTES ({self.max_payload_bytes} bytes)"
+            )
+
+        job_id_value = validate_job_id(job_id)
+        lease_token_value = _validate_lease_token(lease_token)
+        key = self._job_key(job_id_value)
+        for _ in range(_MAX_WATCH_RETRIES):
+            async with self.redis.pipeline(transaction=True) as pipe:
+                try:
+                    await pipe.watch(
+                        key,
+                        self.queue_key,
+                        self.interactive_queue_key,
+                        self.processing_key,
+                    )
+                    record = _decode_mapping(await pipe.hgetall(key))
+                    if not record:
+                        await pipe.unwatch()
+                        raise JobNotFoundError(f"unknown job: {job_id_value}")
+                    owns_lease = record.get(
+                        "status"
+                    ) == RUNNING and hmac.compare_digest(
+                        record.get("lease_token", ""), lease_token_value
+                    )
+                    if not owns_lease:
+                        await pipe.unwatch()
+                        raise JobLeaseLostError(
+                            f"worker lease lost for job: {job_id_value}"
+                        )
+
+                    now = utc_now_iso()
+                    registered_attempt_id = _registered_ingestion_attempt(record)
+                    active_key = await self._matching_active_job_key(
+                        pipe,
+                        record,
+                        job_id_value,
+                    )
+                    cancellation_wins = record.get("cancel_requested") == "1"
+                    pipe.multi()
+                    pipe.lrem(self.processing_key, 0, job_id_value)
+                    pipe.lrem(self.queue_key, 0, job_id_value)
+                    pipe.lrem(self.interactive_queue_key, 0, job_id_value)
+                    if cancellation_wins:
+                        pipe.hset(
+                            key,
+                            mapping={
+                                "status": CANCELLED,
+                                "updated_at": now,
+                                "completed_at": now,
+                                "cancel_reason": "cancellation requested",
+                            },
+                        )
+                        if active_key is not None:
+                            pipe.delete(active_key)
+                        if self.result_ttl_seconds > 0:
+                            pipe.expire(key, self.result_ttl_seconds)
+                    else:
+                        pipe.lpush(self._queue_for_record(record), job_id_value)
+                        pipe.hset(
+                            key,
+                            mapping={
+                                "status": QUEUED,
+                                "payload": payload_json,
+                                "updated_at": now,
+                                "enqueued_at": now,
+                                "requeue_reason": "completed result pending delivery",
+                            },
+                        )
+                        if active_key is not None:
+                            pipe.expire(
+                                active_key,
+                                self.active_job_index_ttl_seconds,
+                            )
+                    if registered_attempt_id is not None and cancellation_wins:
+                        # A delivery-only replay still owns the ingestion
+                        # compensation until its terminal write succeeds. If
+                        # cancellation wins here, leave the durable record due
+                        # for invalidation instead of silently discarding it.
+                        pipe.zadd(
+                            self.ingestion_invalidation_due_key,
+                            {
+                                registered_attempt_id: datetime.now(
+                                    timezone.utc
+                                ).timestamp()
+                            },
+                        )
+                    pipe.hdel(
+                        key,
+                        "lease_token",
+                        "worker_id",
+                        "heartbeat_at",
+                        "attempt_started_at",
+                    )
+                    if cancellation_wins:
+                        pipe.hdel(key, "ingestion_attempt_id")
+                    await pipe.execute()
+                    return not cancellation_wins
+                except WatchError:
+                    continue
+        raise JobStoreError(
+            "could not queue completed result delivery because state kept changing"
+        )
+
+    async def requeue_stale_jobs(
+        self, stale_after_seconds: Optional[int] = None
+    ) -> int:
         stale_seconds = (
             _env_int("JOB_STALE_AFTER_SECONDS", 300, minimum=30)
             if stale_after_seconds is None
@@ -1756,9 +2055,15 @@ class RedisJobStore:
         for _ in range(_MAX_WATCH_RETRIES):
             async with self.redis.pipeline(transaction=True) as pipe:
                 try:
-                    await pipe.watch(key, self.queue_key, self.processing_key)
+                    await pipe.watch(
+                        key,
+                        self.queue_key,
+                        self.interactive_queue_key,
+                        self.processing_key,
+                    )
                     processing = [
-                        _decode(item) for item in await pipe.lrange(self.processing_key, 0, -1)
+                        _decode(item)
+                        for item in await pipe.lrange(self.processing_key, 0, -1)
                     ]
                     if job_id_value not in processing:
                         await pipe.unwatch()
@@ -1768,6 +2073,7 @@ class RedisJobStore:
                         pipe.multi()
                         pipe.lrem(self.processing_key, 0, job_id_value)
                         pipe.lrem(self.queue_key, 0, job_id_value)
+                        pipe.lrem(self.interactive_queue_key, 0, job_id_value)
                         await pipe.execute()
                         return False
 
@@ -1782,6 +2088,7 @@ class RedisJobStore:
                         pipe.multi()
                         pipe.lrem(self.processing_key, 0, job_id_value)
                         pipe.lrem(self.queue_key, 0, job_id_value)
+                        pipe.lrem(self.interactive_queue_key, 0, job_id_value)
                         if active_key is not None:
                             pipe.delete(active_key)
                         await pipe.execute()
@@ -1811,7 +2118,16 @@ class RedisJobStore:
                         attempt = max(0, int(record.get("attempt", "0")))
                     except (TypeError, ValueError):
                         attempt = self.max_attempts
-                    attempts_exhausted = attempt >= self.max_attempts
+                    payload = _json_loads(record.get("payload"), default={})
+                    delivery_only = isinstance(payload, Mapping) and payload.get(
+                        "_delivery_only"
+                    ) is True
+                    # Delivery replay is already-computed work. Never turn a
+                    # transient Redis/artifact outage into a provider failure
+                    # merely because ordinary execution attempts are exhausted.
+                    attempts_exhausted = (
+                        attempt >= self.max_attempts and not delivery_only
+                    )
                     registered_attempt_id = _registered_ingestion_attempt(record)
                     active_key = await self._matching_active_job_key(
                         pipe,
@@ -1821,6 +2137,7 @@ class RedisJobStore:
                     pipe.multi()
                     pipe.lrem(self.processing_key, 0, job_id_value)
                     pipe.lrem(self.queue_key, 0, job_id_value)
+                    pipe.lrem(self.interactive_queue_key, 0, job_id_value)
                     if cancelled:
                         pipe.hset(
                             key,
@@ -1858,7 +2175,7 @@ class RedisJobStore:
                         if active_key is not None:
                             pipe.delete(active_key)
                     else:
-                        pipe.lpush(self.queue_key, job_id_value)
+                        pipe.lpush(self._queue_for_record(record), job_id_value)
                         pipe.hset(
                             key,
                             mapping={
@@ -1873,7 +2190,7 @@ class RedisJobStore:
                                 active_key,
                                 self.active_job_index_ttl_seconds,
                             )
-                    if registered_attempt_id is not None:
+                    if registered_attempt_id is not None and not delivery_only:
                         pipe.zadd(
                             self.ingestion_invalidation_due_key,
                             {
@@ -1888,13 +2205,16 @@ class RedisJobStore:
                         "worker_id",
                         "heartbeat_at",
                         "attempt_started_at",
-                        "ingestion_attempt_id",
                     )
+                    if cancelled or not delivery_only:
+                        pipe.hdel(key, "ingestion_attempt_id")
                     await pipe.execute()
                     return not cancelled and not attempts_exhausted
                 except WatchError:
                     continue
-        raise JobStoreError("could not recover stale job because its state kept changing")
+        raise JobStoreError(
+            "could not recover stale job because its state kept changing"
+        )
 
     async def _mark_terminal(
         self,
@@ -1909,7 +2229,9 @@ class RedisJobStore:
     ) -> bool:
         job_id_value = validate_job_id(job_id)
         key = self._job_key(job_id_value)
-        lease_token_value = _validate_lease_token(lease_token) if lease_token is not None else None
+        lease_token_value = (
+            _validate_lease_token(lease_token) if lease_token is not None else None
+        )
         successful_attempt_id = (
             _validate_ingestion_attempt_id(successful_ingestion_attempt_id)
             if successful_ingestion_attempt_id is not None
@@ -1918,7 +2240,12 @@ class RedisJobStore:
         for _ in range(_MAX_WATCH_RETRIES):
             async with self.redis.pipeline(transaction=True) as pipe:
                 try:
-                    watched_keys = [key, self.queue_key, self.processing_key]
+                    watched_keys = [
+                        key,
+                        self.queue_key,
+                        self.interactive_queue_key,
+                        self.processing_key,
+                    ]
                     if successful_attempt_id is not None:
                         watched_keys.extend(
                             [
@@ -1935,7 +2262,9 @@ class RedisJobStore:
                     if current_status in TERMINAL_STATUSES:
                         await pipe.unwatch()
                         if lease_token_value is not None:
-                            raise JobLeaseLostError(f"worker lease lost for job: {job_id_value}")
+                            raise JobLeaseLostError(
+                                f"worker lease lost for job: {job_id_value}"
+                            )
                         return False
 
                     queued_cancellation = (
@@ -1952,7 +2281,9 @@ class RedisJobStore:
                     )
                     if not (queued_cancellation or owns_lease):
                         await pipe.unwatch()
-                        raise JobLeaseLostError(f"worker lease lost for job: {job_id_value}")
+                        raise JobLeaseLostError(
+                            f"worker lease lost for job: {job_id_value}"
+                        )
 
                     now = utc_now_iso()
                     cancellation_wins = (
@@ -2011,8 +2342,13 @@ class RedisJobStore:
                         "heartbeat_at",
                         "attempt_started_at",
                         "ingestion_attempt_id",
+                        "delivery_payload",
+                        "delivery_prepared_at",
                     )
-                    if terminal_status == SUCCEEDED and registered_attempt_id is not None:
+                    if (
+                        terminal_status == SUCCEEDED
+                        and registered_attempt_id is not None
+                    ):
                         pipe.hdel(
                             self.ingestion_invalidation_payload_key,
                             registered_attempt_id,
@@ -2032,6 +2368,7 @@ class RedisJobStore:
                         )
                     pipe.lrem(self.processing_key, 0, job_id_value)
                     pipe.lrem(self.queue_key, 0, job_id_value)
+                    pipe.lrem(self.interactive_queue_key, 0, job_id_value)
                     if active_key is not None:
                         pipe.delete(active_key)
                     if self.result_ttl_seconds > 0:
@@ -2133,7 +2470,9 @@ async def request_cancellation(job_id: str) -> Optional[dict[str, Any]]:
     return await get_job_store().request_cancellation(job_id)
 
 
-async def claim_job(timeout: float = 1.0, worker_id: Optional[str] = None) -> Optional[dict[str, Any]]:
+async def claim_job(
+    timeout: float = 1.0, worker_id: Optional[str] = None
+) -> Optional[dict[str, Any]]:
     return await get_job_store().claim_job(timeout=timeout, worker_id=worker_id)
 
 
