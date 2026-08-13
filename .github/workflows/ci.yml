@@ -20,7 +20,7 @@ jobs:
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -r requirements-dev.txt
       - run: python -m pip check
-      - run: python -m pip_audit -r requirements.txt
+      - run: python -m pip_audit -r requirements-gateway.txt
       - run: python -m compileall -q .
       - run: python -m ruff check . --select E9,F
       - run: python -m bandit -r . -x ./.venv,./tests -ll -ii
@@ -46,14 +46,15 @@ jobs:
         env:
           SEARXNG_IMAGE: alpine:3.21
           SEARXNG_SECRET: ci-only-searxng-secret
+          CRAWL4AI_API_TOKEN: ci-only-crawl4ai-token
         run: |
-          docker compose create searxng
+          docker compose create --no-build --no-deps searxng
           docker compose rm --force --stop searxng
-      - name: Validate zero-port client-network deployment
+      - name: Validate zero-port shared-network deployment
         env:
-          MCP_CLIENT_NETWORK: ci-client-network
-          MCP_AUTH_TOKEN: ci-only-token
+          CLIENT_DOCKER_NETWORK: ci-client-network
+          SEARXNG_SECRET: ci-only-searxng-secret
+          CRAWL4AI_API_TOKEN: ci-only-crawl4ai-token
         run: |
-          docker compose -f docker-compose.yml -f docker-compose.client-network.yml config --quiet
-          docker compose -f docker-compose.yml -f docker-compose.client-network.yml config --format json |
-            python -c 'import json, sys; gateway = json.load(sys.stdin)["services"]["mcp-gateway"]; assert not gateway.get("ports"), gateway.get("ports"); assert "research-mcp" in gateway["networks"]["client-network"]["aliases"]'
+          docker compose config --format json |
+            python -c 'import json, sys; compose = json.load(sys.stdin); assert all(not service.get("ports") for service in compose["services"].values()); assert compose["networks"]["client"]["name"] == "ci-client-network"'

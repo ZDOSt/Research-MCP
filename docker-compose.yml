@@ -1,620 +1,97 @@
-name: research-mcp
+name: private-search
 
-x-app-environment: &app-environment
-  ARTIFACT_CLEANUP_INTERVAL_SECONDS: ${ARTIFACT_CLEANUP_INTERVAL_SECONDS:-3600}
-  ARTIFACT_DIR: /data/artifacts
-  ARTIFACT_RETENTION_SECONDS: ${ARTIFACT_RETENTION_SECONDS:-2592000}
-  CHUNK_OVERLAP: ${CHUNK_OVERLAP:-150}
-  CHUNK_SIZE: ${CHUNK_SIZE:-1100}
-  CRAWL4AI_URL: ${CRAWL4AI_URL:-http://crawl4ai:11235}
-  DEFAULT_RESEARCH_NAMESPACE: ${DEFAULT_RESEARCH_NAMESPACE:-default}
-  EMBEDDING_MODEL: ${EMBEDDING_MODEL:-BAAI/bge-small-en-v1.5}
-  FASTMCP_CHECK_FOR_UPDATES: ${FASTMCP_CHECK_FOR_UPDATES:-off}
-  GITHUB_API_URL: ${GITHUB_API_URL:-https://api.github.com}
-  GITHUB_API_VERSION: ${GITHUB_API_VERSION:-2022-11-28}
-  GITHUB_ALLOWED_REPOSITORIES: ${GITHUB_ALLOWED_REPOSITORIES:-}
-  GITHUB_ALLOW_INSECURE_HTTP: ${GITHUB_ALLOW_INSECURE_HTTP:-false}
-  GITHUB_MAX_FILE_CHARS: ${GITHUB_MAX_FILE_CHARS:-250000}
-  GITHUB_MAX_RESPONSE_BYTES: ${GITHUB_MAX_RESPONSE_BYTES:-8388608}
-  GITHUB_REDACT_SECRETS: ${GITHUB_REDACT_SECRETS:-true}
-  GITHUB_TIMEOUT_SECONDS: ${GITHUB_TIMEOUT_SECONDS:-45}
-  JOB_BACKEND: redis
-  JOB_MAX_ATTEMPTS: ${JOB_MAX_ATTEMPTS:-3}
-  JOB_INTERACTIVE_CLAIM_BURST: ${JOB_INTERACTIVE_CLAIM_BURST:-8}
-  JOB_INLINE_RESULT_MAX_BYTES: ${JOB_INLINE_RESULT_MAX_BYTES:-262144}
-  JOB_MAX_PAYLOAD_BYTES: ${JOB_MAX_PAYLOAD_BYTES:-1048576}
-  JOB_MAX_QUEUED: ${JOB_MAX_QUEUED:-1000}
-  JOB_INGESTION_WAITAOF_TIMEOUT_MS: ${JOB_INGESTION_WAITAOF_TIMEOUT_MS:-5000}
-  JOB_POLL_INTERVAL_SECONDS: ${JOB_POLL_INTERVAL_SECONDS:-0.5}
-  JOB_RESULT_TTL_SECONDS: ${JOB_RESULT_TTL_SECONDS:-2592000}
-  JOB_STALE_AFTER_SECONDS: ${JOB_STALE_AFTER_SECONDS:-300}
-  JOB_STALE_RECOVERY_INTERVAL_SECONDS: ${JOB_STALE_RECOVERY_INTERVAL_SECONDS:-30}
-  LOG_LEVEL: ${LOG_LEVEL:-INFO}
-  MODEL_CACHE_DIR: /data/models
-  MCP_ALLOW_LEGACY_UNOWNED_JOBS: ${MCP_ALLOW_LEGACY_UNOWNED_JOBS:-false}
-  MCP_AUTH_CLIENT_ID: ${MCP_AUTH_CLIENT_ID:-research-mcp-client}
-  MCP_AUTH_TOKEN: ${MCP_AUTH_TOKEN:-}
-  MCP_AUTH_TOKENS_JSON: "${MCP_AUTH_TOKENS_JSON:-}"
-  MCP_ALLOWED_NAMESPACES: "${MCP_ALLOWED_NAMESPACES:-*}"
-  # The one-call assistant is the default. Select advanced or all explicitly
-  # when an installation still needs the legacy specialized tools.
-  MCP_TOOL_PROFILE: ${MCP_TOOL_PROFILE:-unified}
-  MCP_MAX_INGEST_CHARS: ${MCP_MAX_INGEST_CHARS:-500000}
-  MCP_MAX_QUERY_CHARS: ${MCP_MAX_QUERY_CHARS:-8000}
-  MCP_CLIENT_TIMEOUT_SECONDS: ${MCP_CLIENT_TIMEOUT_SECONDS:-60}
-  MCP_SYNC_RESPONSE_SAFETY_SECONDS: ${MCP_SYNC_RESPONSE_SAFETY_SECONDS:-15}
-  RESEARCH_ADMISSION_ANONYMOUS: ${RESEARCH_ADMISSION_ANONYMOUS:-shared}
-  RESEARCH_ADMISSION_MAX_ACTIVE: ${RESEARCH_ADMISSION_MAX_ACTIVE:-1}
-  RESEARCH_ADMISSION_MAX_NEW_JOBS: ${RESEARCH_ADMISSION_MAX_NEW_JOBS:-2}
-  RESEARCH_ADMISSION_WINDOW_SECONDS: ${RESEARCH_ADMISSION_WINDOW_SECONDS:-60}
-  RESEARCH_ASSISTANT_INTERACTIVE_TIMEOUT_SECONDS: ${RESEARCH_ASSISTANT_INTERACTIVE_TIMEOUT_SECONDS:-36}
-  RESEARCH_RUNNER_MAX_REQUEST_BYTES: ${RESEARCH_RUNNER_MAX_REQUEST_BYTES:-524288}
-  RESEARCH_RUNNER_MAX_RESPONSE_BYTES: ${RESEARCH_RUNNER_MAX_RESPONSE_BYTES:-8388608}
-  RESEARCH_RUNNER_SOCKET: /run/research-interactive/runner.sock
-  PLANNER_ALLOW_INSECURE_HTTP: ${PLANNER_ALLOW_INSECURE_HTTP:-false}
-  PLANNER_MAX_RESPONSE_BYTES: ${PLANNER_MAX_RESPONSE_BYTES:-1048576}
-  QDRANT_COLLECTION: ${QDRANT_COLLECTION:-research_mcp}
-  QDRANT_HISTORY_RETENTION_SECONDS: ${QDRANT_HISTORY_RETENTION_SECONDS:-2592000}
-  QDRANT_INIT_DELAY_SECONDS: ${QDRANT_INIT_DELAY_SECONDS:-2}
-  QDRANT_INIT_RETRIES: ${QDRANT_INIT_RETRIES:-30}
-  QDRANT_URL: http://qdrant:6333
-  RAG_MAX_INGEST_CHARS: ${RAG_MAX_INGEST_CHARS:-1000000}
-  RAG_MAX_METADATA_BYTES: ${RAG_MAX_METADATA_BYTES:-262144}
-  REDIS_URL: redis://redis:6379/0
-  RESEARCH_BROWSER_DISABLE_SANDBOX: ${RESEARCH_BROWSER_DISABLE_SANDBOX:-false}
-  RESEARCH_BROWSER_IGNORE_HTTPS_ERRORS: ${RESEARCH_BROWSER_IGNORE_HTTPS_ERRORS:-false}
-  RESEARCH_API_MAX_RESPONSE_BYTES: ${RESEARCH_API_MAX_RESPONSE_BYTES:-8388608}
-  RESEARCH_API_ALLOW_INSECURE_HTTP: ${RESEARCH_API_ALLOW_INSECURE_HTTP:-false}
-  RESEARCH_API_TOKEN: ${RESEARCH_API_TOKEN:-}
-  RESEARCH_API_TOTAL_TIMEOUT_SECONDS: ${RESEARCH_API_TOTAL_TIMEOUT_SECONDS:-180}
-  RESEARCH_API_URL: ${RESEARCH_API_URL:-}
-  RERANKER_MAX_RESPONSE_BYTES: ${RERANKER_MAX_RESPONSE_BYTES:-2097152}
-  RERANKER_TIMEOUT_SECONDS: ${RERANKER_TIMEOUT_SECONDS:-20}
-  RERANKER_TOTAL_TIMEOUT_SECONDS: ${RERANKER_TOTAL_TIMEOUT_SECONDS:-30}
-  RERANKER_URL: ${RERANKER_URL:-http://reranker:8000}
-  SEARCH_RERANKER_ENABLED: ${SEARCH_RERANKER_ENABLED:-false}
-  SEARCH_RERANKER_MAX_CANDIDATES: ${SEARCH_RERANKER_MAX_CANDIDATES:-24}
-  SEARCH_RERANKER_TIMEOUT_SECONDS: ${SEARCH_RERANKER_TIMEOUT_SECONDS:-2.5}
-  RESEARCH_DEFER_PERSISTENCE: ${RESEARCH_DEFER_PERSISTENCE:-true}
-  RESEARCH_PERSISTENCE_QUEUE: ${RESEARCH_PERSISTENCE_QUEUE:-research:persistence}
-  RESEARCH_PRIMARY_QUEUE: ${RESEARCH_QUEUE:-research:jobs}
-  RESEARCH_QUEUE: ${RESEARCH_QUEUE:-research:jobs}
-  RESEARCH_SOURCE_CONCURRENCY: ${RESEARCH_SOURCE_CONCURRENCY:-3}
-  RESEARCH_TIMEZONE: ${RESEARCH_TIMEZONE:-UTC}
-  SAFE_EGRESS_ALLOWED_PORTS: ${SAFE_EGRESS_ALLOWED_PORTS:-80,443,8080,8443}
-  SAFE_EGRESS_DENY_CIDRS: ${SAFE_EGRESS_DENY_CIDRS:-}
-  SAFE_EGRESS_DNS_TIMEOUT_SECONDS: ${SAFE_EGRESS_DNS_TIMEOUT_SECONDS:-5}
-  SEARXNG_URL: http://searxng:8080
-  USE_RESEARCH_API_RAG: ${USE_RESEARCH_API_RAG:-false}
-  VECTOR_SIZE: ${VECTOR_SIZE:-384}
-  WORKER_HEARTBEAT_TTL_SECONDS: ${WORKER_HEARTBEAT_TTL_SECONDS:-60}
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: ${LOG_MAX_SIZE:-10m}
+    max-file: ${LOG_MAX_FILES:-3}
 
-x-worker-environment: &worker-environment
-  ARTIFACT_CLEANUP_INTERVAL_SECONDS: ${ARTIFACT_CLEANUP_INTERVAL_SECONDS:-3600}
-  ARTIFACT_DIR: /data/artifacts
-  ARTIFACT_RETENTION_SECONDS: ${ARTIFACT_RETENTION_SECONDS:-2592000}
-  CHUNK_OVERLAP: ${CHUNK_OVERLAP:-150}
-  CHUNK_SIZE: ${CHUNK_SIZE:-1100}
-  CRAWL4AI_NETWORK_ISOLATED: "true"
-  CRAWL4AI_MAX_RESPONSE_BYTES: ${CRAWL4AI_MAX_RESPONSE_BYTES:-8388608}
-  CRAWL4AI_TOTAL_TIMEOUT_SECONDS: ${CRAWL4AI_TOTAL_TIMEOUT_SECONDS:-180}
-  DEFAULT_RESEARCH_NAMESPACE: ${DEFAULT_RESEARCH_NAMESPACE:-default}
-  GITHUB_API_URL: ${GITHUB_API_URL:-https://api.github.com}
-  GITHUB_API_VERSION: ${GITHUB_API_VERSION:-2022-11-28}
-  GITHUB_ALLOW_INSECURE_HTTP: ${GITHUB_ALLOW_INSECURE_HTTP:-false}
-  GITHUB_MAX_FILE_CHARS: ${GITHUB_MAX_FILE_CHARS:-250000}
-  GITHUB_MAX_RESPONSE_BYTES: ${GITHUB_MAX_RESPONSE_BYTES:-8388608}
-  GITHUB_REDACT_SECRETS: ${GITHUB_REDACT_SECRETS:-true}
-  GITHUB_TIMEOUT_SECONDS: ${GITHUB_TIMEOUT_SECONDS:-45}
-  DIRECT_EXTRACTION_TIMEOUT_SECONDS: ${DIRECT_EXTRACTION_TIMEOUT_SECONDS:-20}
-  DIRECT_FIRST_HEDGE_SECONDS: ${DIRECT_FIRST_HEDGE_SECONDS:-1.5}
-  DIRECT_FIRST_MIN_CONTENT_CHARS: ${DIRECT_FIRST_MIN_CONTENT_CHARS:-2000}
-  DIRECT_MAX_RESPONSE_BYTES: ${DIRECT_MAX_RESPONSE_BYTES:-16777216}
-  DIRECT_TOTAL_TIMEOUT_SECONDS: ${DIRECT_TOTAL_TIMEOUT_SECONDS:-75}
-  EMBEDDING_MODEL: ${EMBEDDING_MODEL:-BAAI/bge-small-en-v1.5}
-  JOB_BACKEND: redis
-  JOB_MAX_ATTEMPTS: ${JOB_MAX_ATTEMPTS:-3}
-  JOB_MAX_PAYLOAD_BYTES: ${JOB_MAX_PAYLOAD_BYTES:-1048576}
-  JOB_MAX_QUEUED: ${JOB_MAX_QUEUED:-1000}
-  JOB_INGESTION_WAITAOF_TIMEOUT_MS: ${JOB_INGESTION_WAITAOF_TIMEOUT_MS:-5000}
-  JOB_POLL_INTERVAL_SECONDS: ${JOB_POLL_INTERVAL_SECONDS:-0.5}
-  JOB_RESULT_TTL_SECONDS: ${JOB_RESULT_TTL_SECONDS:-2592000}
-  JOB_STALE_AFTER_SECONDS: ${JOB_STALE_AFTER_SECONDS:-300}
-  JOB_STALE_RECOVERY_INTERVAL_SECONDS: ${JOB_STALE_RECOVERY_INTERVAL_SECONDS:-30}
-  LOG_LEVEL: ${LOG_LEVEL:-INFO}
-  MODEL_CACHE_DIR: /data/models
-  PDF_MAX_EXTRACTED_CHARS: ${PDF_MAX_EXTRACTED_CHARS:-1000000}
-  PDF_MAX_PAGES: ${PDF_MAX_PAGES:-200}
-  PDF_MAX_RESPONSE_BYTES: ${PDF_MAX_RESPONSE_BYTES:-8388608}
-  PDF_SANDBOX_CPU_SECONDS: ${PDF_SANDBOX_CPU_SECONDS:-15}
-  PDF_SANDBOX_MEMORY_BYTES: ${PDF_SANDBOX_MEMORY_BYTES:-536870912}
-  PDF_SANDBOX_OUTPUT_BYTES: ${PDF_SANDBOX_OUTPUT_BYTES:-6065536}
-  PDF_RUNNER_SOCKET: /run/research-pdf/runner.sock
-  QDRANT_COLLECTION: ${QDRANT_COLLECTION:-research_mcp}
-  QDRANT_HISTORY_RETENTION_SECONDS: ${QDRANT_HISTORY_RETENTION_SECONDS:-2592000}
-  QDRANT_INIT_DELAY_SECONDS: ${QDRANT_INIT_DELAY_SECONDS:-2}
-  QDRANT_INIT_RETRIES: ${QDRANT_INIT_RETRIES:-30}
-  QDRANT_LIFECYCLE_REPAIR_INTERVAL_SECONDS: ${QDRANT_LIFECYCLE_REPAIR_INTERVAL_SECONDS:-3600}
-  QDRANT_LIFECYCLE_REPAIR_MAX_POINTS: ${QDRANT_LIFECYCLE_REPAIR_MAX_POINTS:-100000}
-  QDRANT_URL: http://qdrant:6333
-  RAG_MAX_INGEST_CHARS: ${RAG_MAX_INGEST_CHARS:-1000000}
-  RAG_MAX_METADATA_BYTES: ${RAG_MAX_METADATA_BYTES:-262144}
-  REDIS_URL: redis://redis:6379/0
-  RESEARCH_API_MAX_RESPONSE_BYTES: ${RESEARCH_API_MAX_RESPONSE_BYTES:-8388608}
-  RESEARCH_API_ALLOW_INSECURE_HTTP: ${RESEARCH_API_ALLOW_INSECURE_HTTP:-false}
-  RESEARCH_API_TOKEN: ${RESEARCH_API_TOKEN:-}
-  RESEARCH_API_TOTAL_TIMEOUT_SECONDS: ${RESEARCH_API_TOTAL_TIMEOUT_SECONDS:-180}
-  RESEARCH_API_URL: ${RESEARCH_API_URL:-}
-  RERANKER_URL: ${RERANKER_URL:-http://reranker:8000}
-  RERANKER_MAX_RESPONSE_BYTES: ${RERANKER_MAX_RESPONSE_BYTES:-2097152}
-  RERANKER_TIMEOUT_SECONDS: ${RERANKER_TIMEOUT_SECONDS:-20}
-  RERANKER_TOTAL_TIMEOUT_SECONDS: ${RERANKER_TOTAL_TIMEOUT_SECONDS:-30}
-  SEARCH_RERANKER_ENABLED: ${SEARCH_RERANKER_ENABLED:-false}
-  SEARCH_RERANKER_MAX_CANDIDATES: ${SEARCH_RERANKER_MAX_CANDIDATES:-24}
-  SEARCH_RERANKER_TIMEOUT_SECONDS: ${SEARCH_RERANKER_TIMEOUT_SECONDS:-2.5}
-  SEARCH_CACHE_MAX_ENTRIES: ${SEARCH_CACHE_MAX_ENTRIES:-256}
-  SEARCH_CACHE_MAX_PAYLOAD_BYTES: ${SEARCH_CACHE_MAX_PAYLOAD_BYTES:-262144}
-  SEARCH_CACHE_REDIS_ENABLED: ${SEARCH_CACHE_REDIS_ENABLED:-true}
-  SEARCH_CACHE_REDIS_TIMEOUT_SECONDS: ${SEARCH_CACHE_REDIS_TIMEOUT_SECONDS:-0.2}
-  SEARCH_CACHE_STALE_TTL_SECONDS: ${SEARCH_CACHE_STALE_TTL_SECONDS:-3600}
-  SEARCH_CACHE_TTL_SECONDS: ${SEARCH_CACHE_TTL_SECONDS:-600}
-  SEARCH_DEEP_MAX_ENGINE_STAGES: ${SEARCH_DEEP_MAX_ENGINE_STAGES:-4}
-  SEARCH_ENGINE_CIRCUIT_REDIS_ENABLED: ${SEARCH_ENGINE_CIRCUIT_REDIS_ENABLED:-true}
-  SEARCH_ENGINE_FAILURE_THRESHOLD: ${SEARCH_ENGINE_FAILURE_THRESHOLD:-2}
-  SEARCH_ENGINE_MAX_COOLDOWN_SECONDS: ${SEARCH_ENGINE_MAX_COOLDOWN_SECONDS:-3600}
-  SEARCH_ENGINE_RATE_LIMIT_COOLDOWN_SECONDS: ${SEARCH_ENGINE_RATE_LIMIT_COOLDOWN_SECONDS:-900}
-  SEARCH_ENGINE_REDIS_TIMEOUT_SECONDS: ${SEARCH_ENGINE_REDIS_TIMEOUT_SECONDS:-0.2}
-  SEARCH_ENGINE_TRANSIENT_COOLDOWN_SECONDS: ${SEARCH_ENGINE_TRANSIENT_COOLDOWN_SECONDS:-120}
-  SEARCH_MAX_CONCURRENT_REQUESTS: ${SEARCH_MAX_CONCURRENT_REQUESTS:-2}
-  SEARCH_MAX_ENGINE_STAGES: ${SEARCH_MAX_ENGINE_STAGES:-2}
-  SEARCH_QUERY_CONCURRENCY: ${SEARCH_QUERY_CONCURRENCY:-2}
-  SEARCH_RELEVANCE_MIN_SCORE: ${SEARCH_RELEVANCE_MIN_SCORE:-0.28}
-  SEARCH_STAGE_MIN_RESULTS: ${SEARCH_STAGE_MIN_RESULTS:-4}
-  SEARCH_STAGE_MIN_RELEVANT_RATIO: ${SEARCH_STAGE_MIN_RELEVANT_RATIO:-0.75}
-  RESEARCH_BROWSER_TOTAL_TIMEOUT_SECONDS: ${RESEARCH_BROWSER_TOTAL_TIMEOUT_SECONDS:-90}
-  RESEARCH_DEFER_PERSISTENCE: ${RESEARCH_DEFER_PERSISTENCE:-true}
-  RESEARCH_ASSISTANT_INTERACTIVE_TIMEOUT_SECONDS: ${RESEARCH_ASSISTANT_INTERACTIVE_TIMEOUT_SECONDS:-36}
-  RESEARCH_ASSISTANT_SYNC_WAIT_SECONDS: ${RESEARCH_ASSISTANT_SYNC_WAIT_SECONDS:-45}
-  RESEARCH_RUNNER_MAX_REQUEST_BYTES: ${RESEARCH_RUNNER_MAX_REQUEST_BYTES:-524288}
-  RESEARCH_RUNNER_MAX_RESPONSE_BYTES: ${RESEARCH_RUNNER_MAX_RESPONSE_BYTES:-8388608}
-  RESEARCH_RUNNER_SOCKET: /run/research-interactive/runner.sock
-  RESEARCH_PERSISTENCE_QUEUE: ${RESEARCH_PERSISTENCE_QUEUE:-research:persistence}
-  RESEARCH_PRIMARY_QUEUE: ${RESEARCH_QUEUE:-research:jobs}
-  RESEARCH_QUEUE: ${RESEARCH_QUEUE:-research:jobs}
-  RESEARCH_SOURCE_CONCURRENCY: ${RESEARCH_SOURCE_CONCURRENCY:-3}
-  RESEARCH_TIMEZONE: ${RESEARCH_TIMEZONE:-UTC}
-  RESEARCH_REQUIRE_PDF_ISOLATION: "true"
-  RESEARCH_REQUIRE_WEB_ISOLATION: "true"
-  SAFE_EGRESS_ALLOWED_PORTS: ${SAFE_EGRESS_ALLOWED_PORTS:-80,443,8080,8443}
-  SAFE_EGRESS_DENY_CIDRS: ${SAFE_EGRESS_DENY_CIDRS:-}
-  SAFE_EGRESS_DNS_TIMEOUT_SECONDS: ${SAFE_EGRESS_DNS_TIMEOUT_SECONDS:-5}
-  SEARXNG_URL: http://searxng:8080
-  SEARXNG_MAX_RESPONSE_BYTES: ${SEARXNG_MAX_RESPONSE_BYTES:-4194304}
-  SEARXNG_TIMEOUT_SECONDS: ${SEARXNG_TIMEOUT_SECONDS:-12}
-  USE_RESEARCH_API_RAG: ${USE_RESEARCH_API_RAG:-false}
-  VECTOR_SIZE: ${VECTOR_SIZE:-384}
-  WEB_RUNNER_MAX_RESPONSE_BYTES: ${WEB_RUNNER_MAX_RESPONSE_BYTES:-8388608}
-  WEB_RUNNER_SOCKET: /run/research-web/runner.sock
-  WORKER_HEARTBEAT_TTL_SECONDS: ${WORKER_HEARTBEAT_TTL_SECONDS:-60}
-
-x-app-service: &app-service
-  build:
-    context: .
-    args:
-      APP_GID: ${APP_GID:-10001}
-      APP_UID: ${APP_UID:-10001}
-      PYTHON_IMAGE: ${PYTHON_IMAGE:-python:3.11.15-slim-bookworm}
-  image: ${RESEARCH_MCP_IMAGE:-research-mcp:local}
+x-hardened: &hardened
   restart: unless-stopped
   read_only: true
-  cap_drop:
-    - ALL
+  cap_drop: [ALL]
   security_opt:
     - no-new-privileges:true
-  volumes:
-    - artifacts:/data/artifacts
-    - model-cache:/data/models
-  tmpfs:
-    - /tmp:rw,noexec,nosuid,size=1g,uid=${APP_UID:-10001},gid=${APP_GID:-10001}
-    - /home/app/.cache:rw,noexec,nosuid,size=256m,uid=${APP_UID:-10001},gid=${APP_GID:-10001}
-  logging: &default-logging
-    driver: json-file
-    options:
-      max-file: ${LOG_MAX_FILES:-3}
-      max-size: ${LOG_MAX_SIZE:-10m}
+  logging: *logging
 
 services:
-  mcp-gateway:
-    <<: *app-service
-    command:
-      - python
-      - mcp_server.py
+  search-gateway:
+    <<: *hardened
+    build:
+      context: .
+      dockerfile: Dockerfile.gateway
+      target: runtime
+      args:
+        PYTHON_IMAGE: ${PYTHON_IMAGE:-python:3.11.15-slim-bookworm}
+        APP_UID: ${APP_UID:-10001}
+        APP_GID: ${APP_GID:-10001}
+    image: ${SEARCH_GATEWAY_IMAGE:-private-search-gateway:local}
+    command: [python, search_gateway.py]
     environment:
-      <<: *app-environment
-      MCP_HOST: 0.0.0.0
-      MCP_ALLOWED_HOSTS: ${MCP_ALLOWED_HOSTS:-127.0.0.1:*,localhost:*,[::1]:*,mcp-gateway:*}
-      MCP_ALLOWED_ORIGINS: ${MCP_ALLOWED_ORIGINS:-}
-      MCP_ALLOW_UNAUTHENTICATED_REMOTE: ${MCP_ALLOW_UNAUTHENTICATED_REMOTE:-false}
-      MCP_EXTERNAL_BIND_ADDRESS: ${MCP_BIND_ADDRESS:-127.0.0.1}
-      MCP_JOB_LONG_POLL_SECONDS: ${MCP_JOB_LONG_POLL_SECONDS:-15}
-      MCP_JOB_POLL_SECONDS: ${MCP_JOB_POLL_SECONDS:-0.5}
-      MCP_JOB_RESULT_TIMEOUT_SECONDS: ${MCP_JOB_RESULT_TIMEOUT_SECONDS:-4.0}
-      MCP_JOB_STATUS_TIMEOUT_SECONDS: ${MCP_JOB_STATUS_TIMEOUT_SECONDS:-1.0}
-      MCP_PATH: ${MCP_PATH:-/mcp}
-      MCP_PORT: "8001"
-      MCP_SYNC_JOB_WAIT_SECONDS: ${MCP_SYNC_JOB_WAIT_SECONDS:-45}
-      RESEARCH_ASSISTANT_SYNC_WAIT_SECONDS: ${RESEARCH_ASSISTANT_SYNC_WAIT_SECONDS:-45}
-      MCP_TRANSPORT: ${MCP_TRANSPORT:-streamable-http}
-      RESEARCH_RUNNER_SOCKET: /run/research-interactive/runner.sock
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      REDIS_URL: redis://redis:6379/0
+      RERANKER_URL: http://reranker:8000
+      SEARXNG_URL: http://searxng:8080
+      WEB_RUNNER_SOCKET: /run/search-gateway-web/runner.sock
+      PDF_RUNNER_SOCKET: /run/search-gateway-pdf/runner.sock
+      GATEWAY_REQUEST_TIMEOUT_SECONDS: ${GATEWAY_REQUEST_TIMEOUT_SECONDS:-30}
+      GATEWAY_SEARCH_TIMEOUT_SECONDS: ${GATEWAY_SEARCH_TIMEOUT_SECONDS:-7}
+      GATEWAY_PAGE_TIMEOUT_SECONDS: ${GATEWAY_PAGE_TIMEOUT_SECONDS:-16}
+      GATEWAY_MAX_SEARCH_RESULTS: ${GATEWAY_MAX_SEARCH_RESULTS:-30}
+      GATEWAY_MAX_CRAWL_PAGES: ${GATEWAY_MAX_CRAWL_PAGES:-6}
+      GATEWAY_MAX_FOLLOW_LINKS: ${GATEWAY_MAX_FOLLOW_LINKS:-2}
+      GATEWAY_MAX_CONCURRENT_FETCHES: ${GATEWAY_MAX_CONCURRENT_FETCHES:-4}
+      GATEWAY_MAX_FINAL_RESULTS: ${GATEWAY_MAX_FINAL_RESULTS:-8}
+      GATEWAY_MAX_PASSAGE_CHARS: ${GATEWAY_MAX_PASSAGE_CHARS:-2600}
+      GATEWAY_MAX_CONTENT_CHARS: ${GATEWAY_MAX_CONTENT_CHARS:-7000}
+      GATEWAY_QUERY_MAX_CHARS: ${GATEWAY_QUERY_MAX_CHARS:-4000}
+      GATEWAY_MAX_REQUEST_BYTES: ${GATEWAY_MAX_REQUEST_BYTES:-65536}
+      GATEWAY_CACHE_TTL_SECONDS: ${GATEWAY_CACHE_TTL_SECONDS:-900}
+      GATEWAY_CACHE_STALE_SECONDS: ${GATEWAY_CACHE_STALE_SECONDS:-86400}
+      GATEWAY_CACHE_MAX_ENTRIES: ${GATEWAY_CACHE_MAX_ENTRIES:-256}
+      GATEWAY_RERANKER_TIMEOUT_SECONDS: ${GATEWAY_RERANKER_TIMEOUT_SECONDS:-5}
+      GATEWAY_RERANKER_MAX_RESPONSE_BYTES: ${GATEWAY_RERANKER_MAX_RESPONSE_BYTES:-2097152}
+      GATEWAY_DIRECT_TIMEOUT_SECONDS: ${GATEWAY_DIRECT_TIMEOUT_SECONDS:-5}
+      GATEWAY_DIRECT_MAX_BYTES: ${GATEWAY_DIRECT_MAX_BYTES:-8388608}
+      GATEWAY_PAGE_MAX_CHARS: ${GATEWAY_PAGE_MAX_CHARS:-300000}
+      SAFE_EGRESS_ALLOWED_PORTS: ${SAFE_EGRESS_ALLOWED_PORTS:-80,443,8080,8443}
+      SAFE_EGRESS_DENY_CIDRS: ${SAFE_EGRESS_DENY_CIDRS:-}
+      SAFE_EGRESS_DNS_TIMEOUT_SECONDS: ${SAFE_EGRESS_DNS_TIMEOUT_SECONDS:-5}
     volumes:
-      - artifacts:/data/artifacts
-      - model-cache:/data/models
-      - interactive-runner-control:/run/research-interactive:ro
-    depends_on:
-      qdrant:
-        condition: service_started
-      redis:
-        condition: service_started
-      research-runner:
-        condition: service_healthy
-      research-worker:
-        condition: service_started
+      - web-runner-control:/run/search-gateway-web:ro
+      - pdf-runner-control:/run/search-gateway-pdf:ro
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=128m,uid=${APP_UID:-10001},gid=${APP_GID:-10001}
     networks:
       - backend
-      - edge
-    ports:
-      - target: 8001
-        published: ${MCP_PUBLISHED_PORT:-8001}
-        host_ip: ${MCP_BIND_ADDRESS:-127.0.0.1}
-        protocol: tcp
-    healthcheck:
-      test:
-        - CMD
-        - python
-        - -c
-        - import socket; socket.create_connection(('127.0.0.1', 8001), 2).close()
-      interval: 15s
-      timeout: 5s
-      retries: 5
-      start_period: 90s
-    cpus: ${GATEWAY_CPUS:-1.0}
-    mem_limit: ${GATEWAY_MEMORY_LIMIT:-2g}
-    pids_limit: ${GATEWAY_PIDS_LIMIT:-256}
-    stop_grace_period: 5m
-
-  research-runner:
-    <<: *app-service
-    command:
-      - python
-      - research_runner.py
-    environment:
-      <<: *worker-environment
-      MCP_TOOL_PROFILE: ${MCP_TOOL_PROFILE:-unified}
-      GITHUB_ALLOWED_REPOSITORIES: ${GITHUB_ALLOWED_REPOSITORIES:-}
-      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
-      PLANNER_API_KEY: ${PLANNER_API_KEY:-}
-      PLANNER_ALLOW_INSECURE_HTTP: ${PLANNER_ALLOW_INSECURE_HTTP:-false}
-      PLANNER_BASE_URL: ${PLANNER_BASE_URL:-}
-      PLANNER_ENABLE_SYNTHESIS: ${PLANNER_ENABLE_SYNTHESIS:-false}
-      PLANNER_MAX_RESPONSE_BYTES: ${PLANNER_MAX_RESPONSE_BYTES:-1048576}
-      PLANNER_MODEL: ${PLANNER_MODEL:-}
-      PLANNER_TIMEOUT_SECONDS: ${PLANNER_TIMEOUT_SECONDS:-90}
-      RESEARCH_AGENT_MAX_EVIDENCE: ${RESEARCH_AGENT_MAX_EVIDENCE:-30}
-      RESEARCH_AGENT_MAX_EXPLICIT_URLS: ${RESEARCH_AGENT_MAX_EXPLICIT_URLS:-2}
-      RESEARCH_AGENT_MAX_FOLLOW_UP_ROUNDS: ${RESEARCH_AGENT_MAX_FOLLOW_UP_ROUNDS:-1}
-      RESEARCH_AGENT_MAX_IMAGES: ${RESEARCH_AGENT_MAX_IMAGES:-6}
-      RESEARCH_AGENT_PLAN_TIMEOUT_SECONDS: ${RESEARCH_AGENT_PLAN_TIMEOUT_SECONDS:-30}
-      RESEARCH_AGENT_REVIEW_TIMEOUT_SECONDS: ${RESEARCH_AGENT_REVIEW_TIMEOUT_SECONDS:-20}
-      RESEARCH_AGENT_SYNTHESIS_TIMEOUT_SECONDS: ${RESEARCH_AGENT_SYNTHESIS_TIMEOUT_SECONDS:-60}
-      RESEARCH_AGENT_QUICK_PLAN_TIMEOUT_SECONDS: ${RESEARCH_AGENT_QUICK_PLAN_TIMEOUT_SECONDS:-8}
-      RESEARCH_AGENT_QUICK_SYNTHESIS_TIMEOUT_SECONDS: ${RESEARCH_AGENT_QUICK_SYNTHESIS_TIMEOUT_SECONDS:-25}
-      RESEARCH_AGENT_QUICK_VERIFY: ${RESEARCH_AGENT_QUICK_VERIFY:-false}
-      RESEARCH_ASSISTANT_AUTO_MODE: ${RESEARCH_ASSISTANT_AUTO_MODE:-auto}
-      RESEARCH_MODEL_API_KEY: ${RESEARCH_MODEL_API_KEY:-}
-      RESEARCH_MODEL_ALLOW_INSECURE_HTTP: ${RESEARCH_MODEL_ALLOW_INSECURE_HTTP:-false}
-      RESEARCH_MODEL_BASE_URL: ${RESEARCH_MODEL_BASE_URL:-}
-      RESEARCH_MODEL_MAX_RESPONSE_BYTES: ${RESEARCH_MODEL_MAX_RESPONSE_BYTES:-1048576}
-      RESEARCH_MODEL_NAME: ${RESEARCH_MODEL_NAME:-}
-      RESEARCH_MODEL_TIMEOUT_SECONDS: ${RESEARCH_MODEL_TIMEOUT_SECONDS:-90}
-      RESEARCH_RUNNER_MAX_CONCURRENT: ${RESEARCH_RUNNER_MAX_CONCURRENT:-2}
-      RESEARCH_RUNNER_SOCKET: /run/research-interactive/runner.sock
-    volumes:
-      - artifacts:/data/artifacts
-      - model-cache:/data/models
-      - interactive-runner-control:/run/research-interactive
-      - pdf-runner-control:/run/research-pdf:ro
-      - web-runner-control:/run/research-web:ro
-    depends_on:
-      searxng:
-        condition: service_healthy
-    networks:
-      - backend
-      - egress
       - search-control
-    healthcheck:
-      test:
-        - CMD
-        - python
-        - research_runner.py
-        - --healthcheck
-      interval: 15s
-      timeout: 5s
-      retries: 8
-      start_period: 30s
-    cpus: ${RESEARCH_RUNNER_CPUS:-2.0}
-    mem_limit: ${RESEARCH_RUNNER_MEMORY_LIMIT:-4g}
-    pids_limit: ${RESEARCH_RUNNER_PIDS_LIMIT:-512}
-    shm_size: ${RESEARCH_RUNNER_SHM_SIZE:-1gb}
-    stop_grace_period: 2m
-
-  research-worker:
-    <<: *app-service
-    command:
-      - python
-      - worker.py
-    environment:
-      <<: *worker-environment
-      MCP_TOOL_PROFILE: ${MCP_TOOL_PROFILE:-unified}
-      GITHUB_ALLOWED_REPOSITORIES: ${GITHUB_ALLOWED_REPOSITORIES:-}
-      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
-      PLANNER_API_KEY: ${PLANNER_API_KEY:-}
-      PLANNER_ALLOW_INSECURE_HTTP: ${PLANNER_ALLOW_INSECURE_HTTP:-false}
-      PLANNER_BASE_URL: ${PLANNER_BASE_URL:-}
-      PLANNER_ENABLE_SYNTHESIS: ${PLANNER_ENABLE_SYNTHESIS:-false}
-      PLANNER_MAX_RESPONSE_BYTES: ${PLANNER_MAX_RESPONSE_BYTES:-1048576}
-      PLANNER_MODEL: ${PLANNER_MODEL:-}
-      PLANNER_TIMEOUT_SECONDS: ${PLANNER_TIMEOUT_SECONDS:-90}
-      RESEARCH_AGENT_MAX_EVIDENCE: ${RESEARCH_AGENT_MAX_EVIDENCE:-30}
-      RESEARCH_AGENT_MAX_EXPLICIT_URLS: ${RESEARCH_AGENT_MAX_EXPLICIT_URLS:-2}
-      RESEARCH_AGENT_MAX_FOLLOW_UP_ROUNDS: ${RESEARCH_AGENT_MAX_FOLLOW_UP_ROUNDS:-1}
-      RESEARCH_AGENT_MAX_IMAGES: ${RESEARCH_AGENT_MAX_IMAGES:-6}
-      RESEARCH_AGENT_PLAN_TIMEOUT_SECONDS: ${RESEARCH_AGENT_PLAN_TIMEOUT_SECONDS:-30}
-      RESEARCH_AGENT_REVIEW_TIMEOUT_SECONDS: ${RESEARCH_AGENT_REVIEW_TIMEOUT_SECONDS:-20}
-      RESEARCH_AGENT_SYNTHESIS_TIMEOUT_SECONDS: ${RESEARCH_AGENT_SYNTHESIS_TIMEOUT_SECONDS:-60}
-      RESEARCH_AGENT_QUICK_PLAN_TIMEOUT_SECONDS: ${RESEARCH_AGENT_QUICK_PLAN_TIMEOUT_SECONDS:-8}
-      RESEARCH_AGENT_QUICK_SYNTHESIS_TIMEOUT_SECONDS: ${RESEARCH_AGENT_QUICK_SYNTHESIS_TIMEOUT_SECONDS:-25}
-      RESEARCH_AGENT_QUICK_VERIFY: ${RESEARCH_AGENT_QUICK_VERIFY:-false}
-      RESEARCH_ASSISTANT_AUTO_MODE: ${RESEARCH_ASSISTANT_AUTO_MODE:-auto}
-      RESEARCH_MODEL_API_KEY: ${RESEARCH_MODEL_API_KEY:-}
-      RESEARCH_MODEL_ALLOW_INSECURE_HTTP: ${RESEARCH_MODEL_ALLOW_INSECURE_HTTP:-false}
-      RESEARCH_MODEL_BASE_URL: ${RESEARCH_MODEL_BASE_URL:-}
-      RESEARCH_MODEL_MAX_RESPONSE_BYTES: ${RESEARCH_MODEL_MAX_RESPONSE_BYTES:-1048576}
-      RESEARCH_MODEL_NAME: ${RESEARCH_MODEL_NAME:-}
-      RESEARCH_MODEL_TIMEOUT_SECONDS: ${RESEARCH_MODEL_TIMEOUT_SECONDS:-90}
-    volumes:
-      - artifacts:/data/artifacts
-      - model-cache:/data/models
-      - pdf-runner-control:/run/research-pdf:ro
-      - web-runner-control:/run/research-web:ro
+      - egress
+      - client
     depends_on:
-      qdrant:
-        condition: service_healthy
       redis:
         condition: service_healthy
-      pdf-runner:
-        condition: service_healthy
       searxng:
+        condition: service_healthy
+      reranker:
         condition: service_healthy
       web-runner:
         condition: service_healthy
-    networks:
-      - backend
-      - egress
-      - search-control
-    healthcheck:
-      test:
-        - CMD
-        - python
-        - worker.py
-        - --healthcheck
-      interval: 20s
-      timeout: 10s
-      retries: 5
-      start_period: 120s
-    cpus: ${WORKER_CPUS:-2.0}
-    mem_limit: ${WORKER_MEMORY_LIMIT:-4g}
-    pids_limit: ${WORKER_PIDS_LIMIT:-512}
-    shm_size: ${WORKER_SHM_SIZE:-1gb}
-    stop_grace_period: 10m
-
-  persistence-worker:
-    <<: *app-service
-    command:
-      - python
-      - worker.py
-    environment:
-      <<: *worker-environment
-      RESEARCH_DEFER_PERSISTENCE: "false"
-      RESEARCH_PRIMARY_QUEUE: ${RESEARCH_QUEUE:-research:jobs}
-      RESEARCH_QUEUE: ${RESEARCH_PERSISTENCE_QUEUE:-research:persistence}
-    depends_on:
-      qdrant:
+      pdf-runner:
         condition: service_healthy
-      redis:
-        condition: service_healthy
-    networks:
-      - backend
-      - egress
     healthcheck:
-      test:
-        - CMD
-        - python
-        - worker.py
-        - --healthcheck
-      interval: 20s
-      timeout: 10s
-      retries: 5
-      start_period: 120s
-    cpus: ${PERSISTENCE_WORKER_CPUS:-1.5}
-    mem_limit: ${PERSISTENCE_WORKER_MEMORY_LIMIT:-2g}
-    pids_limit: ${PERSISTENCE_WORKER_PIDS_LIMIT:-256}
-    stop_grace_period: 10m
-
-  pdf-runner:
-    build:
-      context: .
-      args:
-        APP_GID: ${APP_GID:-10001}
-        APP_UID: ${APP_UID:-10001}
-        PYTHON_IMAGE: ${PYTHON_IMAGE:-python:3.11.15-slim-bookworm}
-    image: ${RESEARCH_MCP_IMAGE:-research-mcp:local}
-    command:
-      - python
-      - pdf_runner.py
-    restart: unless-stopped
-    environment:
-      DIRECT_EXTRACTION_TIMEOUT_SECONDS: ${DIRECT_EXTRACTION_TIMEOUT_SECONDS:-20}
-      LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      PDF_MAX_EXTRACTED_CHARS: ${PDF_MAX_EXTRACTED_CHARS:-1000000}
-      PDF_MAX_PAGES: ${PDF_MAX_PAGES:-200}
-      PDF_MAX_RESPONSE_BYTES: ${PDF_MAX_RESPONSE_BYTES:-8388608}
-      PDF_RUNNER_SOCKET: /run/research-pdf/runner.sock
-      PDF_SANDBOX_CPU_SECONDS: ${PDF_SANDBOX_CPU_SECONDS:-15}
-      PDF_SANDBOX_MEMORY_BYTES: ${PDF_SANDBOX_MEMORY_BYTES:-536870912}
-      PDF_SANDBOX_OUTPUT_BYTES: ${PDF_SANDBOX_OUTPUT_BYTES:-6065536}
-      RESEARCH_PDF_NETWORK_ISOLATED: "true"
-    read_only: true
-    network_mode: none
-    cap_drop:
-      - ALL
-    security_opt:
-      - no-new-privileges:true
-    volumes:
-      - pdf-runner-control:/run/research-pdf
-    tmpfs:
-      - /tmp:rw,noexec,nosuid,size=256m,uid=${APP_UID:-10001},gid=${APP_GID:-10001}
-    healthcheck:
-      test:
-        - CMD
-        - python
-        - pdf_runner.py
-        - --healthcheck
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3)"]
       interval: 15s
-      timeout: 5s
-      retries: 8
-      start_period: 15s
-    cpus: ${PDF_RUNNER_CPUS:-1.0}
-    mem_limit: ${PDF_RUNNER_MEMORY_LIMIT:-768m}
-    pids_limit: ${PDF_RUNNER_PIDS_LIMIT:-128}
-    stop_grace_period: 30s
-    logging: *default-logging
-
-  safe-egress:
-    build:
-      context: .
-      args:
-        APP_GID: ${APP_GID:-10001}
-        APP_UID: ${APP_UID:-10001}
-        PYTHON_IMAGE: ${PYTHON_IMAGE:-python:3.11.15-slim-bookworm}
-    image: ${RESEARCH_MCP_IMAGE:-research-mcp:local}
-    command:
-      - python
-      - safe_egress.py
-    restart: unless-stopped
-    environment:
-      LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      SAFE_EGRESS_ALLOWED_PORTS: ${SAFE_EGRESS_ALLOWED_PORTS:-80,443,8080,8443}
-      SAFE_EGRESS_CONNECT_TIMEOUT_SECONDS: ${SAFE_EGRESS_CONNECT_TIMEOUT_SECONDS:-15}
-      SAFE_EGRESS_DENY_CIDRS: ${SAFE_EGRESS_DENY_CIDRS:-}
-      SAFE_EGRESS_DNS_TIMEOUT_SECONDS: ${SAFE_EGRESS_DNS_TIMEOUT_SECONDS:-5}
-      SAFE_EGRESS_HANDSHAKE_TIMEOUT_SECONDS: ${SAFE_EGRESS_HANDSHAKE_TIMEOUT_SECONDS:-5}
-      SAFE_EGRESS_IDLE_TIMEOUT_SECONDS: ${SAFE_EGRESS_IDLE_TIMEOUT_SECONDS:-45}
-      SAFE_EGRESS_MAX_BYTES_PER_DIRECTION: ${SAFE_EGRESS_MAX_BYTES_PER_DIRECTION:-67108864}
-      SAFE_EGRESS_MAX_CONNECTION_SECONDS: ${SAFE_EGRESS_MAX_CONNECTION_SECONDS:-120}
-      SAFE_EGRESS_MAX_CONNECTIONS: ${SAFE_EGRESS_MAX_CONNECTIONS:-128}
-      SAFE_EGRESS_QUEUE_TIMEOUT_SECONDS: ${SAFE_EGRESS_QUEUE_TIMEOUT_SECONDS:-1}
-      SAFE_EGRESS_PORT: "1080"
-    read_only: true
-    cap_drop:
-      - ALL
-    security_opt:
-      - no-new-privileges:true
-    tmpfs:
-      - /tmp:rw,noexec,nosuid,size=64m,uid=${APP_UID:-10001},gid=${APP_GID:-10001}
-    networks:
-      - web-sandbox
-      - egress
-    healthcheck:
-      test:
-        - CMD
-        - python
-        - safe_egress.py
-        - --healthcheck
-      interval: 10s
       timeout: 5s
       retries: 10
-      start_period: 10s
-    cpus: ${SAFE_EGRESS_CPUS:-0.5}
-    mem_limit: ${SAFE_EGRESS_MEMORY_LIMIT:-256m}
-    pids_limit: 128
-    logging: *default-logging
-
-  web-runner:
-    build:
-      context: .
-      args:
-        APP_GID: ${APP_GID:-10001}
-        APP_UID: ${APP_UID:-10001}
-        PYTHON_IMAGE: ${PYTHON_IMAGE:-python:3.11.15-slim-bookworm}
-    image: ${RESEARCH_MCP_IMAGE:-research-mcp:local}
-    command:
-      - python
-      - web_runner.py
-    restart: unless-stopped
-    environment:
-      CRAWL4AI_API_TOKEN: ${CRAWL4AI_API_TOKEN:-replace-this-private-crawl4ai-token}
-      CRAWL4AI_MAX_RESPONSE_BYTES: ${CRAWL4AI_MAX_RESPONSE_BYTES:-8388608}
-      CRAWL4AI_TOTAL_TIMEOUT_SECONDS: ${CRAWL4AI_TOTAL_TIMEOUT_SECONDS:-180}
-      CRAWL4AI_URL: http://crawl4ai:11235
-      LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      RESEARCH_BROWSER_DISABLE_SANDBOX: ${RESEARCH_BROWSER_DISABLE_SANDBOX:-false}
-      RESEARCH_BROWSER_IGNORE_HTTPS_ERRORS: ${RESEARCH_BROWSER_IGNORE_HTTPS_ERRORS:-false}
-      RESEARCH_BROWSER_PROXY: socks5://safe-egress:1080
-      RESEARCH_BROWSER_SANDBOX_MODE: ${RESEARCH_BROWSER_SANDBOX_MODE:-auto}
-      RESEARCH_BROWSER_TOTAL_TIMEOUT_SECONDS: ${RESEARCH_BROWSER_TOTAL_TIMEOUT_SECONDS:-90}
-      RESEARCH_REQUIRE_WEB_ISOLATION: "true"
-      RESEARCH_WEB_NETWORK_ISOLATED: "true"
-      SAFE_EGRESS_ALLOWED_PORTS: ${SAFE_EGRESS_ALLOWED_PORTS:-80,443,8080,8443}
-      SAFE_EGRESS_DENY_CIDRS: ${SAFE_EGRESS_DENY_CIDRS:-}
-      SAFE_EGRESS_DNS_TIMEOUT_SECONDS: ${SAFE_EGRESS_DNS_TIMEOUT_SECONDS:-5}
-      WEB_RUNNER_MAX_REQUEST_BYTES: ${WEB_RUNNER_MAX_REQUEST_BYTES:-2097152}
-      WEB_RUNNER_SOCKET: /run/research-web/runner.sock
-    read_only: true
-    cap_drop:
-      - ALL
-    security_opt:
-      - no-new-privileges:true
-      - seccomp=./seccomp_profile.json
-    volumes:
-      - web-runner-control:/run/research-web
-    tmpfs:
-      - /tmp:rw,noexec,nosuid,size=1g,uid=${APP_UID:-10001},gid=${APP_GID:-10001}
-      - /home/app/.cache:rw,noexec,nosuid,size=256m,uid=${APP_UID:-10001},gid=${APP_GID:-10001}
-    networks:
-      - web-sandbox
-    depends_on:
-      safe-egress:
-        condition: service_healthy
-    healthcheck:
-      test:
-        - CMD
-        - python
-        - web_runner.py
-        - --healthcheck
-      interval: 15s
-      timeout: 10s
-      retries: 8
-      start_period: 120s
-    cpus: ${WEB_RUNNER_CPUS:-2.0}
-    mem_limit: ${WEB_RUNNER_MEMORY_LIMIT:-4g}
-    pids_limit: ${WEB_RUNNER_PIDS_LIMIT:-512}
-    shm_size: ${WEB_RUNNER_SHM_SIZE:-1gb}
-    stop_grace_period: 2m
-    logging: *default-logging
+      start_period: 30s
+    cpus: ${GATEWAY_CPUS:-1.5}
+    mem_limit: ${GATEWAY_MEMORY_LIMIT:-1g}
+    pids_limit: 256
 
   redis:
+    <<: *hardened
     image: ${REDIS_IMAGE:-redis:7.4.9-alpine3.21}
-    restart: unless-stopped
+    user: redis
     command:
       - redis-server
       - --appendonly
@@ -622,161 +99,50 @@ services:
       - --appendfsync
       - everysec
       - --maxmemory
-      - ${REDIS_MAXMEMORY:-384mb}
+      - ${REDIS_MAXMEMORY:-256mb}
       - --maxmemory-policy
-      - noeviction
-    read_only: true
-    user: redis
-    cap_drop:
-      - ALL
-    security_opt:
-      - no-new-privileges:true
+      - allkeys-lru
     volumes:
       - redis-data:/data
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=32m
-    networks:
-      - backend
+    networks: [backend]
     healthcheck:
-      test:
-        - CMD
-        - redis-cli
-        - ping
+      test: [CMD, redis-cli, ping]
       interval: 10s
       timeout: 3s
       retries: 10
-      start_period: 10s
     cpus: ${REDIS_CPUS:-0.5}
-    mem_limit: ${REDIS_MEMORY_LIMIT:-512m}
-    pids_limit: 128
-    logging: *default-logging
-
-  qdrant:
-    image: ${QDRANT_IMAGE:-qdrant/qdrant:v1.18.2-unprivileged}
-    restart: unless-stopped
-    environment:
-      QDRANT__LOG_LEVEL: ${QDRANT_LOG_LEVEL:-INFO}
-      QDRANT__SERVICE__GRPC_PORT: "6334"
-      QDRANT__SERVICE__HTTP_PORT: "6333"
-    read_only: true
-    cap_drop:
-      - ALL
-    security_opt:
-      - no-new-privileges:true
-    volumes:
-      - qdrant-data:/qdrant/storage
-      - qdrant-snapshots:/qdrant/snapshots
-    tmpfs:
-      - /tmp:rw,noexec,nosuid,size=64m
-    networks:
-      - backend
-    healthcheck:
-      test:
-        - CMD-SHELL
-        - "bash -c ':> /dev/tcp/127.0.0.1/6333'"
-      interval: 10s
-      timeout: 5s
-      retries: 12
-      start_period: 20s
-    cpus: ${QDRANT_CPUS:-1.0}
-    mem_limit: ${QDRANT_MEMORY_LIMIT:-2g}
-    pids_limit: 256
-    logging: *default-logging
+    mem_limit: ${REDIS_MEMORY_LIMIT:-384m}
 
   searxng:
+    <<: *hardened
     image: ${SEARXNG_IMAGE:-searxng/searxng:2026.7.11-62a1ab7ed}
-    restart: unless-stopped
+    user: "977:977"
     environment:
-      GRANIAN_BLOCKING_THREADS: ${SEARXNG_THREADS:-4}
       GRANIAN_WORKERS: ${SEARXNG_WORKERS:-2}
-      SEARXNG_SECRET: ${SEARXNG_SECRET:-replace-this-private-instance-secret}
+      GRANIAN_BLOCKING_THREADS: ${SEARXNG_THREADS:-4}
+      SEARXNG_SECRET: ${SEARXNG_SECRET:?Set SEARXNG_SECRET in .env}
     configs:
       - source: searxng-settings
         target: /etc/searxng/settings.yml
-    read_only: true
-    user: "977:977"
-    cap_drop:
-      - ALL
-    security_opt:
-      - no-new-privileges:true
     volumes:
       - searxng-cache:/var/cache/searxng
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=64m
-    networks:
-      - search-control
-      - egress
+    networks: [search-control, egress]
     healthcheck:
-      test:
-        - CMD-SHELL
-        - wget -q --spider http://127.0.0.1:8080/
+      test: [CMD-SHELL, "wget -q --spider http://127.0.0.1:8080/"]
       interval: 15s
       timeout: 5s
       retries: 10
       start_period: 30s
     cpus: ${SEARXNG_CPUS:-1.0}
-    mem_limit: ${SEARXNG_MEMORY_LIMIT:-1g}
-    pids_limit: 256
-    logging: *default-logging
-
-  crawl4ai:
-    profiles:
-      - crawl4ai
-    build:
-      context: .
-      target: crawl4ai-runtime
-      args:
-        CRAWL4AI_IMAGE: ${CRAWL4AI_IMAGE:-unclecode/crawl4ai:0.9.1}
-    image: ${CRAWL4AI_DERIVED_IMAGE:-research-crawl4ai:local}
-    restart: unless-stopped
-    environment:
-      CRAWL4AI_API_TOKEN: ${CRAWL4AI_API_TOKEN:-replace-this-private-crawl4ai-token}
-      CRAWL4AI_EGRESS_CONNECT_TIMEOUT_SECONDS: ${CRAWL4AI_EGRESS_CONNECT_TIMEOUT_SECONDS:-30}
-      CRAWL4AI_EGRESS_SOCKS_HOST: safe-egress
-      CRAWL4AI_EGRESS_SOCKS_PORT: "1080"
-      GUNICORN_BIND: 0.0.0.0:11235
-      SAFE_EGRESS_ALLOWED_PORTS: ${SAFE_EGRESS_ALLOWED_PORTS:-80,443,8080,8443}
-      SAFE_EGRESS_DENY_CIDRS: ${SAFE_EGRESS_DENY_CIDRS:-}
-    read_only: true
-    user: appuser
-    cap_drop:
-      - ALL
-    security_opt:
-      - no-new-privileges:true
-      - seccomp=./seccomp_profile.json
-    tmpfs:
-      - /tmp:rw,noexec,nosuid,size=512m,uid=999,gid=999
-      - /var/lib/redis:rw,noexec,nosuid,size=128m,uid=999,gid=999,mode=0700
-      - /var/lib/crawl4ai/outputs:rw,noexec,nosuid,size=512m,uid=999,gid=999,mode=0700
-      - /home/appuser/.crawl4ai:rw,noexec,nosuid,size=256m,uid=999,gid=999,mode=0700
-      - /home/appuser/.cache/url_seeder:rw,noexec,nosuid,size=128m,uid=999,gid=999,mode=0700
-      - /home/appuser/.gunicorn:rw,noexec,nosuid,size=64m,uid=999,gid=999,mode=0700
-    networks:
-      - web-sandbox
-    depends_on:
-      safe-egress:
-        condition: service_healthy
-    healthcheck:
-      test:
-        - CMD
-        - curl
-        - -fsS
-        - http://127.0.0.1:11235/health
-      interval: 20s
-      timeout: 5s
-      retries: 10
-      start_period: 120s
-    cpus: ${CRAWL4AI_CPUS:-2.0}
-    mem_limit: ${CRAWL4AI_MEMORY_LIMIT:-4g}
-    pids_limit: 512
-    shm_size: ${CRAWL4AI_SHM_SIZE:-1gb}
-    logging: *default-logging
+    mem_limit: ${SEARXNG_MEMORY_LIMIT:-768m}
 
   reranker:
-    profiles:
-      - reranker
+    <<: *hardened
     image: ${RERANKER_IMAGE:-ghcr.io/huggingface/text-embeddings-inference:cpu-1.9.3}
-    restart: unless-stopped
     command:
       - --model-id
       - ${RERANKER_MODEL:-BAAI/bge-reranker-base}
@@ -784,30 +150,168 @@ services:
       - "8000"
     environment:
       HF_HOME: /data
-    read_only: true
-    cap_drop:
-      - ALL
-    security_opt:
-      - no-new-privileges:true
     volumes:
       - reranker-cache:/data
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=256m
-    networks:
-      - backend
-      - egress
+    networks: [backend, egress]
     healthcheck:
-      test:
-        - CMD-SHELL
-        - curl -fsS http://127.0.0.1:8000/health >/dev/null
+      test: [CMD-SHELL, "curl -fsS http://127.0.0.1:8000/health >/dev/null"]
+      interval: 20s
+      timeout: 5s
+      retries: 20
+      start_period: 5m
+    cpus: ${RERANKER_CPUS:-2.0}
+    mem_limit: ${RERANKER_MEMORY_LIMIT:-3g}
+
+  safe-egress:
+    <<: *hardened
+    build:
+      context: .
+      dockerfile: Dockerfile.gateway
+      target: runtime
+      args:
+        PYTHON_IMAGE: ${PYTHON_IMAGE:-python:3.11.15-slim-bookworm}
+        APP_UID: ${APP_UID:-10001}
+        APP_GID: ${APP_GID:-10001}
+    image: ${SEARCH_GATEWAY_IMAGE:-private-search-gateway:local}
+    command: [python, safe_egress.py]
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      SAFE_EGRESS_ALLOWED_PORTS: ${SAFE_EGRESS_ALLOWED_PORTS:-80,443,8080,8443}
+      SAFE_EGRESS_DENY_CIDRS: ${SAFE_EGRESS_DENY_CIDRS:-}
+      SAFE_EGRESS_DNS_TIMEOUT_SECONDS: ${SAFE_EGRESS_DNS_TIMEOUT_SECONDS:-5}
+      SAFE_EGRESS_CONNECT_TIMEOUT_SECONDS: ${SAFE_EGRESS_CONNECT_TIMEOUT_SECONDS:-15}
+      SAFE_EGRESS_HANDSHAKE_TIMEOUT_SECONDS: ${SAFE_EGRESS_HANDSHAKE_TIMEOUT_SECONDS:-5}
+      SAFE_EGRESS_IDLE_TIMEOUT_SECONDS: ${SAFE_EGRESS_IDLE_TIMEOUT_SECONDS:-45}
+      SAFE_EGRESS_MAX_CONNECTION_SECONDS: ${SAFE_EGRESS_MAX_CONNECTION_SECONDS:-120}
+      SAFE_EGRESS_MAX_CONNECTIONS: ${SAFE_EGRESS_MAX_CONNECTIONS:-128}
+      SAFE_EGRESS_QUEUE_TIMEOUT_SECONDS: ${SAFE_EGRESS_QUEUE_TIMEOUT_SECONDS:-1}
+      SAFE_EGRESS_MAX_BYTES_PER_DIRECTION: ${SAFE_EGRESS_MAX_BYTES_PER_DIRECTION:-67108864}
+      SAFE_EGRESS_PORT: "1080"
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m,uid=${APP_UID:-10001},gid=${APP_GID:-10001}
+    networks: [web-sandbox, egress]
+    healthcheck:
+      test: [CMD, python, safe_egress.py, --healthcheck]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    cpus: ${SAFE_EGRESS_CPUS:-0.5}
+    mem_limit: ${SAFE_EGRESS_MEMORY_LIMIT:-256m}
+
+  crawl4ai:
+    <<: *hardened
+    security_opt:
+      - no-new-privileges:true
+      - seccomp=./seccomp_profile.json
+    build:
+      context: .
+      dockerfile: Dockerfile.gateway
+      target: crawl4ai-runtime
+      args:
+        CRAWL4AI_IMAGE: ${CRAWL4AI_IMAGE:-unclecode/crawl4ai:0.9.1}
+    image: ${CRAWL4AI_DERIVED_IMAGE:-private-search-crawl4ai:local}
+    user: appuser
+    environment:
+      CRAWL4AI_API_TOKEN: ${CRAWL4AI_API_TOKEN:?Set CRAWL4AI_API_TOKEN in .env}
+      CRAWL4AI_EGRESS_CONNECT_TIMEOUT_SECONDS: ${CRAWL4AI_EGRESS_CONNECT_TIMEOUT_SECONDS:-15}
+      CRAWL4AI_EGRESS_SOCKS_HOST: safe-egress
+      CRAWL4AI_EGRESS_SOCKS_PORT: "1080"
+      GUNICORN_BIND: 0.0.0.0:11235
+      SAFE_EGRESS_ALLOWED_PORTS: ${SAFE_EGRESS_ALLOWED_PORTS:-80,443,8080,8443}
+      SAFE_EGRESS_DENY_CIDRS: ${SAFE_EGRESS_DENY_CIDRS:-}
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=512m,uid=999,gid=999
+      - /var/lib/redis:rw,noexec,nosuid,size=128m,uid=999,gid=999,mode=0700
+      - /var/lib/crawl4ai/outputs:rw,noexec,nosuid,size=512m,uid=999,gid=999,mode=0700
+      - /home/appuser/.crawl4ai:rw,noexec,nosuid,size=256m,uid=999,gid=999,mode=0700
+      - /home/appuser/.cache/url_seeder:rw,noexec,nosuid,size=128m,uid=999,gid=999,mode=0700
+      - /home/appuser/.gunicorn:rw,noexec,nosuid,size=64m,uid=999,gid=999,mode=0700
+    networks: [web-sandbox]
+    depends_on:
+      safe-egress:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, curl, -fsS, http://127.0.0.1:11235/health]
       interval: 20s
       timeout: 5s
       retries: 15
-      start_period: 5m
-    cpus: ${RERANKER_CPUS:-2.0}
-    mem_limit: ${RERANKER_MEMORY_LIMIT:-4g}
+      start_period: 3m
+    cpus: ${CRAWL4AI_CPUS:-2.0}
+    mem_limit: ${CRAWL4AI_MEMORY_LIMIT:-2560m}
     pids_limit: 512
-    logging: *default-logging
+    shm_size: ${CRAWL4AI_SHM_SIZE:-1gb}
+
+  web-runner:
+    <<: *hardened
+    security_opt:
+      - no-new-privileges:true
+      - seccomp=./seccomp_profile.json
+    image: ${SEARCH_GATEWAY_IMAGE:-private-search-gateway:local}
+    command: [python, web_runner.py]
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      CRAWL4AI_API_TOKEN: ${CRAWL4AI_API_TOKEN:?Set CRAWL4AI_API_TOKEN in .env}
+      CRAWL4AI_URL: http://crawl4ai:11235
+      CRAWL4AI_TOTAL_TIMEOUT_SECONDS: ${CRAWL4AI_TOTAL_TIMEOUT_SECONDS:-30}
+      CRAWL4AI_MAX_RESPONSE_BYTES: ${CRAWL4AI_MAX_RESPONSE_BYTES:-8388608}
+      RESEARCH_BROWSER_PROXY: socks5://safe-egress:1080
+      RESEARCH_BROWSER_SANDBOX_MODE: ${RESEARCH_BROWSER_SANDBOX_MODE:-auto}
+      RESEARCH_BROWSER_TOTAL_TIMEOUT_SECONDS: ${RESEARCH_BROWSER_TOTAL_TIMEOUT_SECONDS:-30}
+      RESEARCH_REQUIRE_WEB_ISOLATION: "true"
+      RESEARCH_WEB_NETWORK_ISOLATED: "true"
+      WEB_RUNNER_MAX_REQUEST_BYTES: ${WEB_RUNNER_MAX_REQUEST_BYTES:-2097152}
+      WEB_RUNNER_MAX_RESPONSE_BYTES: ${WEB_RUNNER_MAX_RESPONSE_BYTES:-8388608}
+      WEB_RUNNER_SOCKET: /run/search-gateway-web/runner.sock
+    volumes:
+      - web-runner-control:/run/search-gateway-web
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=1g,uid=${APP_UID:-10001},gid=${APP_GID:-10001}
+      - /home/app/.cache:rw,noexec,nosuid,size=256m,uid=${APP_UID:-10001},gid=${APP_GID:-10001}
+    networks: [web-sandbox]
+    depends_on:
+      safe-egress:
+        condition: service_healthy
+      crawl4ai:
+        condition: service_started
+    healthcheck:
+      test: [CMD, python, web_runner.py, --healthcheck]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 2m
+    cpus: ${WEB_RUNNER_CPUS:-2.0}
+    mem_limit: ${WEB_RUNNER_MEMORY_LIMIT:-2g}
+    pids_limit: 512
+    shm_size: ${WEB_RUNNER_SHM_SIZE:-1gb}
+
+  pdf-runner:
+    <<: *hardened
+    image: ${SEARCH_GATEWAY_IMAGE:-private-search-gateway:local}
+    command: [python, gateway_pdf_runner.py]
+    environment:
+      PDF_RUNNER_SOCKET: /run/search-gateway-pdf/runner.sock
+      RESEARCH_PDF_NETWORK_ISOLATED: "true"
+      GATEWAY_DIRECT_MAX_BYTES: ${GATEWAY_DIRECT_MAX_BYTES:-8388608}
+      GATEWAY_PDF_MAX_PAGES: ${GATEWAY_PDF_MAX_PAGES:-100}
+      GATEWAY_PAGE_MAX_CHARS: ${GATEWAY_PAGE_MAX_CHARS:-300000}
+      PDF_TIMEOUT_SECONDS: ${PDF_TIMEOUT_SECONDS:-20}
+      PDF_SANDBOX_MEMORY_BYTES: ${PDF_SANDBOX_MEMORY_BYTES:-536870912}
+      PDF_SANDBOX_CPU_SECONDS: ${PDF_SANDBOX_CPU_SECONDS:-15}
+      PDF_SANDBOX_OUTPUT_BYTES: ${PDF_SANDBOX_OUTPUT_BYTES:-6065536}
+    volumes:
+      - pdf-runner-control:/run/search-gateway-pdf
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=128m,uid=${APP_UID:-10001},gid=${APP_GID:-10001}
+    networks: [pdf-sandbox]
+    healthcheck:
+      test: [CMD, python, gateway_pdf_runner.py, --healthcheck]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    cpus: ${PDF_RUNNER_CPUS:-1.0}
+    mem_limit: ${PDF_RUNNER_MEMORY_LIMIT:-512m}
 
 configs:
   searxng-settings:
@@ -815,27 +319,21 @@ configs:
 
 networks:
   backend:
-    driver: bridge
     internal: true
-  edge:
-    driver: bridge
-  egress:
-    driver: bridge
   search-control:
-    driver: bridge
     internal: true
   web-sandbox:
-    driver: bridge
     internal: true
+  pdf-sandbox:
+    internal: true
+  egress:
+  client:
+    external: true
+    name: ${CLIENT_DOCKER_NETWORK:-docker-stacks_app-network}
 
 volumes:
-  artifacts:
-  interactive-runner-control:
-  model-cache:
-  pdf-runner-control:
-  qdrant-data:
-  qdrant-snapshots:
   redis-data:
   reranker-cache:
   searxng-cache:
   web-runner-control:
+  pdf-runner-control:

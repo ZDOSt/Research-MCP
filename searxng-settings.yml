@@ -1,27 +1,35 @@
 use_default_settings:
   engines:
     keep_only:
-      # Broad web discovery. Redundancy matters because keyless providers can
-      # rate-limit datacenter IPs independently.
+      # Broad web discovery. A small redundant set tolerates individual engine
+      # failures without sending every query to dozens of providers.
       - startpage
       - bing
+      - brave
+      - duckduckgo
       - mojeek
-      - qwant
-      # Image discovery. Keep this set intentionally small; the MCP returns
-      # metadata and source links without proxying or downloading images.
+
+      # Image discovery.
+      - startpage images
       - bing images
-      - qwant images
+      - brave.images
+      - duckduckgo images
       - wikicommons.images
+
       # Current events.
-      - mojeek news
-      - qwant news
+      - startpage news
+      - bing news
+      - brave.news
+      - duckduckgo news
       - reuters
-      # Technical and software research.
+
+      # Technical and software sources.
       - docker hub
       - github
       - mdn
       - stackoverflow
       - askubuntu
+
       # Academic and primary research.
       - arxiv
       - pubmed
@@ -30,7 +38,7 @@ use_default_settings:
       - crossref
 
 general:
-  instance_name: "Research MCP Search"
+  instance_name: "Private Search Gateway"
 
 search:
   safe_search: 0
@@ -41,31 +49,21 @@ search:
 server:
   bind_address: "0.0.0.0"
   port: 8080
-  # The pinned image overrides this value from SEARXNG_SECRET at runtime.
+  # The container replaces this with SEARXNG_SECRET at runtime.
   secret_key: "ultrasecretkey"
   limiter: false
   image_proxy: false
 
 outgoing:
-  request_timeout: 6.0
-  max_request_timeout: 12.0
+  request_timeout: 5.0
+  max_request_timeout: 10.0
 
-# These engines are disabled in the pinned upstream defaults. They are
-# explicitly activated here after keep_only has removed every unselected
-# provider. Do not add disabled overrides for omitted engines: SearXNG would
-# treat them as incomplete new engine definitions.
+# These engines are disabled in the pinned upstream defaults. Explicitly
+# enable only selected engines; enabled defaults need no override.
 engines:
   - name: bing
     disabled: false
   - name: mojeek
-    disabled: false
-  - name: qwant
-    disabled: false
-  - name: qwant images
-    disabled: false
-  - name: mojeek news
-    disabled: false
-  - name: qwant news
     disabled: false
   - name: openalex
     disabled: false

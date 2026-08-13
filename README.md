@@ -1,925 +1,196 @@
-# Research MCP
+# Private Search Gateway
 
-Research MCP gives any Streamable HTTP MCP client one private, high-level
-`research_assistant` tool. The client passes the complete request once; the
-server plans focused queries, searches and browses in parallel, inspects supplied
-URLs and GitHub when relevant, optionally discovers images, and returns a
-citation-checked Markdown answer or a cited evidence digest under one interactive
-deadline. An optional server-side research model improves planning and answer
-writing, but search and cited evidence remain available when it fails or is not
-configured. The gateway exposes MCP only; it does not provide an OpenAI-compatible
-chat endpoint.
+This project is a deterministic, self-hosted search and page-retrieval backend
+for AI frontends. It exposes a SearXNG-compatible search endpoint, discovers
+sources with a small set of search engines, opens the strongest pages, extracts
+their actual contents, follows a bounded number of relevant same-site links,
+reranks evidence locally, and returns cited source URLs and page-derived text.
 
-The existing evidence, URL, GitHub, memory, and durable-job tools remain
-available through an `advanced` tool profile. Separate workers perform bounded
-page extraction, browser automation, background ingestion, retrieval, and
-optional reranking.
+It does not call a paid search API or an internal language model. The frontend's
+model receives the retrieved evidence and writes the answer. This keeps the
+service private, predictable, and usable by any frontend that accepts a custom
+SearXNG or JSON search provider.
 
-## Run with Docker Compose
+## What runs
 
-Requirements: Docker Engine with Compose v2.24.4 or newer, a 64-bit Linux host,
-and outbound internet access for search and page retrieval. The configured
-memory ceilings total about 16.5 GB for the base stack after including the
-separate persistence worker. These are hard ceilings rather than reservations,
-so a 16 GB VPS can run the default stack, but it has little worst-case headroom;
-lower the worker limits or provide swap if other services share the host. Each
-optional Crawl4AI or reranker profile adds up to 4 GB. The first build downloads
-Chromium and the first indexing job downloads the configured embedding model.
+- `search-gateway`: the only client-facing service, on internal port `8080`
+- `searxng`: web, technical, news, image, and research discovery
+- `reranker`: local `BAAI/bge-reranker-base` relevance ranking
+- `crawl4ai`: JavaScript-aware crawling for difficult pages
+- `web-runner`: isolated Crawl4AI and Playwright control over a Unix socket
+- `pdf-runner`: network-isolated PDF extraction
+- `safe-egress`: blocks private-network and metadata destinations for browsers
+- `redis`: response cache and stale-result fallback
 
-The base Compose defaults select the one-call `unified` tool profile, so a
-checkout without a copied `.env` can start with one command:
+The stack publishes no host ports. A frontend reaches it over a shared Docker
+network at:
+
+```text
+http://search-gateway:8080/search
+```
+
+Every container attached to that shared network can call the gateway. Use a
+dedicated shared network if other unrelated containers should not have access.
+
+## Requirements
+
+- 64-bit Linux VPS
+- Docker Engine and Docker Compose v2.24.4 or newer
+- About 10 GB free disk for images, Chromium, and the reranker model
+- 16 GB RAM recommended for the complete stack
+
+The supplied ceilings total about 10.5 GB, excluding shared memory and normal
+Docker overhead. They are limits, not reservations, but leave useful headroom
+on a 16 GB host. The first build is slow because it downloads Chromium, the
+Crawl4AI image, and the reranker model.
+
+## Clean installation
+
+Create the Docker network once if it does not already exist:
 
 ```console
-docker compose up -d
+docker network inspect docker-stacks_app-network >/dev/null 2>&1 || \
+  docker network create docker-stacks_app-network
 ```
 
-The MCP endpoint is `http://127.0.0.1:8001/mcp`. It uses streamable HTTP. Only
-that gateway port is published; Redis, Qdrant, SearXNG, and workers remain on
-private Docker networks.
-
-New installations copy `.env.example`, which selects
-`MCP_TOOL_PROFILE=unified` and exposes `research_assistant` plus
-`research_job`. Existing deployments that need the specialized tools should
-set `MCP_TOOL_PROFILE=advanced` or `MCP_TOOL_PROFILE=all` explicitly. Optionally
-configure a private OpenAI-compatible server-side model for model-assisted
-planning and answer writing:
-
-```dotenv
-RESEARCH_MODEL_BASE_URL=https://your-model-endpoint.example/v1
-RESEARCH_MODEL_NAME=your-model-name
-RESEARCH_MODEL_API_KEY=your-private-key
-```
-
-This endpoint is an optional internal enhancement used only by the research
-worker; it is not exposed to MCP clients. Use
-`RESEARCH_MODEL_ALLOW_INSECURE_HTTP=true` only for a trusted private HTTP
-endpoint. Without it, `research_assistant` uses deterministic planning and
-returns cited evidence rather than failing the request.
-
-When `MCP_AUTH_TOKEN` or `MCP_AUTH_TOKENS_JSON` is set, MCP clients must send an
-`Authorization: Bearer TOKEN` header on gateway requests. An empty policy
-leaves only the loopback endpoint unauthenticated for local development; the
-gateway refuses an unauthenticated non-loopback bind by default.
-
-For a durable non-local installation, create `.env` from `.env.example`, set a
-random `SEARXNG_SECRET` and `MCP_AUTH_TOKEN`, optionally configure
-`RESEARCH_MODEL_*`, review the resource limits, and terminate TLS at a reverse
-proxy in front of the gateway.
+Clone and configure the project:
 
 ```console
-cp .env.example .env
-# Edit .env secrets and optional RESEARCH_MODEL_* settings before continuing.
-docker compose up -d --build --wait
-docker compose ps
-```
-
-PowerShell equivalent:
-
-```powershell
-Copy-Item .env.example .env
-# Edit .env secrets and optional RESEARCH_MODEL_* settings before continuing.
-docker compose up -d --build --wait
-docker compose ps
-```
-
-## Publish to GitHub and deploy to a VPS
-
-Create an empty private GitHub repository first. Then establish a repository
-boundary inside this project directory before adding files. This matters if a
-parent directory is already a Git repository.
-
-```console
-cd Research-MCP-main
-git init
-git branch -M main
-git rev-parse --show-toplevel
-git add .
-git commit -m "Initial private research MCP"
-git remote add origin git@github.com:YOUR_ACCOUNT/research-mcp.git
-git push -u origin main
-```
-
-The `git rev-parse` output must be the `Research-MCP-main` directory itself.
-`.env`, model data, vector data, Redis data, and artifacts are ignored and must
-never be committed.
-
-On an Ubuntu or Debian VPS, install Git and Docker Engine with the Compose
-plugin from Docker's official repository, then verify `docker compose version`
-reports v2.24.4 or newer. Clone and configure the service:
-
-```console
-git clone git@github.com:YOUR_ACCOUNT/research-mcp.git
-cd research-mcp
+git clone https://github.com/ZDOSt/Research-MCP.git
+cd Research-MCP
 cp .env.example .env
 chmod 600 .env
-echo "SEARXNG_SECRET=$(openssl rand -hex 32)"
-echo "MCP_AUTH_TOKEN=$(openssl rand -base64 48)"
-echo "CRAWL4AI_API_TOKEN=$(openssl rand -hex 32)"
 ```
 
-Put the generated values in `.env` as `SEARXNG_SECRET`, `MCP_AUTH_TOKEN`, and
-`CRAWL4AI_API_TOKEN`; use a different value for each credential. Leave the
-`RESEARCH_MODEL_*` values empty unless you choose the optional model enhancement
-described below.
+Generate two different secrets:
 
-Set `RESEARCH_TIMEZONE` to the primary user's IANA timezone, such as
-`America/New_York`, so relative-date searches and results use the expected
-local calendar date. It defaults to `UTC`.
-Keep `MCP_BIND_ADDRESS=127.0.0.1`, and add the public hostname to the strict Host
-allowlist, for example
-`MCP_ALLOWED_HOSTS=127.0.0.1:*,localhost:*,[::1]:*,mcp-gateway:*,research.example.com`.
-Entries must match the HTTP `Host` header exactly; the narrow `:*` suffix allows
-any port only for the named host. Add that suffix to the public hostname too if
-clients connect on a non-default HTTPS port.
-Browser-based MCP clients that send an `Origin` header also require that exact
-origin in `MCP_ALLOWED_ORIGINS`; server-to-server clients may leave it empty.
-Review the resource limits, and then start the base stack:
+```console
+openssl rand -hex 32
+openssl rand -hex 32
+```
+
+Edit `.env` and replace `SEARXNG_SECRET` and `CRAWL4AI_API_TOKEN` with those
+values. Change `CLIENT_DOCKER_NETWORK` only if your frontend uses a different
+external Docker network.
+
+Validate and start the complete stack:
 
 ```console
 docker compose config --quiet
 docker compose up -d --build --wait
 docker compose ps
-docker compose logs --tail=100 mcp-gateway research-worker persistence-worker
 ```
 
-The unified `research_assistant` works without an internal model. In that base
-configuration it uses deterministic planning and returns cited evidence or a
-cited evidence digest.
+No `ports:` entries are needed. Do not add one unless you intentionally want to
+expose the gateway outside Docker.
 
-### Optional server-side research model
+## Verify it
 
-This enhancement is not required for startup or for the unified tool profile.
-Configure it when model-assisted query planning and citation-checked answer
-writing are worth the additional model dependency. The model must support
-OpenAI-compatible `/chat/completions`; it is independent of the model configured
-in the frontend.
-
-For an HTTPS model endpoint reachable from the worker, set
-`RESEARCH_MODEL_BASE_URL`, `RESEARCH_MODEL_NAME`, and, when required,
-`RESEARCH_MODEL_API_KEY`. Keep `RESEARCH_MODEL_ALLOW_INSECURE_HTTP=false` and no
-model-network Compose override is needed.
-
-When the model is another same-host Docker service, no host port is required.
-Create a dedicated external network:
+Run a health check from the gateway container:
 
 ```console
-docker network create research-model
+docker compose exec -T search-gateway python -c \
+  "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8080/healthz').read().decode())"
 ```
 
-Declare that network in the model provider's own Compose file so the attachment
-survives container recreation. Add `research-model` alongside any networks the
-model service already uses:
-
-```yaml
-services:
-  your-model-service:
-    networks:
-      - default
-      - research-model
-
-networks:
-  research-model:
-    external: true
-    name: research-model
-```
-
-For a one-time test with an already-running container,
-`docker network connect research-model YOUR_MODEL_CONTAINER` is sufficient, but
-that manual attachment must be repeated after the model container is recreated.
-
-Then set `RESEARCH_MODEL_NETWORK=research-model`, point
-`RESEARCH_MODEL_BASE_URL` at the model container name and internal port, and set
-`RESEARCH_MODEL_ALLOW_INSECURE_HTTP=true` only for that trusted private Docker
-network. Add the model settings and model-only file set to `.env`:
-
-```dotenv
-RESEARCH_MODEL_BASE_URL=http://your-model-service:PORT/v1
-RESEARCH_MODEL_NAME=your-model-name
-RESEARCH_MODEL_API_KEY=
-RESEARCH_MODEL_ALLOW_INSECURE_HTTP=true
-RESEARCH_MODEL_NETWORK=research-model
-COMPOSE_FILE=docker-compose.yml:docker-compose.model-network.yml
-COMPOSE_PATH_SEPARATOR=:
-```
-
-Apply the optional enhancement after those values are present:
+Run a real search from any container on the shared network. Replace
+`your-frontend-container` with `anythingllm`, `librechat`, or another container
+name:
 
 ```console
-docker compose config --quiet
-docker compose up -d --build --wait
+docker exec your-frontend-container sh -lc \
+  "wget -qO- 'http://search-gateway:8080/search?q=how+to+install+docker+compose&format=json' | head -c 1000"
 ```
 
-Alternatively, leave `COMPOSE_FILE` unset and keep
-`-f docker-compose.yml -f docker-compose.model-network.yml` on every Compose
-command.
+The response should contain `results`, source URLs, extracted `content`, and
+diagnostics. Search snippets are used only as a clearly labeled fallback when a
+site blocks extraction or the request deadline is reached.
 
-Do not publish port 8001 directly to the internet. Put Caddy, Nginx, Traefik,
-or another TLS reverse proxy on the same VPS and proxy a dedicated HTTPS name
-to `127.0.0.1:8001`. For example, a host Caddy configuration is:
+## Frontend setup
 
-```caddyfile
-research.example.com {
-    reverse_proxy 127.0.0.1:8001
+Use the following base URL wherever the frontend asks for a SearXNG URL:
+
+```text
+http://search-gateway:8080
+```
+
+If it asks for the complete search path, use:
+
+```text
+http://search-gateway:8080/search
+```
+
+The standard request is:
+
+```http
+GET /search?q=your+question&format=json
+```
+
+Supported query parameters include:
+
+- `language=auto`
+- `time_range=day|week|month|year`
+- `categories=general,it,news,science,images`
+- `max_results=1..8`
+- `mode=auto|quick|balanced|deep`
+
+When no category is supplied, the gateway infers useful SearXNG categories from
+the request. `auto` uses quick mode for simple lookups and balanced mode for
+technical questions and recommendations.
+
+For direct integrations, a richer JSON endpoint is also available:
+
+```http
+POST /v1/research
+Content-Type: application/json
+
+{
+  "query": "What are the recommended settings for an AW3426DW?",
+  "mode": "balanced",
+  "max_results": 5,
+  "language": "auto",
+  "categories": []
 }
 ```
 
-Allow only SSH, HTTP, and HTTPS through the VPS firewall. The remote MCP URL is
-then `https://research.example.com/mcp`; the client must still send the bearer
-token. The proxy must allow long-lived streaming responses and retain the
-`Authorization` header. To update later, preserve any enabled Compose profiles
-and Compose overrides, then explicitly choose the tool profile. Existing
-deployments may set `MCP_TOOL_PROFILE=unified` with or without an internal model;
-leave the compatibility value `all` only until clients have migrated:
+## Updating
+
+From the repository directory on the VPS:
 
 ```console
 git pull --ff-only
-docker compose up -d --build --wait
-```
-
-Add `--profile crawl4ai` and/or `--profile reranker` only for optional services
-that are already enabled and should remain enabled. For example, preserve both
-profiles with:
-
-```console
-docker compose --profile crawl4ai --profile reranker up -d --build --wait
-```
-
-Profile flags are required to recreate and rebuild those profile-gated services
-during an update, but including a flag also enables that service if it was not
-previously running.
-
-Back up the Qdrant, Redis, and artifact named volumes before destructive Docker
-maintenance. `docker compose down` preserves them; `docker compose down
---volumes` permanently deletes them.
-
-## Architecture
-
-```text
-MCP client -> mcp-gateway -> private Unix socket -> research-runner (ordinary research)
-                                  |                     |-> private research model (optional)
-                                  |                     |-> SearXNG -> public web
-                                  |                     |-> direct bounded fetch -> public web
-                                  |                     |-> Unix socket -> isolated PDF parser (no network)
-                                  |                     `-> Unix socket -> isolated web-runner
-                                  |                                          |-> safe-egress -> public web
-                                  |                                          `-> isolated Crawl4AI (optional)
-                                  |-> Redis primary queue -> research-worker (explicit deep/durable jobs)
-                                  `-> current evidence (returned immediately)
-                                                               |
-                                                               `-> Redis persistence queue
-                                                                    `-> persistence-worker -> Qdrant + FastEmbed
-```
-
-The default stack includes:
-
-| Service | Role | Host exposure |
-| --- | --- | --- |
-| `mcp-gateway` | MCP protocol, validation, and private runner/queue dispatch | `127.0.0.1:8001` |
-| `research-runner` | Isolated ordinary research execution over a private Unix socket | None |
-| `research-worker` | Internal planning/writing model calls, search, crawl, extraction, browser automation, and current evidence | None |
-| `persistence-worker` | Independently index one extracted source per durable child job | None |
-| `redis` | Durable primary/persistence queues and result state | None |
-| `qdrant` | Persistent vector memory | None |
-| `searxng` | Private metasearch with JSON output enabled | None |
-| `pdf-runner` | Resource-bounded PDF parsing in a network-less container | None |
-| `web-runner` | Network-isolated Playwright/Crawl4AI control process | None |
-| `safe-egress` | DNS-pinned, public-only SOCKS5 broker for the browser sandbox | None |
-
-Redis and Qdrant join only the internal backend network. The persistence worker
-and optional reranker also join the outbound network so an empty model cache can
-download its configured Hugging Face model; neither publishes a host port or
-joins the external MCP client network. SearXNG performs search on a separate
-control network. The worker reaches the browser and PDF parser only through
-separate Unix sockets. The PDF parser has no network interface. Playwright and
-optional Crawl4AI run only on an internal
-sandbox network and reach public targets through `safe-egress`, which rejects
-private, loopback, link-local, and metadata destinations after DNS resolution.
-SearXNG uses a file-backed settings mount so its root filesystem remains
-read-only across Compose implementations; `SEARXNG_SECRET` overrides the
-checked-in placeholder at runtime. Its pinned configuration keeps a deliberately
-small set of broad, news, technical, and academic engines rather than querying
-every upstream provider. Keyless engines can still rate-limit VPS addresses;
-inspect SearXNG diagnostics when discovery is empty, and revalidate exact engine
-names whenever the pinned SearXNG image is upgraded.
-The gateway joins a separate edge network for its published port. Named volumes
-retain Redis state, Qdrant vectors and snapshots, embedding models, and research
-artifacts across replacement.
-
-## MCP tools
-
-`MCP_TOOL_PROFILE` controls discovery. The default is `unified`, exposing only
-`research_assistant` and `research_job`, which minimizes tool-choice errors in
-frontends. Select `advanced` or `all` explicitly when the original specialized tools are needed. `advanced` exposes the original specialized tools and
-`research_job`; `all` exposes both surfaces. Restart the gateway after changing
-the profile because MCP clients commonly cache tool schemas. `namespace` values
-create logical Qdrant partitions and authorization boundaries.
-
-| Tool | Purpose and important behavior |
-| --- | --- |
-| `research_assistant` | Complete a current, external, technical, URL, GitHub, image, or general research request in one call. Pass the complete user request and normally use `mode=auto`. Ordinary modes have a server-owned 36-second end-to-end worker budget and return the best answer or cited evidence available at expiry; `deep` remains background-oriented. An optional `RESEARCH_MODEL_*` endpoint improves planning and synthesis. The tool returns `answer_markdown`, citations, optional image metadata, `confidence`, `limitations`, and a bounded `research_summary`. |
-| `research_web` | Run open-ended research. Pass the complete task in `query`; capable calling models may also supply 1-5 concise, optional `proposed_queries` of at most 180 characters each. The server validates suggestions and retains deterministic search anchors. Modes are `quick` (12-second target), `balanced` (30), `web_only` (25), `technical` (45), `academic` (50), `deep` (180/background-oriented), and `local_only`. Search queries and source extraction run under one bounded latency budget and return the best available evidence at expiry. `evidence` is the authoritative fresh result; `results` and `memory_results` are optional vector-memory matches and may be empty. Source indexing continues independently after the response. With Redis, same-owner duplicate active requests are coalesced and wait for the existing result rather than launching duplicate work. |
-| `investigate_url` | Investigate one public HTTP(S) URL with crawl, rendered-browser, scrolling, clicking, and network-data fallbacks. Modes are `auto`, `targeted`, `balanced`, and `exhaustive`; optional flags control ingestion, raw text, and diagnostics. |
-| `start_research` | Queue explicitly deep durable `research_web` work and return a job ID immediately. It accepts the same complete `query` and optional `proposed_queries` planning inputs. Ordinary work should use `research_web`. A model may follow with one bounded `research_job` call itself; users should not be asked to run job-control commands. It requires `JOB_BACKEND=redis`, which Compose configures. |
-| `research_job` | Operate on a durable job with `action=status`, `result`, or `cancel`. Status and result use bounded long polling (`wait_seconds`, default 15) to avoid busy loops. `include_full_result=false` returns compact Redis metadata, including persistence acceptance, instead of loading the complete artifact. Cancellation is cooperative and may not be instantaneous. |
-| `get_research_artifact` | Read a returned source artifact, or a job-result path obtained through compact job metadata, as bounded text. Completed full results omit their duplicate job-result path because the payload is already present. `max_chars` is clamped to 1,000-250,000 characters. |
-| `query_memory` | Search Qdrant memory in a namespace, with `top_k` clamped to 1-30, and return reranked evidence. |
-| `ingest_text` | Store supplied text in a namespace. Common credentials and tokens are redacted by default. Under token policies, `redact_secrets=false` requires the separate `memory:write:unredacted` scope. |
-| `manage_sources` | `list`, inspect `stats`, or `delete` an ingested source within a namespace. Deletion removes its Qdrant chunks, not job artifact files. |
-| `github_research` | Read-only GitHub API access. `search` searches `issues`, `code`, or `repositories`; `inspect` returns repository metadata and a prioritized recursive file tree; `read` returns a file or directory listing at an optional ref. |
-
-### Unified orchestration
-
-`research_assistant(request, mode="auto")` accepts the complete private request.
-With the default configuration, `auto` classifies the request and selects the
-appropriate quick, balanced, technical, or academic acquisition profile.
-Those profiles retain their different search breadth but share the server-owned
-interactive deadline, so a client with a roughly 60-second tool timeout receives
-a terminal answer-bearing response.
-Use `deep` only for explicitly background-oriented work.
-Before any content crosses the configured research-model boundary, the server
-redacts credential patterns, signed/session URL values, common PII,
-private-context phrases, addresses, and host paths. Only normalized, bounded,
-planner-minimized queries cross public search boundaries.
-The deterministic failure path preserves the privacy-filtered public topic,
-dates, products, and constraints. Explicit public URLs are retained exactly in
-execution-only state so signed query ordering and encoding remain intact; only
-redacted canonical forms are returned or persisted. Relevant web, URL, GitHub, and image operations run
-concurrently. The normal research pipeline still performs source selection,
-reranking when enabled, page extraction, and browser fallbacks.
-
-Privacy filtering is heuristic: it recognizes credential patterns, common PII,
-and private identifiers with recognizable context. An arbitrary project name or
-other identifier without such context cannot be reliably distinguished from a
-public product name, so callers should still avoid placing secrets or sensitive
-identifiers in research requests. If the optional research model is enabled, use
-a trusted endpoint.
-
-Interactive calls skip the separate evidence-review model call and use one short
-deterministic rescue search only when initial acquisition returns nothing. Deep
-work may review the bounded evidence once and request at most one focused
-follow-up round, controlled by `RESEARCH_AGENT_MAX_FOLLOW_UP_ROUNDS`. When the
-optional model writes the answer, it writes from numbered evidence only.
-Citation IDs, paragraph/list-item coverage, and lexical evidence alignment are
-validated before IDs become clickable links. Without the model, or if synthesis
-or citation repair misses the interactive deadline, the server returns a clearly
-marked cited evidence digest instead of an unfinished job. These checks reduce
-unsupported claims but do not establish semantic entailment or factual truth.
-
-Image discovery uses a small SearXNG image-engine set and returns titles,
-resolution metadata, and validated source-page links. Direct image and thumbnail
-URLs are omitted from MCP responses so clients cannot auto-fetch an image host
-after its DNS changes. The MCP does not fetch, proxy, or store image bytes.
-Unsafe, private, loopback, credential-bearing, alternate-numeric, and DNS-private
-candidate URLs are discarded at retrieval time. Frontends must still apply their
-own URL/SSRF policy to ordinary source and citation links.
-
-The server returns:
-
-- `answer_markdown`: either the citation-validated finished answer or a clearly
-  marked cited evidence digest; follow the returned `answering_instructions`.
-- `citations`: the cited source records used by that answer.
-- `images`: optional bounded image metadata when the request calls for images.
-- `confidence` and `limitations`: evidence-coverage signals, not truth guarantees.
-- `research_summary`: plan, acquisition counts, bounded follow-up diagnostics,
-  redaction count, and elapsed time.
-
-MCP cannot intercept an ordinary chat turn or force a frontend model to call a
-tool. The tool name, description, and server instructions strongly direct capable
-clients to call `research_assistant` once when external information is needed,
-but the initial call remains a frontend responsibility. Once called, the server
-owns evidence acquisition and returns either the finished answer or a cited digest
-the frontend can turn into the answer without coordinating subtools. Frontend model
-credentials and hidden model state are not
-portable through MCP, so the optional internal model needs its own server-side
-configuration when enabled.
-
-### Advanced query planning
-
-For the `advanced` profile's `research_web` and `start_research`, the calling
-model may formulate concise
-search suggestions in `proposed_queries`, but the complete user task in `query`
-remains authoritative. The server normalizes and deduplicates suggestions,
-checks that each one aligns with a canonical intent, rejects off-topic,
-ambiguous, missing-constraint, or conflicting-constraint proposals, and keeps
-deterministic queries as bounded anchors and fallbacks. Accepted proposals still
-share the selected mode's existing query budget. A proposal that adds a narrower
-semantic scope or omits part of the canonical search intent is treated as a
-guarded expansion: it runs concurrently with that intent's deterministic anchor,
-and expansion-only results cannot by themselves mark the original intent
-resolved. Search-form additions
-such as official documentation, primary sources, release notes, GitHub issues,
-benchmarks, specifications, and reviews remain normal calling-model queries.
-Because `quick` mode has a one-query budget, it deliberately keeps only the
-deterministic anchor; use a larger mode such as `balanced` or `technical` when
-proposals should be eligible. The unified assistant also bounds quick-mode
-planning and synthesis and disables rendered-browser verification by default so
-short-timeout MCP clients receive a useful result promptly. Set
-`RESEARCH_AGENT_QUICK_VERIFY=true` when rendered pages are more important than
-latency. The high-level assistant's `auto` mode classifies each request by
-default; set `RESEARCH_ASSISTANT_AUTO_MODE=quick`, `balanced`, `technical`, or
-`academic` only when every automatic request should use that fixed profile.
-`local_only` performs no web search and therefore never uses proposed queries.
-
-Omitting `proposed_queries` preserves the previous deterministic planning path,
-so older MCP clients continue to work unchanged. MCP clients commonly cache tool
-schemas; reconnect or restart the client after upgrading the server so the new
-optional field becomes available to the calling model.
-
-For `github_research`, `repository` accepts `owner/name` or a GitHub repository
-URL. Anonymous access is rate-limited. Set a least-privilege `GITHUB_TOKEN` for
-private repositories, higher limits, and API operations that require
-authentication. `GITHUB_MAX_FILE_CHARS` bounds returned file content, while
-`max_results` is bounded to 30 search results or 1,000 inspected files. Set
-`GITHUB_API_URL` only to a trusted GitHub Enterprise API because the configured
-token is sent to that origin.
-
-When `GITHUB_TOKEN` is configured, `GITHUB_ALLOWED_REPOSITORIES` is mandatory
-and credentialed requests fail closed outside that allowlist. Repository-less
-search is allowed only when the allowlist contains the exact global `*` entry.
-Prefer explicit `owner/repository` entries. The same rule applies independently
-to each multi-token client policy.
-
-## Authentication and authorization
-
-`MCP_AUTH_TOKEN` keeps the simple single-client configuration. It grants the
-normal research, redacted memory-write, memory-delete, artifact-read, and
-GitHub-read scopes. Restrict it with comma-separated
-`MCP_ALLOWED_NAMESPACES` and `GITHUB_ALLOWED_REPOSITORIES` values.
-
-For multiple clients, set `MCP_AUTH_TOKENS_JSON` to a one-line JSON object keyed
-by bearer token. When it is present, it replaces `MCP_AUTH_TOKEN`. Example:
-
-```dotenv
-MCP_AUTH_TOKENS_JSON='{"alice-long-random-token":{"client_id":"alice","scopes":["research","memory:write","memory:delete","artifacts:read","github:read"],"namespaces":["alice-*"],"github_repositories":["owner/docs"]},"automation-long-random-token":{"client_id":"automation","scopes":["research","memory:write"],"namespaces":["automation"],"github_repositories":[]}}'
-```
-
-`client_id` is the stable job owner. Namespace patterns use shell-style globs
-and are case-sensitive; repository patterns are case-insensitive. Every token
-must have `research`. Optional scopes are:
-
-- `memory:write`: ingest text after secret redaction.
-- `memory:write:unredacted`: explicitly permit `redact_secrets=false`.
-- `memory:delete`: delete vector-memory sources.
-- `artifacts:read`: read artifacts owned by that client's jobs.
-- `github:read`: use the read-only GitHub connector, still constrained by the
-  token and server repository allowlists.
-
-Durable jobs are tagged with the authenticated `client_id`; other clients
-cannot inspect, retrieve, cancel, or read their artifacts. Jobs created before
-ownership was enabled are denied while authentication is active. The temporary
-`MCP_ALLOW_LEGACY_UNOWNED_JOBS=true` migration switch weakens this isolation
-and should be removed after old jobs expire.
-
-Generate tokens with a cryptographically secure random generator and protect
-`.env` with restrictive filesystem permissions. Static bearer tokens are not a
-replacement for TLS.
-
-## Verification semantics
-
-`verify=true` asks the pipeline to favor distinct source-owner domains and
-report lexical/topical overlap across retrieved evidence. It does not perform
-claim-level entailment, prove that apparently separate sites are independent,
-or establish factual truth. The returned `verification` object states this
-explicitly. Planner synthesis validates that every `[E#]` citation points to
-available evidence, but it also does not automatically validate factual
-entailment. Clients should treat these features as corroboration aids and keep
-uncertainty visible when evidence is incomplete or conflicts. When usable
-evidence exists but requested corroboration does not find cross-source topical
-overlap, `completion.status` is `partial` and `completion.reasons` includes
-`verification_inconclusive`; this describes an evidence limitation, not proof
-that the evidence is false.
-
-## Durable jobs and artifacts
-
-The Compose deployment uses a primary Redis queue, a separate persistence
-queue, and a shared artifact volume. Ordinary `research_web` calls wait for a
-bounded best-evidence result. A typical explicitly durable/deep flow is:
-
-1. Call `start_research` and retain its `job_id`.
-2. The assistant may call `research_job(action="result", job_id=...)` once with
-   a bounded `wait_seconds`. It must not busy-poll or ask the user to run a
-   tool-control command.
-3. Set `include_full_result=false` when only compact Redis metadata is needed.
-4. When a result or source includes `artifact_path`, call
-   `get_research_artifact` to read a bounded copy later.
-
-The unified `research_assistant` uses the private synchronous runner for ordinary
-(`auto`, `quick`, `balanced`, `technical`, and `academic`) calls, so a busy durable
-worker cannot make an interactive request return `running`. The runner returns
-SearXNG-backed evidence or a terminal, explicit failure; it never hands the MCP
-client an unresumable queue handle. Deep assistant calls and the lower-level
-`research_web`/`investigate_url` tools remain Redis-backed durable operations and
-wait up to `MCP_SYNC_JOB_WAIT_SECONDS` (45 seconds by default). Deep mode is the
-intentionally long-running option.
-Exact active requests are coalesced by authenticated owner, job kind, and
-canonical payload, so a model retry waits for the existing physical job instead
-of creating duplicate work. Workers hold random per-attempt leases and heartbeat
-active jobs. Stale leases are
-recovered both on startup and every `JOB_STALE_RECOVERY_INTERVAL_SECONDS`; only
-the current lease owner may publish a result. Duplicate queue entries therefore
-cannot execute the same lease concurrently. Queue payloads are capped by
-`JOB_MAX_PAYLOAD_BYTES`, and queue admission is capped by `JOB_MAX_QUEUED` (`0`
-disables the admission cap). A job that repeatedly loses a stale lease is
-terminally failed after `JOB_MAX_ATTEMPTS` claims instead of retrying forever.
-Open-web acquisition does not write to Qdrant on its response path. After source
-text is extracted, it is staged as an immutable artifact under a unique future
-persistence-job ID. Parent completion and all child enqueues occur in one
-lease-checked Redis transaction, and cancellation wins that transaction without
-enqueuing children. Each child indexes exactly one source, so one failing source
-does not revoke successful siblings and slow embeddings do not block another
-interactive request. The returned `persistence.status=accepted` is an enqueue
-acknowledgement, not a live indexing status; current `evidence` is usable
-immediately and must not wait for vector memory.
-
-Before an ingesting child (or explicitly synchronous ingestion) can dispatch,
-its compensation record is written to Redis and confirmed on the local AOF with
-`WAITAOF`. The worker fails closed if that confirmation does not arrive within
-`JOB_INGESTION_WAITAOF_TIMEOUT_MS` (default 5000 ms). Setting the timeout to `0`
-disables the fsync confirmation and weakens recovery from a Redis host crash.
-
-Each successful attempt writes its full JSON result atomically under
-`ARTIFACT_DIR/<job_id>/result-<lease-prefix>.json`; deferred source snapshots are
-owned by their individual persistence child IDs. A worker that loses its lease
-cannot attach the result artifact to
-the job result, preventing an obsolete attempt from overwriting a newer one.
-Compose fixes `ARTIFACT_DIR` to `/data/artifacts` and mounts the `artifacts`
-named volume into both gateway and workers. Paths returned to clients are
-relative, validated paths rather than host filesystem paths.
-
-Redis job metadata expires `JOB_RESULT_TTL_SECONDS` after a terminal state
-(default 30 days; `0` disables expiry). Artifact directories are independently
-pruned when their newest file is older than `ARTIFACT_RETENTION_SECONDS`
-(default 30 days), with scans every `ARTIFACT_CLEANUP_INTERVAL_SECONDS` (default
-one hour). A retention value of `0` disables worker pruning. Queued and running
-artifact owners are protected across both Redis queues, including referenced
-parent owners. Unless metadata expiry is disabled,
-`JOB_RESULT_TTL_SECONDS` must be at least `ARTIFACT_RETENTION_SECONDS` so an
-authenticated client never retains a path after its ownership record expires.
-Qdrant memory has a separate lifecycle and is not removed by artifact cleanup.
-Ingestion is committed in two phases. Workers immediately revoke all chunks
-from a cancelled, failed, or lease-lost attempt when Qdrant is available; if it
-is not, the fsynced Redis compensation ledger retries the idempotent revocation
-after recovery. Successful completion atomically disarms that ledger entry.
-Attempt tombstones are permanent and are never removed by ordinary Qdrant
-history pruning, so delayed writes cannot reactivate an abandoned attempt.
-Lifecycle repair runs every
-`QDRANT_LIFECYCLE_REPAIR_INTERVAL_SECONDS` (default one hour), resumes bounded
-`QDRANT_LIFECYCLE_REPAIR_MAX_POINTS` scans across passes, and removes inactive
-history after `QDRANT_HISTORY_RETENTION_SECONDS` (default 30 days; `0` disables
-history pruning). Set the repair interval to `0` only when another process owns
-lifecycle maintenance.
-
-## Optional standalone RAG API
-
-`api.py` exposes the Qdrant-backed RAG operations as HTTP routes for a split
-deployment. It is not published by the default Compose stack. If it is run with
-Uvicorn, set `RESEARCH_API_TOKEN` and send the same bearer token from the
-consumer; management routes refuse unauthenticated access by default.
-`RESEARCH_API_ALLOW_UNAUTHENTICATED=true` is intended only for a network-isolated
-development service. Consumers set `USE_RESEARCH_API_RAG=true`,
-`RESEARCH_API_URL`, `RESEARCH_API_TOKEN`, and bounded request, metadata, ingest,
-and response limits. `RESEARCH_API_TOTAL_TIMEOUT_SECONDS` bounds the entire
-streamed response, not only individual socket operations. Public remote API
-URLs must use HTTPS unless `RESEARCH_API_ALLOW_INSECURE_HTTP=true` is explicitly
-set for a trusted endpoint; private Docker service URLs may use HTTP. Leased
-workers use the same token to invalidate an entire opaque ingestion attempt when
-a remote request is cancelled or its outcome is uncertain; the API persists an
-attempt tombstone so an in-flight late commit cannot become retrievable.
-
-## Connect MCP clients
-
-The Compose endpoint uses Streamable HTTP at
-`http://127.0.0.1:8001/mcp`. If either authentication setting is non-empty,
-configure the client to send its assigned token on every MCP request:
-
-```text
-Authorization: Bearer YOUR_MCP_AUTH_TOKEN
-```
-
-For LibreChat, add a Streamable HTTP server to `librechat.yaml` (store the token
-through LibreChat's secret or environment interpolation facility in a real
-deployment):
-
-```yaml
-mcpServers:
-  research-mcp:
-    type: streamable-http
-    url: http://127.0.0.1:8001/mcp
-    timeout: 300000
-    requiresOAuth: false
-    headers:
-      Authorization: "Bearer YOUR_MCP_AUTH_TOKEN"
-```
-
-For an OpenWebUI release with native MCP support, add an external MCP server in
-its admin connections/tools UI, select **Streamable HTTP**, use the same URL,
-and add the same `Authorization` header. Some OpenWebUI releases expose only
-OpenAPI tool servers; those require an MCP-to-OpenAPI bridge such as `mcpo`.
-Keep that bridge private and configure the bearer header between it and this
-gateway.
-
-### Container-to-container clients
-
-When LibreChat or OpenWebUI runs in a container, `127.0.0.1` refers to that
-client container, not the Docker host. The optional
-`docker-compose.client-network.yml` override attaches only `mcp-gateway` to an
-existing external Docker network. Redis, Qdrant, workers, search, and browser
-services remain on the base stack's private networks.
-
-Set these values in `.env`:
-
-```dotenv
-COMPOSE_FILE=docker-compose.yml:docker-compose.client-network.yml
-COMPOSE_PATH_SEPARATOR=:
-MCP_CLIENT_NETWORK=the-existing-client-network
-MCP_CLIENT_ALIAS=research-mcp
-MCP_AUTH_TOKEN=a-long-random-secret
-```
-
-When the research model also runs on its dedicated external Docker network,
-retain both overrides by listing all three files in order:
-
-```dotenv
-COMPOSE_FILE=docker-compose.yml:docker-compose.client-network.yml:docker-compose.model-network.yml
-COMPOSE_PATH_SEPARATOR=:
-MCP_CLIENT_NETWORK=the-existing-client-network
-RESEARCH_MODEL_NETWORK=research-model
-```
-
-The equivalent commands without `COMPOSE_FILE` are:
-
-```console
-docker compose -f docker-compose.yml -f docker-compose.client-network.yml -f docker-compose.model-network.yml config --quiet
-docker compose -f docker-compose.yml -f docker-compose.client-network.yml -f docker-compose.model-network.yml up -d --build --wait
-```
-
-The named network must already exist and the MCP client must also join it. The
-alias must be unique on that network. Keep `MCP_BIND_ADDRESS=127.0.0.1` so the
-base deployment remains safe if the override is later removed. The override
-removes the host port publication and exposes the gateway only through its
-Docker network alias. `COMPOSE_FILE` makes every subsequent `docker compose`
-command retain both files, including profile and scaling commands.
-`COMPOSE_PATH_SEPARATOR` keeps that setting portable across host operating
-systems. Start the stack with:
-
-```console
 docker compose config --quiet
-docker compose up -d --build --wait
+docker compose up -d --build --remove-orphans --wait
+docker compose ps
 ```
 
-The override makes authentication mandatory and assigns unique backend aliases
-for gateway database connections. This prevents an unrelated `redis`, `qdrant`,
-or `reranker` on the shared client network from being selected by Docker DNS.
-It also removes every host port publication; only containers on the external
-client network can reach the gateway. Do not attach any other Research MCP
-service to that external network.
-
-Configure the client for Streamable HTTP at
-`http://research-mcp:8001/mcp`, or replace the hostname with the value of
-`MCP_CLIENT_ALIAS`. Plain HTTP is appropriate only for a trusted, same-host
-Docker network; use a TLS reverse proxy across hosts or untrusted networks.
-The default synchronous wait for `research_assistant` is 45 seconds. Ordinary
-assistant modes receive a 36-second worker budget measured from enqueue time,
-leaving delivery margin before clients cancel around 60 seconds. Slow
-acquisition paths are cancelled and completed evidence is retained; slow final
-synthesis falls back to a cited evidence digest. Explicit `deep` work may still
-return a durable running-job response.
-`MCP_CLIENT_TIMEOUT_SECONDS` (60 by default) and
-`MCP_SYNC_RESPONSE_SAFETY_SECONDS` (15 by default) enforce that bound. Set the
-client timeout to `0` only when every connected client supports longer calls.
-Clients that still have shorter limits should use the quick mode or lower
-`MCP_SYNC_RESPONSE_SAFETY_SECONDS`; clients that support durable continuation
-can select the `advanced` profile and use `start_research` followed by one
-bounded `research_job` call.
-
-LibreChat also blocks private MCP destinations by default. Allow the exact
-private socket rather than disabling SSRF protection:
-
-```yaml
-mcpSettings:
-  allowedAddresses:
-    - "research-mcp:8001"
-```
-
-LibreChat ignores `allowedAddresses` when `mcpSettings.allowedDomains` is also
-configured. In that case, make the equivalent narrow entry in the authoritative
-domain allowlist or remove that setting and use the exact address above.
-
-Without the override, the portable base deployment remains available at
-`http://127.0.0.1:8001/mcp` for host-local clients and reverse proxies. Remote
-clients should use a TLS reverse proxy instead of a shared Docker network. Leave
-`COMPOSE_FILE` and `COMPOSE_PATH_SEPARATOR` unset for that base deployment.
-
-## Optional profiles
-
-Crawl4AI is a fallback for difficult dynamic pages. The reranker can improve
-which discovery candidates are crawled before the expensive extraction stage.
-Both are optional because direct HTTP, Playwright, deterministic source scoring,
-and Qdrant ordering remain available. Neither optional service can create search
-results when SearXNG discovery itself is empty.
-
-The Crawl4AI image requires its separate `CRAWL4AI_API_TOKEN` in order to bind
-beyond its own loopback interface. Compose passes that token only to Crawl4AI
-and the isolated `web-runner`, which sends it as a bearer credential. Replace
-the placeholder in `.env` before enabling the profile on a VPS. Compose builds
-`CRAWL4AI_DERIVED_IMAGE` from the pinned upstream image and overlays only its
-localhost egress proxy. The proxy normalizes the requested hostname and sends it
-through `safe-egress`, where DNS resolution, public-address validation, and
-connection pinning occur; the Crawl4AI container remains on the internal-only
-browser network. Always include `--build` after changing the upstream image pin
-or overlay.
-
-```console
-# Start either profile
-docker compose --profile crawl4ai up -d --wait
-docker compose --profile reranker up -d --wait
-
-# Start both
-docker compose --profile crawl4ai --profile reranker up -d --wait
-```
-
-The reranker profile downloads `RERANKER_MODEL` on first start and can require
-several gigabytes of memory and disk. The default CPU image is amd64-only; leave
-this profile disabled on arm64 hosts unless you configure a compatible image or
-external reranking service. Before starting it, set
-`SEARCH_RERANKER_ENABLED=true` in `.env`; merely starting the profile does not
-activate pre-crawl candidate reranking. The call is capped by
-`SEARCH_RERANKER_TIMEOUT_SECONDS`, and failures fall back to deterministic
-ranking without failing research.
+You do not need to run `docker compose down` for a normal update. Existing Redis
+cache and reranker downloads remain in named volumes.
 
 ## Operations
 
-Inspect readiness and logs:
+Useful commands:
 
 ```console
 docker compose ps
-docker compose logs -f mcp-gateway research-worker persistence-worker searxng
+docker compose logs --tail=200 search-gateway searxng reranker
+docker compose logs --tail=200 crawl4ai web-runner safe-egress pdf-runner
+docker compose restart search-gateway
+docker compose down
+docker compose up -d --wait
 ```
 
-Scale acquisition and persistence independently. Add acquisition workers when
-search/crawl jobs queue, and persistence workers when embedding/indexing lags:
-
-```console
-docker compose up -d --scale research-worker=3
-docker compose up -d --scale persistence-worker=2
-```
-
-Each worker processes up to `RESEARCH_SOURCE_CONCURRENCY` sources concurrently.
-The default is `3`; valid values are `1` through `4`. It controls acquisition
-source concurrency; each persistence job indexes one source. Increase it only
-when the worker has enough CPU and memory for concurrent extraction.
-
-Open-web admission is enforced before a job reaches the queue. By default, one
-authenticated MCP client principal may have one distinct research job active
-and may admit two new research jobs per rolling 60-second window. Exact active
-duplicates coalesce before consuming this budget. These settings are controlled
-by `RESEARCH_ADMISSION_MAX_ACTIVE`, `RESEARCH_ADMISSION_MAX_NEW_JOBS`, and
-`RESEARCH_ADMISSION_WINDOW_SECONDS`; `0` disables the corresponding numeric
-limit. A single bearer token represents one client principal, so all LibreChat
-users configured through that token share its budget. Use separate entries in
-`MCP_AUTH_TOKENS_JSON` when independent client budgets are required.
-
-Within one admitted job, the first query for each planned intent runs with at
-most `SEARCH_QUERY_CONCURRENCY` queries in flight. Normal modes use at most one
-reserve query per unresolved intent; `deep` mode may use up to four. A reserve
-query runs only when the intent's earlier queries lack relevant, independent
-source coverage.
-Each query uses explicit staged SearXNG engine groups and stops only after
-`SEARCH_STAGE_MIN_RESULTS` includes the relevant fraction configured by
-`SEARCH_STAGE_MIN_RELEVANT_RATIO`. `SEARCH_RELEVANCE_MIN_SCORE` controls the
-bounded lexical relevance gate. For each unresolved intent whose discovered
-results are off-topic, the worker runs at most one shorter internal repair
-query, rejects remaining noise, and returns `completion.status=insufficient`
-with reason `low_topical_relevance` when no intent has usable evidence instead
-of asking the MCP client to retry. `SEARCH_MAX_ENGINE_STAGES` bounds normal
-modes; `SEARCH_DEEP_MAX_ENGINE_STAGES` permits broader durable research.
-Clearly English search queries use an English SearXNG language preference;
-explicit `language:xx` controls still win, while ambiguous and non-English
-queries retain automatic language selection.
-
-Workers cache exact normalized public-web discovery results in Redis for
-`SEARCH_CACHE_TTL_SECONDS`, scoped to the MCP client principal. Entries remain
-eligible for explicitly labeled stale fallback until
-`SEARCH_CACHE_STALE_TTL_SECONDS`, but only after a transient acquisition failure.
-Shared per-engine and SearXNG-service circuits suppress repeated calls while an
-upstream is rate-limited or failing. Redis cache/circuit operations use short
-timeouts and fail open to bounded local behavior.
-
-For ordinary static pages, direct extraction receives a short
-`DIRECT_FIRST_HEDGE_SECONDS` head start. Results must pass the conservative
-`DIRECT_FIRST_MIN_CONTENT_CHARS` quality gate; thin, blocked, or dynamic pages
-must also contain enough primary page content after navigation chrome is removed.
-Thin, blocked, boilerplate-only, or dynamic pages still escalate to Crawl4AI and
-the rendered-browser fallback. Research source fallbacks reuse their first crawl
-result instead of fetching the same URL twice.
-
-Workers share one serialized `web-runner`, so worker replicas do not increase
-rendered-browser concurrency. Scale only after budgeting `WORKER_MEMORY_LIMIT`
-and `WORKER_CPUS` for every replica; scaling the browser tier requires a separate
-socket/routing design rather than this command.
-
-Stop containers without deleting research state:
-
-```console
-docker compose --profile crawl4ai --profile reranker down
-```
-
-Include every optional profile that may have been started. Otherwise Compose can
-leave that profile's container running and fail to remove the shared project
-network.
-
-Deleting named volumes permanently removes queue state, vector memory, cached
-models, and artifacts:
-
-```console
-docker compose --profile crawl4ai --profile reranker down --volumes
-```
-
-## Configuration
-
-Compose reads `.env` automatically. `.env.example` documents image pins,
-gateway binding and synchronous wait timing, queue timing,
-embedding/vector settings, optional backends,
-GitHub/planner credentials, browser safety switches, and resource bounds.
-Important invariants:
-
-- `VECTOR_SIZE` must match the selected `EMBEDDING_MODEL`.
-- `RESEARCH_TIMEZONE` must be an IANA timezone name. Retrieval context always
-  preserves UTC timestamps and also reports the configured timezone, local
-  timestamp, and local calendar date for interpreting relative dates.
-- `MCP_BIND_ADDRESS` defaults to loopback. `MCP_AUTH_TOKEN` enables static bearer
-  authentication, but the application does not provide TLS. Require the token
-  and terminate TLS at a reverse proxy before publishing to an untrusted
-  network.
-- Redis uses `noeviction` so queued work is never silently evicted. Monitor its
-  volume and memory, especially with long result TTLs.
-- `RESEARCH_PERSISTENCE_QUEUE` must differ from `RESEARCH_QUEUE`. The supplied
-  `persistence-worker` consumes only the former. With
-  `RESEARCH_DEFER_PERSISTENCE=true`, current evidence returns before vector
-  indexing; `false` is a safe but slower synchronous compatibility mode.
-- SearXNG is the mandatory discovery layer. Its `keep_only` list intentionally
-  limits broad web, news, technical, and academic providers to reduce latency
-  and failure noise. Research requests select small explicit engine stages rather
-  than fanning out to every engine in a category. Inspect `search_stages`, cache,
-  and `unresponsive_engines` diagnostics before adding providers, and revalidate
-  names against the pinned image during upgrades.
-- Keep `RESEARCH_BROWSER_DISABLE_SANDBOX=false` and
-  `RESEARCH_BROWSER_IGNORE_HTTPS_ERRORS=false` unless a controlled environment
-  has a documented compatibility requirement.
-- `RESEARCH_BROWSER_SANDBOX_MODE=auto` first launches Chromium with its native
-  sandbox. Only a recognized host denial of Chromium's user namespace permits a
-  compatibility retry without that inner sandbox; the dedicated web runner
-  remains non-root, read-only, capability-free, seccomp-filtered,
-  resource-limited, isolated behind `safe-egress`, and subject to Docker's
-  AppArmor profile where AppArmor is available. Set the mode to `required` after
-  loading a host AppArmor policy that grants `userns`. `disabled` and the
-  legacy `RESEARCH_BROWSER_DISABLE_SANDBOX=true` switch are explicit emergency
-  overrides. Do not add `SYS_ADMIN` or change host-wide user-namespace policy.
-- Successful job artifacts are pruned after `ARTIFACT_RETENTION_SECONDS` by
-  default. Set it to `0` only when another process owns artifact lifecycle, and
-  keep the Redis result TTL at least as long as artifact retention.
-- Treat `.env` as a secret when it contains `MCP_AUTH_TOKEN`, `GITHUB_TOKEN`,
-  `PLANNER_API_KEY`, or `RESEARCH_MODEL_API_KEY`; it is excluded from the
-  container build context.
-- Image defaults are exact tags. For a controlled production rollout, mirror
-  them and optionally replace tags with digest-pinned image references.
-- The supplied Crawl4AI profile is deliberately inside the browser sandbox. An
-  external Crawl4AI deployment requires an equivalent public-only egress and
-  authentication design. The reranker URL may point to an external service.
-- `SAFE_EGRESS_ALLOWED_PORTS` applies to both direct fetches and browser traffic.
-  Keep it limited to required web ports. Use `SAFE_EGRESS_DENY_CIDRS` to block
-  otherwise-public addresses owned by this VPS, its provider control plane, or
-  other administrative networks that web research must never contact.
+`docker compose down` preserves named volumes. `docker compose down -v` deletes
+the cache and downloaded reranker model and should be used only for a deliberate
+full reset.
 
 ## Limitations
 
-- Static token policies are not a replacement for TLS or a full identity
-  provider. Multi-token policies do enforce namespace, job-owner, artifact, and
-  GitHub-repository boundaries; the legacy single token can also restrict its
-  allowed namespaces. A wildcard namespace policy intentionally grants access
-  to every namespace.
-- URL investigation accepts only public `http` and `https` targets. Loopback,
-  private, link-local, metadata-service, credential-bearing, and non-HTTP URLs
-  are rejected, including hostnames with any non-public DNS answer. This
-  intentionally prevents intranet and local-development URL research.
-- Extraction is heuristic. Authentication walls, CAPTCHAs, paywalls, unusual
-  shadow-DOM or iframe interactions, and aggressive anti-automation can leave
-  evidence incomplete. The system does not bypass access controls.
-- Chromium work is serialized in the shared isolated `web-runner` and is
-  memory-heavy. Additional workers improve non-browser throughput but do not
-  multiply browser capacity in the supplied topology.
-- Durable cancellation is cooperative. Redis job metadata and artifact files
-  have independent expiry, and deleting the named volumes is irreversible.
-- GitHub access is read-only and subject to GitHub API permissions and rate
-  limits. Recursive trees and large files can be truncated; it does not clone a
-  repository or expose arbitrary Git history.
-- Planner synthesis is disabled unless an OpenAI-compatible planner endpoint,
-  model, credentials, and `PLANNER_ENABLE_SYNTHESIS=true` are configured.
-
-## Native Python dependencies
-
-The container installs the repository's `requirements.txt`. The queued
-gateway/worker implementation also requires the Redis Python client declared by
-that file. Playwright's Chromium and operating-system libraries are installed
-in the runtime image. SearXNG, Qdrant, Crawl4AI, and the reranker are network
-services, not Python packages embedded in the application container.
+This can approach hosted search tools for documentation, troubleshooting,
+product settings, games, current information, and general research, but it
+cannot guarantee the same coverage as commercial providers. Keyless engines may
+rate-limit datacenter IPs, some sites block all automated browsers, and no
+single VPS has the proprietary search indexes used by Google, Brave, or paid
+answer engines. The gateway compensates with multiple discovery providers,
+concurrent extraction, local reranking, bounded browser fallbacks, caching, and
+honest partial results rather than inventing an answer.

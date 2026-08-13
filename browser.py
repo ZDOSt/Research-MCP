@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 import httpx
 from playwright.async_api import async_playwright
 
-from crawler import BROWSER_HEADERS, validate_proxy_url_safety
+from gateway_fetch import BROWSER_HEADERS, validate_proxy_url_safety
 from extractors import extract_table_like_rows, html_to_text, parse_maybe_json_text, unique_preserve_order
 from redaction import redact_sensitive_text
 

@@ -24,11 +24,9 @@ from browser import (
     playwright_explore_page_local,
     set_resolved_chromium_sandbox,
 )
-from crawler import (
-    CRAWL4AI_MAX_RESPONSE_BYTES,
-    CRAWL4AI_TOTAL_TIMEOUT_SECONDS,
+from gateway_fetch import (
     UnsafeURLError,
-    _read_limited_response,
+    _read_limited as _read_limited_response,
     validate_proxy_url_safety,
 )
 from redaction import redact_sensitive_text
@@ -42,6 +40,12 @@ WEB_RUNNER_MAX_REQUEST_BYTES = max(
 WEB_RUNNER_PROXY_URL = os.getenv("RESEARCH_BROWSER_PROXY", "").strip()
 WEB_RUNNER_CRAWL4AI_URL = os.getenv("CRAWL4AI_URL", "http://crawl4ai:11235").rstrip("/")
 WEB_RUNNER_CRAWL4AI_API_TOKEN = os.getenv("CRAWL4AI_API_TOKEN", "").strip()
+CRAWL4AI_MAX_RESPONSE_BYTES = max(
+    1024, int(os.getenv("CRAWL4AI_MAX_RESPONSE_BYTES", str(8 * 1024 * 1024)))
+)
+CRAWL4AI_TOTAL_TIMEOUT_SECONDS = max(
+    1.0, float(os.getenv("CRAWL4AI_TOTAL_TIMEOUT_SECONDS", "30"))
+)
 
 
 def _env_flag(name: str) -> bool:
@@ -133,7 +137,7 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(
-    title="Research MCP isolated web runner",
+    title="Private Search Gateway isolated web runner",
     docs_url=None,
     redoc_url=None,
     openapi_url=None,
@@ -312,7 +316,9 @@ def _prepare_socket_path() -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Research MCP isolated web runner")
+    parser = argparse.ArgumentParser(
+        description="Private Search Gateway isolated web runner"
+    )
     parser.add_argument("--healthcheck", action="store_true")
     args = parser.parse_args()
     logging.basicConfig(
