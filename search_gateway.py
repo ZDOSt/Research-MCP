@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -13,13 +14,14 @@ from collections import OrderedDict
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from typing import Any, Literal
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
-from fastapi import FastAPI, HTTPException, Query, Request, Response
+from fastapi import FastAPI, HTTPException, Query, Response
 from pydantic import BaseModel, ConfigDict, Field
 
 from gateway_fetch import fetch_page
+from request_limits import RequestBodyLimitMiddleware
 
 
 LOGGER = logging.getLogger("search-gateway")
@@ -55,12 +57,25 @@ RERANKER_MAX_RESPONSE_BYTES = max(
 )
 MAX_REQUEST_BYTES = max(4096, int(os.getenv("GATEWAY_MAX_REQUEST_BYTES", "65536")))
 QUERY_MAX_CHARS = max(256, int(os.getenv("GATEWAY_QUERY_MAX_CHARS", "4000")))
+MAX_CONCURRENT_REQUESTS = max(
+    1, int(os.getenv("GATEWAY_MAX_CONCURRENT_REQUESTS", "4"))
+)
+ADMISSION_TIMEOUT_SECONDS = max(
+    0.05, float(os.getenv("GATEWAY_ADMISSION_TIMEOUT_SECONDS", "2"))
+)
+FINALIZATION_RESERVE_SECONDS = max(
+    0.25, float(os.getenv("GATEWAY_FINALIZATION_RESERVE_SECONDS", "3"))
+)
+CANDIDATE_RERANKER_TIMEOUT_SECONDS = max(
+    0.25, float(os.getenv("GATEWAY_CANDIDATE_RERANKER_TIMEOUT_SECONDS", "2"))
+)
 
 
 _CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
 _CACHE_LOCK = asyncio.Lock()
 _QUERY_LOCKS: dict[str, asyncio.Lock] = {}
 _QUERY_LOCK_USERS: dict[str, int] = {}
+_ADMISSION = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
 _REDIS = None
 
 
@@ -93,10 +108,12 @@ STOP_WORDS = frozenset(
     "is it me my of on or please search should tell that the this to what when where which who "
     "why with would you your".split()
 )
-SOURCE_BOOSTS = {
-    "docs.": 1.2,
-    "developer.": 1.0,
-    "support.": 0.9,
+SOURCE_LABEL_BOOSTS = {
+    "docs": 1.2,
+    "developer": 1.0,
+    "support": 0.9,
+}
+SOURCE_DOMAIN_BOOSTS = {
     "github.com": 0.9,
     "stackoverflow.com": 0.65,
     "serverfault.com": 0.65,
@@ -121,6 +138,10 @@ class SearchRequest(BaseModel):
     language: str = Field(default="auto", min_length=1, max_length=32)
     time_range: Literal["day", "week", "month", "year"] | None = None
     categories: list[str] = Field(default_factory=list, max_length=8)
+
+
+class GatewayBusyError(RuntimeError):
+    """Raised when all expensive retrieval slots remain occupied."""
 
 
 @dataclass(frozen=True)
@@ -205,14 +226,45 @@ def _domain(url: str) -> str:
 
 
 def _root_domain(domain: str) -> str:
-    parts = domain.split(".")
-    return ".".join(parts[-2:]) if len(parts) >= 2 else domain
+    parts = [part for part in domain.rstrip(".").split(".") if part]
+    if len(parts) < 2:
+        return domain
+    common_second_level = {"ac", "co", "com", "edu", "gov", "net", "org"}
+    if len(parts) >= 3 and len(parts[-1]) == 2 and parts[-2] in common_second_level:
+        return ".".join(parts[-3:])
+    return ".".join(parts[-2:])
+
+
+def _canonical_url(value: object) -> str | None:
+    url = str(value or "").strip()
+    if not url or len(url) > 8192:
+        return None
+    try:
+        parsed = urlsplit(url)
+        scheme = parsed.scheme.lower()
+        host = (parsed.hostname or "").rstrip(".").lower()
+        port = parsed.port
+    except (UnicodeError, ValueError):
+        return None
+    if scheme not in {"http", "https"} or not host or parsed.username or parsed.password:
+        return None
+    try:
+        host = host.encode("idna").decode("ascii")
+    except UnicodeError:
+        return None
+    display_host = f"[{host}]" if ":" in host else host
+    if port is not None and not (
+        (scheme == "http" and port == 80) or (scheme == "https" and port == 443)
+    ):
+        display_host = f"{display_host}:{port}"
+    return urlunsplit((scheme, display_host, parsed.path or "/", parsed.query, ""))
 
 
 def _source_adjustment(domain: str) -> float:
-    adjustment = 0.0
-    for candidate, value in SOURCE_BOOSTS.items():
-        if domain == candidate or candidate in domain:
+    first_label = domain.split(".", 1)[0]
+    adjustment = SOURCE_LABEL_BOOSTS.get(first_label, 0.0)
+    for candidate, value in SOURCE_DOMAIN_BOOSTS.items():
+        if domain == candidate or domain.endswith("." + candidate):
             adjustment += value
     for candidate, value in SOURCE_PENALTIES.items():
         if domain == candidate or domain.endswith("." + candidate):
@@ -242,9 +294,9 @@ def _candidate_score(query: str, item: dict[str, Any], rank: int) -> float:
 
 
 def _normalize_search_result(item: dict[str, Any], query: str, rank: int) -> dict[str, Any] | None:
-    url = str(item.get("url") or "").strip()
+    url = _canonical_url(item.get("url"))
     title = re.sub(r"\s+", " ", str(item.get("title") or "")).strip()
-    if not url or not title or urlsplit(url).scheme not in {"http", "https"}:
+    if not url or not title:
         return None
     domain = _domain(url)
     if not domain or any(
@@ -256,7 +308,7 @@ def _normalize_search_result(item: dict[str, Any], query: str, rank: int) -> dic
     snippet = re.sub(r"\s+", " ", str(item.get("content") or "")).strip()
     return {
         "title": title[:500],
-        "url": url[:8192],
+        "url": url,
         "domain": domain,
         "snippet": snippet[:1500],
         "search_rank": rank,
@@ -412,8 +464,11 @@ async def _rerank(
             index = row["index"]
             if not 0 <= index < len(documents) or index in scored_indices:
                 continue
+            score = float(row.get("score") or 0.0)
+            if not math.isfinite(score):
+                continue
             item = dict(documents[index])
-            item["rerank_score"] = float(row.get("score") or 0.0)
+            item["rerank_score"] = score
             scored.append(item)
             scored_indices.add(index)
         if not scored:
@@ -431,13 +486,34 @@ async def _rerank(
         return [*scored, *unscored][:top_k], status
     except Exception as exc:
         LOGGER.warning("Reranker unavailable; using lexical fallback: %s", type(exc).__name__)
-        fallback = []
-        for document in documents:
-            item = dict(document)
-            item["rerank_score"] = _lexical_score(query, item["text"])
-            fallback.append(item)
-        fallback.sort(key=lambda item: item["rerank_score"], reverse=True)
-        return fallback[:top_k], f"fallback:{type(exc).__name__}"
+        return _lexical_rerank(query, documents, top_k), f"fallback:{type(exc).__name__}"
+
+
+def _lexical_rerank(
+    query: str, documents: list[dict[str, Any]], top_k: int
+) -> list[dict[str, Any]]:
+    fallback = []
+    for document in documents:
+        item = dict(document)
+        item["rerank_score"] = _lexical_score(query, item["text"])
+        fallback.append(item)
+    fallback.sort(key=lambda item: item["rerank_score"], reverse=True)
+    return fallback[:top_k]
+
+
+async def _rerank_bounded(
+    query: str,
+    documents: list[dict[str, Any]],
+    top_k: int,
+    timeout_seconds: float,
+) -> tuple[list[dict[str, Any]], str]:
+    if timeout_seconds <= 0:
+        return _lexical_rerank(query, documents, top_k), "fallback:deadline"
+    try:
+        async with asyncio.timeout(timeout_seconds):
+            return await _rerank(query, documents, top_k)
+    except TimeoutError:
+        return _lexical_rerank(query, documents, top_k), "fallback:deadline"
 
 
 async def _crawl_candidates(
@@ -463,12 +539,36 @@ async def _crawl_candidates(
             except Exception as exc:
                 return candidate, {"error": type(exc).__name__}
 
-    pairs = await asyncio.gather(
-        *(one(index, candidate) for index, candidate in enumerate(candidates))
-    )
+    tasks = {
+        asyncio.create_task(one(index, candidate)): (index, candidate)
+        for index, candidate in enumerate(candidates)
+    }
+    if not tasks:
+        return [], []
+    done: set[asyncio.Task] = set()
+    pending: set[asyncio.Task] = set(tasks)
+    try:
+        done, pending = await asyncio.wait(
+            tasks, timeout=max(0.0, deadline - time.monotonic())
+        )
+    finally:
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    pairs = [
+        (tasks[task][0], *task.result())
+        for task in done
+        if not task.cancelled()
+    ]
+    pairs.sort(key=lambda pair: pair[0])
     pages: list[dict[str, Any]] = []
-    failures: list[dict[str, Any]] = []
-    for candidate, page in pairs:
+    failures: list[dict[str, Any]] = [
+        {"url": tasks[task][1]["url"], "error": "deadline"}
+        for task in pending
+    ]
+    for _, candidate, page in pairs:
         if page is None or page.get("error"):
             failures.append({"url": candidate["url"], "error": (page or {}).get("error", "deadline")})
             continue
@@ -497,14 +597,23 @@ async def _follow_relevant_links(
     if limit <= 0:
         return [], []
     candidates: list[tuple[float, dict[str, Any]]] = []
-    visited = {str(page.get("url") or "") for page in pages}
+    visited = {
+        canonical
+        for page in pages
+        if (canonical := _canonical_url(page.get("url"))) is not None
+    }
     for page in pages:
         for link in page.get("links") or []:
-            url = str(link.get("url") or "")
+            url = _canonical_url(link.get("url"))
             if not url or url in visited:
                 continue
-            score = _follow_link_score(query, str(page.get("url") or ""), link)
+            normalized_link = dict(link)
+            normalized_link["url"] = url
+            score = _follow_link_score(
+                query, str(page.get("url") or ""), normalized_link
+            )
             if score > 0.35:
+                visited.add(url)
                 candidates.append(
                     (
                         score,
@@ -679,124 +788,156 @@ async def research(request: SearchRequest) -> dict[str, Any]:
                 result["cache"] = "fresh-coalesced"
                 return result
 
-            started = time.monotonic()
-            mode = _mode_for(request.query, request.mode)
-            budget = MODE_BUDGETS[mode]
-            deadline = started + budget.total_seconds
-            diagnostics: dict[str, Any] = {"mode": mode, "partial": False}
-            candidates: list[dict[str, Any]] = []
+            acquired = False
             try:
-                async with asyncio.timeout(budget.total_seconds):
-                    candidates, search_diagnostics = await _searx_search(
-                        request.query,
-                        mode=mode,
-                        max_results=min(MAX_SEARCH_RESULTS, budget.search_results),
-                        language=request.language,
-                        time_range=request.time_range,
-                        categories=request.categories,
-                    )
-                    diagnostics["searches"] = search_diagnostics
-                    if not candidates:
-                        raise RuntimeError("SearXNG returned no usable candidates")
+                await asyncio.wait_for(
+                    _ADMISSION.acquire(), ADMISSION_TIMEOUT_SECONDS
+                )
+                acquired = True
+            except TimeoutError as exc:
+                raise GatewayBusyError("Search gateway is at capacity") from exc
 
-                    candidate_documents = [
-                        {
-                            "text": f"{item['title']}\n{item['snippet']}",
-                            "candidate_index": index,
-                        }
-                        for index, item in enumerate(candidates)
-                    ]
-                    ranked_candidates, candidate_reranker = await _rerank(
-                        request.query,
-                        candidate_documents,
-                        min(MAX_CRAWL_PAGES, budget.crawl_pages),
-                    )
-                    diagnostics["candidate_reranker"] = candidate_reranker
-                    selected = [
-                        candidates[int(item["candidate_index"])]
-                        for item in ranked_candidates
-                        if 0
-                        <= int(item.get("candidate_index", -1))
-                        < len(candidates)
-                    ]
-                    pages, failures = await _crawl_candidates(
-                        selected, request.query, deadline
-                    )
-                    diagnostics["crawl_failures"] = failures
-                    follow_limit = min(MAX_FOLLOW_LINKS, budget.follow_links)
-                    if pages and follow_limit and deadline - time.monotonic() > 5:
-                        followed, follow_failures = await _follow_relevant_links(
-                            pages, request.query, follow_limit, deadline
+            try:
+                started = time.monotonic()
+                mode = _mode_for(request.query, request.mode)
+                budget = MODE_BUDGETS[mode]
+                deadline = started + budget.total_seconds
+                diagnostics: dict[str, Any] = {"mode": mode, "partial": False}
+                candidates: list[dict[str, Any]] = []
+                pages: list[dict[str, Any]] = []
+                results: list[dict[str, Any]] = []
+                try:
+                    async with asyncio.timeout(budget.total_seconds):
+                        candidates, search_diagnostics = await _searx_search(
+                            request.query,
+                            mode=mode,
+                            max_results=min(MAX_SEARCH_RESULTS, budget.search_results),
+                            language=request.language,
+                            time_range=request.time_range,
+                            categories=request.categories,
                         )
-                        pages.extend(followed)
-                        diagnostics["follow_failures"] = follow_failures
+                        diagnostics["searches"] = search_diagnostics
+                        if not candidates:
+                            raise RuntimeError("SearXNG returned no usable candidates")
 
+                        candidate_documents = [
+                            {
+                                "text": f"{item['title']}\n{item['snippet']}",
+                                "candidate_index": index,
+                            }
+                            for index, item in enumerate(candidates)
+                        ]
+                        crawl_deadline = deadline - FINALIZATION_RESERVE_SECONDS
+                        candidate_rerank_timeout = min(
+                            CANDIDATE_RERANKER_TIMEOUT_SECONDS,
+                            max(0.0, crawl_deadline - time.monotonic() - 1.0),
+                        )
+                        ranked_candidates, candidate_reranker = await _rerank_bounded(
+                            request.query,
+                            candidate_documents,
+                            min(MAX_CRAWL_PAGES, budget.crawl_pages),
+                            candidate_rerank_timeout,
+                        )
+                        diagnostics["candidate_reranker"] = candidate_reranker
+                        selected = [
+                            candidates[int(item["candidate_index"])]
+                            for item in ranked_candidates
+                            if 0
+                            <= int(item.get("candidate_index", -1))
+                            < len(candidates)
+                        ]
+                        pages, failures = await _crawl_candidates(
+                            selected, request.query, crawl_deadline
+                        )
+                        diagnostics["crawl_failures"] = failures
+                        follow_limit = min(MAX_FOLLOW_LINKS, budget.follow_links)
+                        if pages and follow_limit and crawl_deadline - time.monotonic() > 2:
+                            followed, follow_failures = await _follow_relevant_links(
+                                pages, request.query, follow_limit, crawl_deadline
+                            )
+                            pages.extend(followed)
+                            diagnostics["follow_failures"] = follow_failures
+
+                        documents = _passage_documents(pages, request.query)
+                        if documents:
+                            ranked, reranker_status = await _rerank_bounded(
+                                request.query,
+                                documents,
+                                max(20, request.max_results * 5),
+                                max(0.0, deadline - time.monotonic()),
+                            )
+                        else:
+                            ranked, reranker_status = [], "empty"
+                        diagnostics["reranker"] = reranker_status
+                        results = _assemble_results(
+                            pages,
+                            ranked,
+                            min(request.max_results, budget.final_results),
+                        )
+                except TimeoutError:
+                    diagnostics["partial"] = True
+                    diagnostics["deadline_exceeded"] = True
                     documents = _passage_documents(pages, request.query)
                     if documents:
-                        ranked, reranker_status = await _rerank(
-                            request.query,
-                            documents,
-                            max(20, request.max_results * 5),
+                        ranked = _lexical_rerank(
+                            request.query, documents, max(20, request.max_results * 5)
                         )
-                    else:
-                        ranked, reranker_status = [], "empty"
-                    diagnostics["reranker"] = reranker_status
-                    results = _assemble_results(
-                        pages,
-                        ranked,
-                        min(request.max_results, budget.final_results),
-                    )
-            except TimeoutError:
-                diagnostics["partial"] = True
-                diagnostics["deadline_exceeded"] = True
-                results = []
+                        diagnostics["reranker"] = "fallback:deadline"
+                        results = _assemble_results(
+                            pages,
+                            ranked,
+                            min(request.max_results, budget.final_results),
+                        )
 
-            if len(results) < min(request.max_results, budget.final_results):
-                existing_urls = {str(item.get("url") or "") for item in results}
-                snippets = [
-                    {
-                        "title": item["title"],
-                        "url": item["url"],
-                        "content": item["snippet"],
-                        "snippet": item["snippet"],
-                        "engine": "search-gateway-snippet-fallback",
-                        "engines": item["engines"],
-                        "score": item["discovery_score"],
-                        "publishedDate": item["published_at"],
-                        "img_src": item.get("image_url"),
-                        "thumbnail_src": item.get("thumbnail_url"),
-                    }
-                    for item in candidates
-                    if item.get("snippet") and item["url"] not in existing_urls
-                ]
-                needed = min(request.max_results, budget.final_results) - len(results)
-                if snippets:
-                    results.extend(snippets[:needed])
-                    diagnostics["partial"] = True
-                    diagnostics["fallback"] = "search-snippets"
+                if len(results) < min(request.max_results, budget.final_results):
+                    existing_urls = {str(item.get("url") or "") for item in results}
+                    snippets = [
+                        {
+                            "title": item["title"],
+                            "url": item["url"],
+                            "content": item["snippet"],
+                            "snippet": item["snippet"],
+                            "engine": "search-gateway-snippet-fallback",
+                            "engines": item["engines"],
+                            "score": item["discovery_score"],
+                            "publishedDate": item["published_at"],
+                            "img_src": item.get("image_url"),
+                            "thumbnail_src": item.get("thumbnail_url"),
+                        }
+                        for item in candidates
+                        if item.get("snippet") and item["url"] not in existing_urls
+                    ]
+                    needed = min(request.max_results, budget.final_results) - len(results)
+                    if snippets:
+                        results.extend(snippets[:needed])
+                        diagnostics["partial"] = True
+                        diagnostics["fallback"] = "search-snippets"
 
-            if not results:
-                raise RuntimeError("Search produced no usable evidence")
+                if not results:
+                    raise RuntimeError("Search produced no usable evidence")
 
-            result = {
-                "query": request.query,
-                "number_of_results": len(results),
-                "results": results,
-                "suggestions": [],
-                "answers": [],
-                "corrections": [],
-                "infoboxes": [],
-                "unresponsive_engines": [
-                    item
-                    for search in diagnostics.get("searches", [])
-                    for item in search.get("unresponsive_engines", [])
-                ],
-                "diagnostics": diagnostics,
-                "duration_seconds": round(time.monotonic() - started, 3),
-                "cache": "miss",
-            }
-            await _cache_set(key, result)
-            return result
+                result = {
+                    "query": request.query,
+                    "number_of_results": len(results),
+                    "results": results,
+                    "suggestions": [],
+                    "answers": [],
+                    "corrections": [],
+                    "infoboxes": [],
+                    "unresponsive_engines": [
+                        item
+                        for search in diagnostics.get("searches", [])
+                        for item in search.get("unresponsive_engines", [])
+                    ],
+                    "diagnostics": diagnostics,
+                    "duration_seconds": round(time.monotonic() - started, 3),
+                    "cache": "miss",
+                }
+                await _cache_set(key, result)
+                return result
+            finally:
+                if acquired:
+                    _ADMISSION.release()
 
     except Exception as exc:
         if cached and cached.get("result"):
@@ -835,17 +976,7 @@ app = FastAPI(
 )
 
 
-@app.middleware("http")
-async def request_limits(request: Request, call_next):
-    declared = request.headers.get("content-length")
-    if declared:
-        try:
-            declared_size = int(declared)
-            if declared_size < 0 or declared_size > MAX_REQUEST_BYTES:
-                return Response(status_code=413)
-        except ValueError:
-            return Response(status_code=400)
-    return await call_next(request)
+app.add_middleware(RequestBodyLimitMiddleware, max_bytes=MAX_REQUEST_BYTES)
 
 
 @app.get("/healthz")
@@ -893,6 +1024,12 @@ async def searx_compatible_search(
         )
     except TimeoutError as exc:
         raise HTTPException(status_code=504, detail="Search gateway deadline exceeded") from exc
+    except GatewayBusyError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Search gateway is busy",
+            headers={"Retry-After": "1"},
+        ) from exc
     except Exception as exc:
         LOGGER.warning("Search request failed: %s", type(exc).__name__)
         raise HTTPException(status_code=502, detail="Search retrieval failed") from exc
@@ -904,6 +1041,12 @@ async def rich_research(request: SearchRequest) -> dict[str, Any]:
         return await research(request)
     except TimeoutError as exc:
         raise HTTPException(status_code=504, detail="Search gateway deadline exceeded") from exc
+    except GatewayBusyError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Search gateway is busy",
+            headers={"Retry-After": "1"},
+        ) from exc
     except Exception as exc:
         LOGGER.warning("Research request failed: %s", type(exc).__name__)
         raise HTTPException(status_code=502, detail="Research retrieval failed") from exc

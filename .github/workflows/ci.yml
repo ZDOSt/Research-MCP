@@ -41,15 +41,19 @@ jobs:
             echo "::error title=Pytest failure::$message"
           fi
           exit "$status"
-      - run: docker compose config --quiet
-      - name: Validate read-only SearXNG config mount
+      - name: Validate Compose configuration
         env:
-          SEARXNG_IMAGE: alpine:3.21
+          SEARXNG_SECRET: ci-only-searxng-secret
+          CRAWL4AI_API_TOKEN: ci-only-crawl4ai-token
+        run: docker compose config --quiet
+      - name: Validate real SearXNG startup with read-only config
+        env:
           SEARXNG_SECRET: ci-only-searxng-secret
           CRAWL4AI_API_TOKEN: ci-only-crawl4ai-token
         run: |
-          docker compose create --no-build --no-deps searxng
-          docker compose rm --force --stop searxng
+          docker compose up -d --no-deps --wait searxng
+          docker compose exec -T searxng wget -qO- http://127.0.0.1:8080/ >/dev/null
+          docker compose down --volumes
       - name: Validate zero-port shared-network deployment
         env:
           CLIENT_DOCKER_NETWORK: ci-client-network

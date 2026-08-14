@@ -1,4 +1,5 @@
 import asyncio
+import math
 
 import httpx
 import pytest
@@ -59,6 +60,24 @@ def test_candidate_scoring_prefers_relevant_official_sources():
     )
 
 
+def test_url_canonicalization_and_source_matching_are_strict():
+    normalized = search_gateway._normalize_search_result(
+        {
+            "title": "Guide",
+            "url": "HTTPS://Example.COM:443/guide#section",
+            "content": "Useful guide",
+        },
+        "guide",
+        1,
+    )
+    assert normalized is not None
+    assert normalized["url"] == "https://example.com/guide"
+    assert search_gateway._canonical_url("https://example.com/" + "a" * 8192) is None
+    assert search_gateway._source_adjustment("notdocs.example.com") == 0.0
+    assert search_gateway._source_adjustment("docs.example.com") > 0.0
+    assert search_gateway._root_domain("docs.example.co.uk") == "example.co.uk"
+
+
 @pytest.mark.asyncio
 async def test_reranker_falls_back_to_lexical_order(monkeypatch):
     class FailingClient:
@@ -111,6 +130,95 @@ async def test_reranker_preserves_unscored_documents(monkeypatch):
     ranked, status = await search_gateway._rerank("answer", docs, 2)
     assert status == "partial"
     assert {item["candidate_index"] for item in ranked} == {0, 1}
+
+
+@pytest.mark.asyncio
+async def test_reranker_rejects_non_finite_scores(monkeypatch):
+    response = httpx.Response(
+        200,
+        content=b'[{"index":0,"score":NaN},{"index":1,"score":0.5}]',
+        headers={"content-type": "application/json"},
+        request=httpx.Request("POST", "http://reranker/rerank"),
+    )
+
+    class Stream:
+        async def __aenter__(self):
+            return response
+
+        async def __aexit__(self, *args):
+            return False
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        def stream(self, *args, **kwargs):
+            return Stream()
+
+    monkeypatch.setattr(search_gateway.httpx, "AsyncClient", lambda **kwargs: Client())
+    docs = [
+        {"text": "first answer", "candidate_index": 0},
+        {"text": "second answer", "candidate_index": 1},
+    ]
+    ranked, status = await search_gateway._rerank("answer", docs, 2)
+    assert status == "partial"
+    assert all(math.isfinite(item["rerank_score"]) for item in ranked)
+
+
+@pytest.mark.asyncio
+async def test_crawl_deadline_keeps_completed_pages(monkeypatch):
+    candidates = [
+        {"title": "Fast", "url": "https://fast.example/"},
+        {"title": "Slow", "url": "https://slow.example/"},
+    ]
+
+    async def fetch(url, *args, **kwargs):
+        if "slow" in url:
+            await asyncio.sleep(2)
+        return {"url": url, "content": "evidence", "links": []}
+
+    monkeypatch.setattr(search_gateway, "fetch_page", fetch)
+    pages, failures = await search_gateway._crawl_candidates(
+        candidates, "evidence", search_gateway.time.monotonic() + 1.05
+    )
+    assert [page["url"] for page in pages] == ["https://fast.example/"]
+    assert failures == [{"url": "https://slow.example/", "error": "deadline"}]
+
+
+@pytest.mark.asyncio
+async def test_follow_links_canonicalizes_and_deduplicates_fragments(monkeypatch):
+    captured = []
+
+    async def crawl(candidates, query, deadline):
+        captured.extend(candidates)
+        return [], []
+
+    pages = [
+        {
+            "url": "https://docs.example.co.uk/start",
+            "title": "Start",
+            "links": [
+                {
+                    "url": "https://docs.example.co.uk:443/install#one",
+                    "anchor": "Install guide",
+                },
+                {
+                    "url": "https://docs.example.co.uk/install#two",
+                    "anchor": "Install guide duplicate",
+                },
+            ],
+        }
+    ]
+    monkeypatch.setattr(search_gateway, "_crawl_candidates", crawl)
+    await search_gateway._follow_relevant_links(
+        pages, "install guide", 5, search_gateway.time.monotonic() + 10
+    )
+    assert [item["url"] for item in captured] == [
+        "https://docs.example.co.uk/install"
+    ]
 
 
 def test_assemble_results_diversifies_domains_before_duplicates():
@@ -406,7 +514,79 @@ async def test_total_deadline_returns_discovered_snippet(monkeypatch):
         search_gateway.SearchRequest(query="deadline", mode="quick")
     )
     assert result["results"][0]["content"].startswith("Useful evidence")
-    assert result["diagnostics"]["deadline_exceeded"] is True
+    assert result["diagnostics"]["partial"] is True
+
+
+@pytest.mark.asyncio
+async def test_final_rerank_timeout_keeps_crawled_evidence(monkeypatch):
+    search_gateway._CACHE.clear()
+    search_gateway._QUERY_LOCKS.clear()
+    search_gateway._QUERY_LOCK_USERS.clear()
+
+    async def no_cache(_):
+        return None
+
+    async def ignore_cache(*_):
+        return None
+
+    async def search(*args, **kwargs):
+        return (
+            [
+                {
+                    "title": "Crawled guide",
+                    "url": "https://example.com/guide",
+                    "domain": "example.com",
+                    "snippet": "short search snippet",
+                    "search_rank": 1,
+                    "discovery_score": 1.0,
+                    "published_at": None,
+                    "engines": ["bing"],
+                }
+            ],
+            [],
+        )
+
+    async def rerank(query, docs, top_k):
+        if docs and "page_index" in docs[0]:
+            await asyncio.sleep(1)
+            return [], "late"
+        return [dict(docs[0], rerank_score=1.0)], "ok"
+
+    async def crawl(candidates, query, deadline):
+        return (
+            [
+                {
+                    "url": candidates[0]["url"],
+                    "title": candidates[0]["title"],
+                    "content": "Detailed crawled installation evidence. " * 20,
+                    "content_chars": 800,
+                    "links": [],
+                    "extraction_method": "direct",
+                    "search": candidates[0],
+                }
+            ],
+            [],
+        )
+
+    monkeypatch.setattr(search_gateway, "_cache_get", no_cache)
+    monkeypatch.setattr(search_gateway, "_cache_set", ignore_cache)
+    monkeypatch.setattr(search_gateway, "_searx_search", search)
+    monkeypatch.setattr(search_gateway, "_rerank", rerank)
+    monkeypatch.setattr(search_gateway, "_crawl_candidates", crawl)
+    monkeypatch.setitem(
+        search_gateway.MODE_BUDGETS,
+        "quick",
+        search_gateway.Budget(4, 1, 0, 2, 0.05),
+    )
+    monkeypatch.setattr(search_gateway, "FINALIZATION_RESERVE_SECONDS", 0.01)
+    monkeypatch.setattr(search_gateway, "CANDIDATE_RERANKER_TIMEOUT_SECONDS", 0.01)
+
+    result = await search_gateway.research(
+        search_gateway.SearchRequest(query="installation evidence", mode="quick")
+    )
+    assert result["results"][0]["engine"] == "search-gateway"
+    assert "Detailed crawled installation evidence" in result["results"][0]["content"]
+    assert result["diagnostics"]["reranker"] == "fallback:deadline"
 
 
 @pytest.mark.asyncio

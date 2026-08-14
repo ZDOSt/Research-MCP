@@ -68,10 +68,13 @@ async def parse_pdf(body: bytes) -> dict[str, object]:
     try:
         async with asyncio.timeout(PDF_TIMEOUT_SECONDS):
             stdout, _ = await process.communicate(body)
-    except TimeoutError:
+    except (TimeoutError, asyncio.CancelledError) as exc:
         if process.returncode is None:
-            process.kill()
+            with suppress(ProcessLookupError):
+                process.kill()
         await process.wait()
+        if isinstance(exc, asyncio.CancelledError):
+            raise
         return {"content": "", "title": None, "error": "PDF extraction timed out"}
     if process.returncode != 0 or len(stdout) > PDF_OUTPUT_BYTES:
         return {"content": "", "title": None, "error": "PDF extraction failed safely"}

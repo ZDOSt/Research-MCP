@@ -53,3 +53,37 @@ async def test_pdf_subprocess_receives_no_application_secrets(monkeypatch):
     child_environment = create_process.await_args.kwargs["env"]
     assert "CRAWL4AI_API_TOKEN" not in child_environment
     assert "SEARXNG_SECRET" not in child_environment
+
+
+@pytest.mark.asyncio
+async def test_pdf_subprocess_is_reaped_when_request_is_cancelled(monkeypatch):
+    communicating = asyncio.Event()
+
+    class Process:
+        returncode = None
+        killed = False
+        waited = False
+
+        async def communicate(self, body):
+            communicating.set()
+            await asyncio.Future()
+
+        def kill(self):
+            self.killed = True
+            self.returncode = -9
+
+        async def wait(self):
+            self.waited = True
+            return self.returncode
+
+    process = Process()
+    monkeypatch.setattr(
+        asyncio, "create_subprocess_exec", AsyncMock(return_value=process)
+    )
+    task = asyncio.create_task(gateway_pdf_runner.parse_pdf(b"%PDF"))
+    await communicating.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert process.killed is True
+    assert process.waited is True

@@ -12,7 +12,7 @@ from typing import Any, Literal
 
 import httpx
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import FastAPI, HTTPException, Response
 from playwright.async_api import async_playwright
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -30,6 +30,7 @@ from gateway_fetch import (
     validate_proxy_url_safety,
 )
 from redaction import redact_sensitive_text
+from request_limits import RequestBodyLimitMiddleware
 
 
 LOGGER = logging.getLogger("web-runner")
@@ -143,6 +144,9 @@ app = FastAPI(
     openapi_url=None,
     lifespan=lifespan,
 )
+app.add_middleware(
+    RequestBodyLimitMiddleware, max_bytes=WEB_RUNNER_MAX_REQUEST_BYTES
+)
 
 
 class ExploreRequest(BaseModel):
@@ -154,19 +158,6 @@ class ExploreRequest(BaseModel):
     max_chars: int = Field(default=DEFAULT_MAX_CHARS, ge=10_000, le=ABSOLUTE_MAX_CHARS)
     profile: Literal["targeted", "balanced", "exhaustive"] = "targeted"
     timeout_ms: int = Field(default=60_000, ge=5_000, le=60_000)
-
-
-@app.middleware("http")
-async def reject_oversized_requests(request: Request, call_next):
-    content_length = request.headers.get("content-length")
-    if content_length:
-        try:
-            declared_size = int(content_length)
-        except ValueError:
-            return Response(status_code=400)
-        if declared_size < 0 or declared_size > WEB_RUNNER_MAX_REQUEST_BYTES:
-            return Response(status_code=413)
-    return await call_next(request)
 
 
 @app.get("/healthz")

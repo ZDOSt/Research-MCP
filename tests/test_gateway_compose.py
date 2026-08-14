@@ -61,6 +61,10 @@ def test_documented_runtime_limits_are_wired_to_their_consumers():
             "GATEWAY_MAX_CONTENT_CHARS",
             "GATEWAY_QUERY_MAX_CHARS",
             "GATEWAY_MAX_REQUEST_BYTES",
+            "GATEWAY_MAX_CONCURRENT_REQUESTS",
+            "GATEWAY_ADMISSION_TIMEOUT_SECONDS",
+            "GATEWAY_FINALIZATION_RESERVE_SECONDS",
+            "GATEWAY_CANDIDATE_RERANKER_TIMEOUT_SECONDS",
             "GATEWAY_CACHE_MAX_ENTRIES",
             "SAFE_EGRESS_DNS_TIMEOUT_SECONDS",
         },
@@ -108,3 +112,15 @@ def test_seccomp_profile_has_namespace_rule_for_chromium():
         and rule.get("action") == "SCMP_ACT_ALLOW"
         for rule in profile["syscalls"]
     )
+
+
+def test_web_runner_waits_for_healthy_crawl4ai():
+    dependency = _compose()["services"]["web-runner"]["depends_on"]["crawl4ai"]
+    assert dependency["condition"] == "service_healthy"
+
+
+def test_ci_validates_real_searxng_with_required_secrets():
+    workflow = (PROJECT_ROOT / ".github" / "workflows" / "ci.yml").read_text("utf-8")
+    assert "SEARXNG_IMAGE: alpine" not in workflow
+    assert "docker compose up -d --no-deps --wait searxng" in workflow
+    assert workflow.count("SEARXNG_SECRET: ci-only-searxng-secret") >= 3
