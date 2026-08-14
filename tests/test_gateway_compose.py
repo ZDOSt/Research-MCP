@@ -100,7 +100,14 @@ def test_documented_runtime_limits_are_wired_to_their_consumers():
 def test_searxng_provider_set_is_bounded_and_has_major_keyless_engines():
     settings = yaml.safe_load((PROJECT_ROOT / "searxng-settings.yml").read_text("utf-8"))
     engines = settings["use_default_settings"]["engines"]["keep_only"]
-    assert {"startpage", "bing", "brave", "duckduckgo"}.issubset(engines)
+    assert {"startpage", "bing", "brave"}.issubset(engines)
+    assert {
+        "duckduckgo",
+        "duckduckgo images",
+        "duckduckgo news",
+        "mojeek",
+        "docker hub",
+    }.isdisjoint(engines)
     assert len(engines) <= 30
     assert "json" in settings["search"]["formats"]
 

@@ -10,12 +10,34 @@ import search_gateway
 
 def test_query_variants_are_bounded_and_intent_aware():
     variants = search_gateway._query_variants(
-        "How do I install Example with Docker?", "balanced"
+        "How do I install Docker Compose on Ubuntu?", "balanced"
     )
     assert "install" in variants[0].lower()
-    assert "example" in variants[0].lower()
-    assert any("official documentation guide" in item for item in variants)
+    assert any("site:docs.docker.com" in item for item in variants)
     assert len(variants) <= 3
+
+
+def test_generic_technical_query_uses_general_documentation_variant():
+    variants = search_gateway._query_variants(
+        "How do I install PostgreSQL on Ubuntu?", "balanced"
+    )
+    assert any("official documentation guide" in item for item in variants)
+    assert all("site:docs.docker.com" not in item for item in variants)
+
+
+def test_unrelated_compose_verb_does_not_trigger_docker_routing():
+    variants = search_gateway._query_variants(
+        "Compose an error report for this application", "balanced"
+    )
+    assert all("site:docs.docker.com" not in item for item in variants)
+
+
+def test_installing_an_application_with_docker_does_not_target_docker_docs():
+    variants = search_gateway._query_variants(
+        "How do I install Example with Docker?", "balanced"
+    )
+    assert all("site:docs.docker.com" not in item for item in variants)
+    assert any("official documentation guide" in item for item in variants)
 
 
 def test_search_categories_are_inferred_from_intent():
@@ -58,6 +80,34 @@ def test_candidate_scoring_prefers_relevant_official_sources():
     assert search_gateway._candidate_score(query, official, 2) > search_gateway._candidate_score(
         query, weak, 1
     )
+
+
+def test_docker_documentation_outranks_docker_hub_for_installation_guides():
+    query = "How do I install Docker Compose on Ubuntu?"
+    documentation = {
+        "title": "Install Docker Compose on Ubuntu",
+        "url": "https://docs.docker.com/engine/install/ubuntu/",
+        "content": "Official Docker installation documentation for Ubuntu",
+    }
+    hub = {
+        "title": "Docker Compose container image",
+        "url": "https://hub.docker.com/r/docker/compose",
+        "content": "Docker Compose image overview",
+    }
+    assert search_gateway._candidate_score(
+        query, documentation, 2
+    ) > search_gateway._candidate_score(query, hub, 1)
+
+
+def test_lexical_reranking_preserves_source_authority():
+    documents = [
+        {"text": "Docker Compose installation guide", "authority_score": -0.35},
+        {"text": "Docker Compose installation guide", "authority_score": 2.6},
+    ]
+    ranked = search_gateway._lexical_rerank(
+        "Docker Compose installation guide", documents, 2
+    )
+    assert ranked[0]["authority_score"] == 2.6
 
 
 def test_url_canonicalization_and_source_matching_are_strict():
@@ -130,6 +180,43 @@ async def test_reranker_preserves_unscored_documents(monkeypatch):
     ranked, status = await search_gateway._rerank("answer", docs, 2)
     assert status == "partial"
     assert {item["candidate_index"] for item in ranked} == {0, 1}
+
+
+@pytest.mark.asyncio
+async def test_reranker_uses_source_authority_for_equal_relevance(monkeypatch):
+    response = httpx.Response(
+        200,
+        json=[{"index": 0, "score": 0.5}, {"index": 1, "score": 0.5}],
+        request=httpx.Request("POST", "http://reranker/rerank"),
+    )
+
+    class Stream:
+        async def __aenter__(self):
+            return response
+
+        async def __aexit__(self, *args):
+            return False
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        def stream(self, *args, **kwargs):
+            return Stream()
+
+    monkeypatch.setattr(search_gateway.httpx, "AsyncClient", lambda **kwargs: Client())
+    docs = [
+        {"text": "Docker Compose installation", "authority_score": -0.35},
+        {"text": "Docker Compose installation", "authority_score": 2.6},
+    ]
+    ranked, status = await search_gateway._rerank(
+        "Docker Compose installation", docs, 2
+    )
+    assert status == "ok"
+    assert ranked[0]["authority_score"] == 2.6
 
 
 @pytest.mark.asyncio

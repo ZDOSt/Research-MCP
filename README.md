@@ -120,6 +120,13 @@ If it asks for the complete search path, use:
 http://search-gateway:8080/search
 ```
 
+AnythingLLM requires the complete search path even though its field is labeled
+`SearXNG API Base URL`. Configure it as:
+
+```text
+http://search-gateway:8080/search
+```
+
 The standard request is:
 
 ```http

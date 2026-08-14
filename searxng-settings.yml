@@ -6,25 +6,20 @@ use_default_settings:
       - startpage
       - bing
       - brave
-      - duckduckgo
-      - mojeek
 
       # Image discovery.
       - startpage images
       - bing images
       - brave.images
-      - duckduckgo images
       - wikicommons.images
 
       # Current events.
       - startpage news
       - bing news
       - brave.news
-      - duckduckgo news
       - reuters
 
       # Technical and software sources.
-      - docker hub
       - github
       - mdn
       - stackoverflow
@@ -62,8 +57,6 @@ outgoing:
 # enable only selected engines; enabled defaults need no override.
 engines:
   - name: bing
-    disabled: false
-  - name: mojeek
     disabled: false
   - name: openalex
     disabled: false

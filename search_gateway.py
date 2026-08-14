@@ -84,6 +84,15 @@ TECHNICAL_RE = re.compile(
     r"install|kubernetes|linux|log|manual|postgres|server|setup|stack trace|vps)\b",
     re.I,
 )
+DOCKER_DOCUMENTATION_QUERY_RE = re.compile(
+    r"(?:\b(?:configure|fix|install|setup|troubleshoot(?:ing)?)\s+"
+    r"(?:docker(?:\s+compose)?|docker-compose)\b|"
+    r"\b(?:docker(?:\s+compose)?|docker-compose)\s+"
+    r"(?:config(?:uration)?|error|exception|fix|guide|install(?:ation)?|manual|"
+    r"setup|troubleshoot(?:ing)?)\b|\bcompose\.ya?ml\b|"
+    r"\bcompose\s+(?:file|plugin|stack)\b)",
+    re.I,
+)
 CURRENT_RE = re.compile(
     r"\b(?:current|latest|new|news|patch|release|recent|today|tonight|version)\b",
     re.I,
@@ -114,6 +123,7 @@ SOURCE_LABEL_BOOSTS = {
     "support": 0.9,
 }
 SOURCE_DOMAIN_BOOSTS = {
+    "docs.docker.com": 1.4,
     "github.com": 0.9,
     "stackoverflow.com": 0.65,
     "serverfault.com": 0.65,
@@ -121,12 +131,14 @@ SOURCE_DOMAIN_BOOSTS = {
     "reddit.com": 0.15,
 }
 SOURCE_PENALTIES = {
+    "hub.docker.com": -0.35,
     "pinterest.com": -4.0,
     "facebook.com": -3.0,
     "instagram.com": -3.0,
     "tiktok.com": -3.0,
     "fandom.com": -1.0,
 }
+AUTHORITY_RANK_WEIGHT = 0.12
 
 
 class SearchRequest(BaseModel):
@@ -189,7 +201,10 @@ def _query_variants(query: str, mode: str) -> list[str]:
     if error:
         variants.append(f'"{error.group(1).strip()}"')
     if TECHNICAL_RE.search(normalized):
-        variants.append(f"{compact or normalized} official documentation guide")
+        if DOCKER_DOCUMENTATION_QUERY_RE.search(normalized):
+            variants.append(f"{compact or normalized} site:docs.docker.com")
+        else:
+            variants.append(f"{compact or normalized} official documentation guide")
     elif GAME_RE.search(normalized):
         variants.append(f"{compact or normalized} strategy guide wiki")
     elif RECOMMENDATION_RE.search(normalized):
@@ -293,6 +308,26 @@ def _candidate_score(query: str, item: dict[str, Any], rank: int) -> float:
     return score
 
 
+def _ranking_score(relevance: float, authority: object = 0.0) -> float:
+    try:
+        authority_value = float(authority or 0.0)
+    except (TypeError, ValueError):
+        authority_value = 0.0
+    if not math.isfinite(authority_value):
+        authority_value = 0.0
+    authority_value = max(-4.0, min(4.0, authority_value))
+    return relevance + AUTHORITY_RANK_WEIGHT * authority_value
+
+
+def _document_ranking_score(document: dict[str, Any]) -> float:
+    value = document.get("ranking_score", document.get("rerank_score", 0.0))
+    try:
+        score = float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    return score if math.isfinite(score) else 0.0
+
+
 def _normalize_search_result(item: dict[str, Any], query: str, rank: int) -> dict[str, Any] | None:
     url = _canonical_url(item.get("url"))
     title = re.sub(r"\s+", " ", str(item.get("title") or "")).strip()
@@ -313,6 +348,7 @@ def _normalize_search_result(item: dict[str, Any], query: str, rank: int) -> dic
         "snippet": snippet[:1500],
         "search_rank": rank,
         "discovery_score": round(_candidate_score(query, item, rank), 4),
+        "source_authority": round(_source_adjustment(domain), 4),
         "published_at": item.get("publishedDate") or item.get("published_at"),
         "engines": item.get("engines") or ([item.get("engine")] if item.get("engine") else []),
         "image_url": item.get("img_src") or item.get("image_url"),
@@ -469,6 +505,9 @@ async def _rerank(
                 continue
             item = dict(documents[index])
             item["rerank_score"] = score
+            item["ranking_score"] = _ranking_score(
+                score, item.get("authority_score")
+            )
             scored.append(item)
             scored_indices.add(index)
         if not scored:
@@ -479,9 +518,12 @@ async def _rerank(
                 continue
             item = dict(document)
             item["rerank_score"] = _lexical_score(query, item["text"])
+            item["ranking_score"] = _ranking_score(
+                item["rerank_score"], item.get("authority_score")
+            )
             unscored.append(item)
-        scored.sort(key=lambda item: item["rerank_score"], reverse=True)
-        unscored.sort(key=lambda item: item["rerank_score"], reverse=True)
+        scored.sort(key=lambda item: item["ranking_score"], reverse=True)
+        unscored.sort(key=lambda item: item["ranking_score"], reverse=True)
         status = "ok" if len(scored_indices) == len(documents) else "partial"
         return [*scored, *unscored][:top_k], status
     except Exception as exc:
@@ -496,8 +538,11 @@ def _lexical_rerank(
     for document in documents:
         item = dict(document)
         item["rerank_score"] = _lexical_score(query, item["text"])
+        item["ranking_score"] = _ranking_score(
+            item["rerank_score"], item.get("authority_score")
+        )
         fallback.append(item)
-    fallback.sort(key=lambda item: item["rerank_score"], reverse=True)
+    fallback.sort(key=lambda item: item["ranking_score"], reverse=True)
     return fallback[:top_k]
 
 
@@ -624,6 +669,7 @@ async def _follow_relevant_links(
                             "snippet": f"Relevant link from {page.get('title') or page.get('url')}",
                             "search_rank": 999,
                             "discovery_score": score,
+                            "source_authority": _source_adjustment(_domain(url)),
                             "published_at": None,
                             "engines": ["bounded-link-follow"],
                         },
@@ -651,6 +697,7 @@ def _passage_documents(pages: list[dict[str, Any]], query: str) -> list[dict[str
                     "passage_index": passage_index,
                     "lexical_score": lexical,
                     "source_score": float(search.get("discovery_score") or 0.0),
+                    "authority_score": float(search.get("source_authority") or 0.0),
                 }
             )
     documents.sort(
@@ -668,7 +715,7 @@ def _assemble_results(
         by_page.setdefault(int(passage["page_index"]), []).append(passage)
     ranked_pages = sorted(
         by_page,
-        key=lambda index: max(item.get("rerank_score", 0.0) for item in by_page[index]),
+        key=lambda index: max(_document_ranking_score(item) for item in by_page[index]),
         reverse=True,
     )
     output: list[dict[str, Any]] = []
@@ -678,7 +725,9 @@ def _assemble_results(
         page = pages[page_index]
         search = page.get("search") or {}
         passages = sorted(
-            by_page[page_index], key=lambda item: item.get("rerank_score", 0.0), reverse=True
+            by_page[page_index],
+            key=_document_ranking_score,
+            reverse=True,
         )[:3]
         content = "\n\n".join(item["text"] for item in passages)[:MAX_CONTENT_CHARS]
         item = {
@@ -688,7 +737,7 @@ def _assemble_results(
             "snippet": search.get("snippet", ""),
             "engine": "search-gateway",
             "engines": search.get("engines") or ["search-gateway"],
-            "score": round(max(p.get("rerank_score", 0.0) for p in passages), 6),
+            "score": round(max(_document_ranking_score(p) for p in passages), 6),
             "publishedDate": search.get("published_at"),
             "extraction_method": page.get("extraction_method"),
             "content_chars": page.get("content_chars"),
@@ -824,6 +873,7 @@ async def research(request: SearchRequest) -> dict[str, Any]:
                             {
                                 "text": f"{item['title']}\n{item['snippet']}",
                                 "candidate_index": index,
+                                "authority_score": item.get("source_authority", 0.0),
                             }
                             for index, item in enumerate(candidates)
                         ]
