@@ -119,7 +119,7 @@ FIRECRAWL_MAX_RESPONSE_BYTES = max(
 FIRECRAWL_MAX_RESULTS = max(
     1, int(os.getenv("FIRECRAWL_MAX_RESULTS", "20"))
 )
-CACHE_SCHEMA_VERSION = "quality-v4"
+CACHE_SCHEMA_VERSION = "quality-v5"
 
 
 _CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
@@ -746,7 +746,6 @@ async def _searx_search(
     categories: list[str],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     variants = _query_variants(query, mode)
-    effective_categories = _search_categories(query, categories)
     diagnostics: list[dict[str, Any]] = []
 
     async def one(variant: str) -> dict[str, Any]:
@@ -760,8 +759,6 @@ async def _searx_search(
         }
         if time_range:
             params["time_range"] = time_range
-        if effective_categories:
-            params["categories"] = ",".join(effective_categories)
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(SEARCH_TIMEOUT_SECONDS), trust_env=False
         ) as client:

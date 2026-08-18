@@ -257,6 +257,7 @@ async def test_searx_variants_use_local_rank_and_targeted_engine_routing(monkeyp
     assert official["search_rank"] == 1
     targeted = next(item for item in captured if "site:docs.docker.com" in item["q"])
     assert targeted["engines"] == "startpage,bing,brave"
+    assert all("categories" not in params for params in captured)
     assert diagnostics[1]["requested_engines"] == ["startpage", "bing", "brave"]
 
 
