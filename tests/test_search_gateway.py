@@ -57,6 +57,29 @@ def test_search_categories_are_inferred_from_intent():
     ]
 
 
+def test_search_engines_are_bounded_by_intent_and_exclude_repository_search():
+    technical = search_gateway._search_engines(
+        "How do I install Docker Compose on Ubuntu?",
+        [],
+        "install docker compose ubuntu",
+    )
+    targeted = search_gateway._search_engines(
+        "How do I install Docker Compose on Ubuntu?",
+        [],
+        "install docker compose ubuntu site:docs.docker.com",
+    )
+    assert technical == [
+        "startpage",
+        "bing",
+        "brave",
+        "mdn",
+        "stackoverflow",
+        "askubuntu",
+    ]
+    assert targeted == ["startpage", "bing", "brave"]
+    assert "github" not in technical
+
+
 def test_game_query_uses_strategy_terms_not_product_measurements():
     variants = search_gateway._query_variants(
         "Best team composition in DragonSword Awakening", "balanced"
@@ -97,6 +120,106 @@ def test_docker_documentation_outranks_docker_hub_for_installation_guides():
     assert search_gateway._candidate_score(
         query, documentation, 2
     ) > search_gateway._candidate_score(query, hub, 1)
+
+
+def test_instruction_query_penalizes_source_repository_without_repo_intent():
+    repository = {
+        "title": "Terraform GCP Ubuntu container ready VM",
+        "url": "https://github.com/example/terraform-gcp-ubuntu-container-ready",
+        "content": "Ubuntu with Docker and Docker Compose installed using Terraform",
+    }
+    install_query = "How do I install Docker Compose on Ubuntu?"
+    repository_query = "Find the GitHub repository for Docker Compose"
+    install_profile = search_gateway.source_profile(
+        repository["url"],
+        title=repository["title"],
+        snippet=repository["content"],
+        query=install_query,
+    )
+    repository_profile = search_gateway.source_profile(
+        repository["url"],
+        title=repository["title"],
+        snippet=repository["content"],
+        query=repository_query,
+    )
+    assert search_gateway._intent_source_adjustment(
+        install_query, install_profile
+    ) == -1.25
+    assert search_gateway._intent_source_adjustment(
+        repository_query, repository_profile
+    ) == 0.0
+
+
+@pytest.mark.asyncio
+async def test_searx_variants_use_local_rank_and_targeted_engine_routing(monkeypatch):
+    captured = []
+
+    class Stream:
+        def __init__(self, params):
+            self.params = params
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        def raise_for_status(self):
+            return None
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        def stream(self, method, url, params):
+            captured.append(params)
+            return Stream(params)
+
+    async def read(response, max_bytes=0):
+        query = response.params["q"]
+        if "site:docs.docker.com" in query:
+            return {
+                "results": [
+                    {
+                        "title": "Install Docker Engine on Ubuntu",
+                        "url": "https://docs.docker.com/engine/install/ubuntu/",
+                        "content": "Official installation steps including Compose plugin",
+                        "engine": "bing",
+                    }
+                ]
+            }
+        return {
+            "results": [
+                {
+                    "title": f"Unrelated result {index}",
+                    "url": f"https://github.com/example/unrelated-{index}",
+                    "content": "Ubuntu Docker Compose container",
+                    "engine": "github",
+                }
+                for index in range(1, 6)
+            ]
+        }
+
+    monkeypatch.setattr(search_gateway.httpx, "AsyncClient", lambda **kwargs: Client())
+    monkeypatch.setattr(search_gateway, "_read_json_response", read)
+    results, diagnostics = await search_gateway._searx_search(
+        "How do I install Docker Compose on Ubuntu?",
+        mode="balanced",
+        max_results=10,
+        language="auto",
+        time_range=None,
+        categories=[],
+    )
+
+    official = next(item for item in results if item["domain"] == "docs.docker.com")
+    assert results[0] == official
+    assert official["search_rank"] == 1
+    targeted = next(item for item in captured if "site:docs.docker.com" in item["q"])
+    assert targeted["engines"] == "startpage,bing,brave"
+    assert diagnostics[1]["requested_engines"] == ["startpage", "bing", "brave"]
 
 
 def test_lexical_reranking_preserves_source_authority():

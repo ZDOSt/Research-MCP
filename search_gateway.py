@@ -119,7 +119,7 @@ FIRECRAWL_MAX_RESPONSE_BYTES = max(
 FIRECRAWL_MAX_RESULTS = max(
     1, int(os.getenv("FIRECRAWL_MAX_RESULTS", "20"))
 )
-CACHE_SCHEMA_VERSION = "quality-v2"
+CACHE_SCHEMA_VERSION = "quality-v3"
 
 
 _CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
@@ -134,6 +134,15 @@ _REDIS = None
 TECHNICAL_RE = re.compile(
     r"\b(?:api|compose|config(?:uration)?|container|docker|error|exception|fix|github|"
     r"install|kubernetes|linux|log|manual|postgres|server|setup|stack trace|vps)\b",
+    re.I,
+)
+INSTRUCTION_RE = re.compile(
+    r"\b(?:configure|configuration|fix|guide|how\s+to|install(?:ation)?|manual|"
+    r"setup|steps?|troubleshoot(?:ing)?|upgrade)\b",
+    re.I,
+)
+REPOSITORY_INTENT_RE = re.compile(
+    r"\b(?:commit|github|gitlab|issue|pull request|repository|repo|source code|tag)\b",
     re.I,
 )
 DOCKER_DOCUMENTATION_QUERY_RE = re.compile(
@@ -177,7 +186,6 @@ SOURCE_LABEL_BOOSTS = {
 }
 SOURCE_DOMAIN_BOOSTS = {
     "docs.docker.com": 1.4,
-    "github.com": 0.9,
     "stackoverflow.com": 0.65,
     "serverfault.com": 0.65,
     "superuser.com": 0.55,
@@ -192,6 +200,16 @@ SOURCE_PENALTIES = {
     "fandom.com": -1.0,
 }
 AUTHORITY_RANK_WEIGHT = 0.12
+BROAD_WEB_ENGINES = ("startpage", "bing", "brave")
+TECHNICAL_ENGINES = ("mdn", "stackoverflow", "askubuntu")
+NEWS_ENGINES = ("startpage news", "bing news", "brave.news", "reuters")
+ACADEMIC_ENGINES = ("arxiv", "pubmed", "semantic scholar", "openalex", "crossref")
+IMAGE_ENGINES = (
+    "startpage images",
+    "bing images",
+    "brave.images",
+    "wikicommons.images",
+)
 
 
 class SearchRequest(BaseModel):
@@ -323,6 +341,30 @@ def _search_categories(query: str, categories: list[str]) -> list[str]:
     if IMAGE_RE.search(query):
         inferred.append("images")
     return inferred
+
+
+def _search_engines(
+    query: str,
+    categories: list[str],
+    variant: str,
+) -> list[str]:
+    """Route each query variant to bounded engines suited to its intent."""
+
+    effective = set(_search_categories(query, categories))
+    if effective == {"images"}:
+        return list(IMAGE_ENGINES)
+
+    engines = list(BROAD_WEB_ENGINES)
+    site_restricted = bool(re.search(r"(?:^|\s)site:[^\s]+", variant, re.I))
+    if "it" in effective and not site_restricted:
+        engines.extend(TECHNICAL_ENGINES)
+    if "news" in effective:
+        engines.extend(NEWS_ENGINES)
+    if "science" in effective:
+        engines.extend(ACADEMIC_ENGINES)
+    if "images" in effective:
+        engines.extend(IMAGE_ENGINES)
+    return list(dict.fromkeys(engines))
 
 
 def _domain(url: str) -> str:
@@ -472,11 +514,44 @@ def _candidate_score(
     score += 1.0 / max(1, rank)
     score += _source_adjustment(domain)
     score += float(profile["authority_adjustment"])
+    score += _intent_source_adjustment(query, profile)
     score += 0.55 * max(
         freshness_score(published, requirement),
         freshness_score(modified, requirement),
     )
     return score
+
+
+def _intent_source_adjustment(query: str, profile: dict[str, Any]) -> float:
+    """Prefer instructional sources for how-to intent without harming repo queries."""
+
+    if not INSTRUCTION_RE.search(query):
+        return 0.0
+    source_type = str(profile.get("source_type") or "")
+    if source_type == "documentation_candidate":
+        return 0.9
+    if source_type in {"government", "standard", "technical_reference"}:
+        return 0.35
+    if source_type == "source_repository" and not REPOSITORY_INTENT_RE.search(query):
+        return -1.25
+    return 0.0
+
+
+def _variant_source_adjustment(
+    variant: str,
+    result: dict[str, Any],
+) -> float:
+    domain = str(result.get("domain") or "")
+    site = re.search(r"(?:^|\s)site:([^\s]+)", variant, re.I)
+    if site:
+        expected = site.group(1).strip(".").casefold()
+        if domain == expected or domain.endswith("." + expected):
+            return 0.8
+    if "official documentation" in variant.casefold() and result.get(
+        "source_type"
+    ) == "documentation_candidate":
+        return 0.4
+    return 0.0
 
 
 def _ranking_score(relevance: float, authority: object = 0.0) -> float:
@@ -522,7 +597,12 @@ def _normalize_search_result(
     modified = normalize_date(item.get("modifiedDate") or item.get("modified_at"))
     requirement = temporal_requirement(query, time_range)
     version_context = extract_version_markers(title, snippet)
-    source_authority = _source_adjustment(domain) + float(profile["authority_adjustment"])
+    intent_adjustment = _intent_source_adjustment(query, profile)
+    source_authority = (
+        _source_adjustment(domain)
+        + float(profile["authority_adjustment"])
+        + intent_adjustment
+    )
     return {
         "title": title[:500],
         "url": url,
@@ -538,6 +618,7 @@ def _normalize_search_result(
         "authority_score": profile["authority_score"],
         "primary_source_candidate": profile["primary_source_candidate"],
         "source_classification_method": profile["classification_method"],
+        "intent_source_adjustment": intent_adjustment,
         "published_at": published,
         "modified_at": modified,
         "freshness_score": max(
@@ -598,11 +679,13 @@ async def _searx_search(
     diagnostics: list[dict[str, Any]] = []
 
     async def one(variant: str) -> dict[str, Any]:
+        engines = _search_engines(query, categories, variant)
         params: dict[str, str] = {
             "q": variant,
             "format": "json",
             "language": language or "auto",
             "safesearch": "0",
+            "engines": ",".join(engines),
         }
         if time_range:
             params["time_range"] = time_range
@@ -617,7 +700,6 @@ async def _searx_search(
 
     outcomes = await asyncio.gather(*(one(variant) for variant in variants), return_exceptions=True)
     by_url: dict[str, dict[str, Any]] = {}
-    rank = 0
     for variant, outcome in zip(variants, outcomes):
         if isinstance(outcome, Exception):
             diagnostics.append({"query": variant, "status": "failed", "error": type(outcome).__name__})
@@ -628,16 +710,22 @@ async def _searx_search(
                 "query": variant,
                 "status": "ok",
                 "result_count": len(raw_results) if isinstance(raw_results, list) else 0,
+                "requested_engines": _search_engines(query, categories, variant),
                 "unresponsive_engines": outcome.get("unresponsive_engines", []),
             }
         )
-        for item in raw_results or []:
+        for rank, item in enumerate(raw_results or [], start=1):
             if not isinstance(item, dict):
                 continue
-            rank += 1
             normalized = _normalize_search_result(item, query, rank, time_range)
             if normalized is None:
                 continue
+            normalized["query_variant"] = variant
+            normalized["discovery_score"] = round(
+                normalized["discovery_score"]
+                + _variant_source_adjustment(variant, normalized),
+                4,
+            )
             existing = by_url.get(normalized["url"])
             if existing is None or normalized["discovery_score"] > existing["discovery_score"]:
                 by_url[normalized["url"]] = normalized

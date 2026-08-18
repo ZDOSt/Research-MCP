@@ -115,6 +115,7 @@ def test_searxng_provider_set_is_bounded_and_has_major_keyless_engines():
         "duckduckgo",
         "duckduckgo images",
         "duckduckgo news",
+        "github",
         "mojeek",
         "docker hub",
     }.isdisjoint(engines)
