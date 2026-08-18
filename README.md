@@ -7,6 +7,11 @@ The gateway discovers sources with a small set of search engines, opens pages
 only when the selected route asks for it, extracts their actual contents,
 reranks evidence locally, and returns source URLs and page-derived text.
 
+Search results also carry deterministic evidence metadata: an inferred source
+type and tier, an authority score, normalized page-declared dates, version
+markers, and a stable citation ID/URL. These are ranking and coverage aids, not
+claims that the gateway has proved source ownership or verified every claim.
+
 It does not call a paid search API or an internal language model. The frontend's
 model receives the retrieved evidence and writes the answer. This keeps the
 service private, predictable, and usable by any frontend that accepts a custom
@@ -190,6 +195,13 @@ then passes through the same authenticated Firecrawl-compatible scraper. This
 prevents direct-page requests from depending on whether a search engine happens
 to index the supplied URL.
 
+The `/v1/research` and `/integrated/search` responses include an
+`evidence_summary` with independent-domain coverage, likely primary-source
+coverage, date and extraction coverage, version context, and explicit warnings
+when evidence is thin. Source classification is based on transparent domain,
+path, and query-affinity heuristics. It never represents itself as claim-level
+verification or proof that two domains are organizationally independent.
+
 Use these internal Docker URLs:
 
 | Frontend | Search setting | Scraper setting | Reranker setting |
@@ -277,6 +289,24 @@ docker compose restart search-gateway
 docker compose down
 docker compose up -d --wait
 ```
+
+### Repeatable quality baseline
+
+The opt-in live evaluation suite covers installation guides, errors, hardware
+settings, recommendations, version-sensitive questions, direct URLs,
+multi-source comparisons, gaming, academic material, and current news. It is
+not run automatically and adds no latency to normal gateway requests.
+
+From inside the running gateway container:
+
+```console
+docker compose exec -T search-gateway python evaluate_search_quality.py \
+  --base-url http://127.0.0.1:8080
+```
+
+Run one case while tuning with `--case docker-compose-install`, or retain the
+JSON report with `--output /tmp/search-quality-report.json`. See
+`evals/README.md` for the measured fields and limitations.
 
 `docker compose down` preserves named volumes. `docker compose down -v` deletes
 the cache and downloaded reranker model and should be used only for a deliberate

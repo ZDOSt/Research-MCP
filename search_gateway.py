@@ -21,6 +21,16 @@ import httpx
 from fastapi import FastAPI, Header, HTTPException, Query, Response
 from pydantic import BaseModel, ConfigDict, Field
 
+from evidence_quality import (
+    evidence_summary,
+    extract_version_markers,
+    freshness_score,
+    normalize_date,
+    normalize_page_metadata,
+    source_profile,
+    stable_evidence_id,
+    temporal_requirement,
+)
 from gateway_fetch import fetch_page
 from request_limits import RequestBodyLimitMiddleware
 
@@ -109,6 +119,7 @@ FIRECRAWL_MAX_RESPONSE_BYTES = max(
 FIRECRAWL_MAX_RESULTS = max(
     1, int(os.getenv("FIRECRAWL_MAX_RESULTS", "20"))
 )
+CACHE_SCHEMA_VERSION = "quality-v2"
 
 
 _CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
@@ -382,16 +393,31 @@ def _direct_url_candidates(query: str, max_results: int) -> list[dict[str, Any]]
         parsed = urlsplit(url)
         domain = (parsed.hostname or "").lower()
         path = parsed.path.rstrip("/") or "/"
+        title = f"{domain}{path}"
+        profile = source_profile(url, title=title, query=query)
+        source_authority = _source_adjustment(domain) + float(
+            profile["authority_adjustment"]
+        )
         candidates.append(
             {
-                "title": f"{domain}{path}",
+                "title": title,
                 "url": url,
                 "domain": domain,
                 "snippet": "User-supplied URL selected for direct page extraction.",
                 "search_rank": rank,
-                "discovery_score": round(10.0 + _source_adjustment(domain), 4),
-                "source_authority": round(_source_adjustment(domain), 4),
+                "discovery_score": round(10.0 + source_authority, 4),
+                "source_authority": round(source_authority, 4),
+                "source_type": profile["source_type"],
+                "source_tier": profile["source_tier"],
+                "authority_score": profile["authority_score"],
+                "primary_source_candidate": profile["primary_source_candidate"],
+                "source_classification_method": profile["classification_method"],
                 "published_at": None,
+                "modified_at": None,
+                "freshness_score": 0.0,
+                "version_context": extract_version_markers(title),
+                "evidence_id": stable_evidence_id(url),
+                "citation_url": url,
                 "engines": ["direct-url"],
                 "image_url": None,
                 "thumbnail_url": None,
@@ -425,14 +451,31 @@ def _lexical_score(query: str, text: str) -> float:
     return matched / len(query_terms) + 0.25 * phrase
 
 
-def _candidate_score(query: str, item: dict[str, Any], rank: int) -> float:
+def _candidate_score(
+    query: str,
+    item: dict[str, Any],
+    rank: int,
+    time_range: str | None = None,
+) -> float:
     domain = _domain(str(item.get("url") or ""))
     text = f"{item.get('title', '')} {item.get('content', '')}"
+    profile = source_profile(
+        item.get("url"),
+        title=str(item.get("title") or ""),
+        snippet=str(item.get("content") or ""),
+        query=query,
+    )
+    requirement = temporal_requirement(query, time_range)
+    published = normalize_date(item.get("publishedDate") or item.get("published_at"))
+    modified = normalize_date(item.get("modifiedDate") or item.get("modified_at"))
     score = 3.0 * _lexical_score(query, text)
     score += 1.0 / max(1, rank)
     score += _source_adjustment(domain)
-    if item.get("publishedDate") or item.get("published_at"):
-        score += 0.1
+    score += float(profile["authority_adjustment"])
+    score += 0.55 * max(
+        freshness_score(published, requirement),
+        freshness_score(modified, requirement),
+    )
     return score
 
 
@@ -456,7 +499,12 @@ def _document_ranking_score(document: dict[str, Any]) -> float:
     return score if math.isfinite(score) else 0.0
 
 
-def _normalize_search_result(item: dict[str, Any], query: str, rank: int) -> dict[str, Any] | None:
+def _normalize_search_result(
+    item: dict[str, Any],
+    query: str,
+    rank: int,
+    time_range: str | None = None,
+) -> dict[str, Any] | None:
     url = _canonical_url(item.get("url"))
     title = re.sub(r"\s+", " ", str(item.get("title") or "")).strip()
     if not url or not title:
@@ -469,15 +517,36 @@ def _normalize_search_result(item: dict[str, Any], query: str, rank: int) -> dic
     ):
         return None
     snippet = re.sub(r"\s+", " ", str(item.get("content") or "")).strip()
+    profile = source_profile(url, title=title, snippet=snippet, query=query)
+    published = normalize_date(item.get("publishedDate") or item.get("published_at"))
+    modified = normalize_date(item.get("modifiedDate") or item.get("modified_at"))
+    requirement = temporal_requirement(query, time_range)
+    version_context = extract_version_markers(title, snippet)
+    source_authority = _source_adjustment(domain) + float(profile["authority_adjustment"])
     return {
         "title": title[:500],
         "url": url,
         "domain": domain,
         "snippet": snippet[:1500],
         "search_rank": rank,
-        "discovery_score": round(_candidate_score(query, item, rank), 4),
-        "source_authority": round(_source_adjustment(domain), 4),
-        "published_at": item.get("publishedDate") or item.get("published_at"),
+        "discovery_score": round(
+            _candidate_score(query, item, rank, time_range), 4
+        ),
+        "source_authority": round(source_authority, 4),
+        "source_type": profile["source_type"],
+        "source_tier": profile["source_tier"],
+        "authority_score": profile["authority_score"],
+        "primary_source_candidate": profile["primary_source_candidate"],
+        "source_classification_method": profile["classification_method"],
+        "published_at": published,
+        "modified_at": modified,
+        "freshness_score": max(
+            freshness_score(published, requirement),
+            freshness_score(modified, requirement),
+        ),
+        "version_context": version_context,
+        "evidence_id": stable_evidence_id(url),
+        "citation_url": url,
         "engines": item.get("engines") or ([item.get("engine")] if item.get("engine") else []),
         "image_url": item.get("img_src") or item.get("image_url"),
         "thumbnail_url": item.get("thumbnail_src") or item.get("thumbnail"),
@@ -566,7 +635,7 @@ async def _searx_search(
             if not isinstance(item, dict):
                 continue
             rank += 1
-            normalized = _normalize_search_result(item, query, rank)
+            normalized = _normalize_search_result(item, query, rank, time_range)
             if normalized is None:
                 continue
             existing = by_url.get(normalized["url"])
@@ -605,7 +674,10 @@ async def _rerank(
 ) -> tuple[list[dict[str, Any]], str]:
     if not documents:
         return [], "empty"
-    texts = [str(document["text"])[:MAX_PASSAGE_CHARS] for document in documents]
+    texts = [
+        str(document.get("reranker_text") or document["text"])[:MAX_PASSAGE_CHARS]
+        for document in documents
+    ]
     try:
         await asyncio.wait_for(
             _RERANK_ADMISSION.acquire(), RERANKER_ADMISSION_TIMEOUT_SECONDS
@@ -654,7 +726,9 @@ async def _rerank(
             if index in scored_indices:
                 continue
             item = dict(document)
-            item["rerank_score"] = _lexical_score(query, item["text"])
+            item["rerank_score"] = _lexical_score(
+                query, item.get("reranker_text") or item["text"]
+            )
             item["ranking_score"] = _ranking_score(
                 item["rerank_score"], item.get("authority_score")
             )
@@ -676,7 +750,9 @@ def _lexical_rerank(
     fallback = []
     for document in documents:
         item = dict(document)
-        item["rerank_score"] = _lexical_score(query, item["text"])
+        item["rerank_score"] = _lexical_score(
+            query, item.get("reranker_text") or item["text"]
+        )
         item["ranking_score"] = _ranking_score(
             item["rerank_score"], item.get("authority_score")
         )
@@ -798,6 +874,14 @@ async def _follow_relevant_links(
             )
             if score > 0.35:
                 visited.add(url)
+                profile = source_profile(
+                    url,
+                    title=str(link.get("anchor") or ""),
+                    query=query,
+                )
+                source_authority = _source_adjustment(_domain(url)) + float(
+                    profile["authority_adjustment"]
+                )
                 candidates.append(
                     (
                         score,
@@ -808,8 +892,24 @@ async def _follow_relevant_links(
                             "snippet": f"Relevant link from {page.get('title') or page.get('url')}",
                             "search_rank": 999,
                             "discovery_score": score,
-                            "source_authority": _source_adjustment(_domain(url)),
+                            "source_authority": source_authority,
+                            "source_type": profile["source_type"],
+                            "source_tier": profile["source_tier"],
+                            "authority_score": profile["authority_score"],
+                            "primary_source_candidate": profile[
+                                "primary_source_candidate"
+                            ],
+                            "source_classification_method": profile[
+                                "classification_method"
+                            ],
                             "published_at": None,
+                            "modified_at": None,
+                            "freshness_score": 0.0,
+                            "version_context": extract_version_markers(
+                                link.get("anchor")
+                            ),
+                            "evidence_id": stable_evidence_id(url),
+                            "citation_url": url,
                             "engines": ["bounded-link-follow"],
                         },
                     )
@@ -825,6 +925,32 @@ def _passage_documents(pages: list[dict[str, Any]], query: str) -> list[dict[str
     documents: list[dict[str, Any]] = []
     for page_index, page in enumerate(pages):
         search = page.get("search") or {}
+        metadata = normalize_page_metadata(page.get("metadata"))
+        context_parts = [
+            f"Title: {page.get('title') or search.get('title') or ''}",
+            f"Source type: {search.get('source_type') or 'general_web'}",
+        ]
+        if metadata.get("publishedDate") or search.get("published_at"):
+            context_parts.append(
+                f"Published: {metadata.get('publishedDate') or search.get('published_at')}"
+            )
+        if metadata.get("modifiedDate") or search.get("modified_at"):
+            context_parts.append(
+                f"Modified: {metadata.get('modifiedDate') or search.get('modified_at')}"
+            )
+        if metadata.get("declaredDate"):
+            context_parts.append(f"Page-declared date: {metadata['declaredDate']}")
+        versions = list(
+            dict.fromkeys(
+                [
+                    *(search.get("version_context") or []),
+                    *(metadata.get("version_context") or []),
+                ]
+            )
+        )
+        if versions:
+            context_parts.append(f"Version context: {', '.join(versions[:8])}")
+        reranker_context = "\n".join(context_parts)
         for passage_index, passage in enumerate(_chunk_text(str(page.get("content") or ""))):
             lexical = _lexical_score(query, passage)
             if lexical <= 0 and passage_index > 1:
@@ -832,6 +958,7 @@ def _passage_documents(pages: list[dict[str, Any]], query: str) -> list[dict[str
             documents.append(
                 {
                     "text": passage,
+                    "reranker_text": f"{reranker_context}\n\n{passage}",
                     "page_index": page_index,
                     "passage_index": passage_index,
                     "lexical_score": lexical,
@@ -847,7 +974,10 @@ def _passage_documents(pages: list[dict[str, Any]], query: str) -> list[dict[str
 
 
 def _assemble_results(
-    pages: list[dict[str, Any]], ranked_passages: list[dict[str, Any]], limit: int
+    pages: list[dict[str, Any]],
+    ranked_passages: list[dict[str, Any]],
+    limit: int,
+    query: str = "",
 ) -> list[dict[str, Any]]:
     by_page: dict[int, list[dict[str, Any]]] = {}
     for passage in ranked_passages:
@@ -869,15 +999,52 @@ def _assemble_results(
             reverse=True,
         )[:3]
         content = "\n\n".join(item["text"] for item in passages)[:MAX_CONTENT_CHARS]
+        url = str(page.get("url") or search.get("url") or "")
+        metadata = normalize_page_metadata(page.get("metadata"))
+        profile = source_profile(
+            url,
+            title=str(page.get("title") or search.get("title") or ""),
+            snippet=str(search.get("snippet") or ""),
+            query=query,
+        )
+        published = metadata.get("publishedDate") or search.get("published_at")
+        modified = metadata.get("modifiedDate") or search.get("modified_at")
+        declared = metadata.get("declaredDate")
+        version_context = list(
+            dict.fromkeys(
+                [
+                    *(search.get("version_context") or []),
+                    *(metadata.get("version_context") or []),
+                    *extract_version_markers(page.get("title"), content),
+                ]
+            )
+        )[:8]
+        evidence_id = search.get("evidence_id") or stable_evidence_id(url)
         item = {
             "title": page.get("title") or search.get("title") or page.get("url"),
-            "url": page.get("url") or search.get("url"),
+            "url": url,
             "content": content,
             "snippet": search.get("snippet", ""),
             "engine": "search-gateway",
             "engines": search.get("engines") or ["search-gateway"],
             "score": round(max(_document_ranking_score(p) for p in passages), 6),
-            "publishedDate": search.get("published_at"),
+            "publishedDate": published,
+            "modifiedDate": modified,
+            "declaredDate": declared,
+            "source_type": search.get("source_type") or profile["source_type"],
+            "source_tier": search.get("source_tier") or profile["source_tier"],
+            "authority_score": search.get("authority_score", profile["authority_score"]),
+            "primary_source_candidate": search.get(
+                "primary_source_candidate", profile["primary_source_candidate"]
+            ),
+            "source_classification_method": search.get(
+                "source_classification_method", profile["classification_method"]
+            ),
+            "freshness_score": search.get("freshness_score", 0.0),
+            "version_context": version_context,
+            "evidence_id": evidence_id,
+            "citation_url": url,
+            "citation": {"id": evidence_id, "url": url},
             "extraction_method": page.get("extraction_method"),
             "content_chars": page.get("content_chars"),
             "img_src": search.get("image_url"),
@@ -900,7 +1067,11 @@ def _assemble_results(
 
 def _cache_key(request: SearchRequest, pipeline: str = "research") -> str:
     payload = json.dumps(
-        {"pipeline": pipeline, "request": request.model_dump()},
+        {
+            "schema": CACHE_SCHEMA_VERSION,
+            "pipeline": pipeline,
+            "request": request.model_dump(),
+        },
         sort_keys=True,
         separators=(",", ":"),
     )
@@ -974,6 +1145,15 @@ def _searx_result(item: dict[str, Any]) -> dict[str, Any]:
         "engines": item.get("engines") or ["search-gateway"],
         "score": item.get("discovery_score", 0.0),
         "publishedDate": item.get("published_at"),
+        "modifiedDate": item.get("modified_at"),
+        "source_type": item.get("source_type"),
+        "source_tier": item.get("source_tier"),
+        "authority_score": item.get("authority_score"),
+        "primary_source_candidate": item.get("primary_source_candidate", False),
+        "freshness_score": item.get("freshness_score", 0.0),
+        "version_context": item.get("version_context") or [],
+        "evidence_id": item.get("evidence_id") or stable_evidence_id(item.get("url")),
+        "citation_url": item.get("citation_url") or item.get("url"),
         "img_src": item.get("image_url"),
         "thumbnail_src": item.get("thumbnail_url"),
         "category": item.get("category"),
@@ -1128,7 +1308,7 @@ async def discovery_search(request: SearchRequest) -> dict[str, Any]:
 
 def _scrape_cache_key(url: str) -> str:
     payload = json.dumps(
-        {"pipeline": "scrape", "url": url},
+        {"schema": CACHE_SCHEMA_VERSION, "pipeline": "scrape", "url": url},
         sort_keys=True,
         separators=(",", ":"),
     )
@@ -1139,15 +1319,49 @@ def _firecrawl_scrape_payload(
     page: dict[str, Any], requested_url: str
 ) -> dict[str, Any]:
     source_url = str(page.get("url") or requested_url)
+    page_metadata = normalize_page_metadata(page.get("metadata"))
+    declared_lines = []
+    if page_metadata.get("publishedDate"):
+        declared_lines.append(f"Published: {page_metadata['publishedDate']}")
+    if page_metadata.get("modifiedDate"):
+        declared_lines.append(f"Modified: {page_metadata['modifiedDate']}")
+    if page_metadata.get("declaredDate"):
+        declared_lines.append(f"Declared date: {page_metadata['declaredDate']}")
+    if page_metadata.get("version_context"):
+        declared_lines.append(
+            "Version context: " + ", ".join(page_metadata["version_context"][:8])
+        )
+    metadata_block = ""
+    if declared_lines:
+        metadata_block = (
+            "> Page-declared metadata (not independently verified)\n> "
+            + "\n> ".join(declared_lines)
+            + "\n\n"
+        )
+    raw_content = metadata_block + str(page.get("content") or "")
     content = _truncate_utf8(
-        str(page.get("content") or "")[:FIRECRAWL_MAX_CONTENT_CHARS],
-        FIRECRAWL_MAX_RESPONSE_BYTES,
+        raw_content[:FIRECRAWL_MAX_CONTENT_CHARS], FIRECRAWL_MAX_RESPONSE_BYTES
     )
     metadata = {
         "title": page.get("title") or "",
         "sourceURL": source_url,
         "statusCode": page.get("status_code"),
+        "evidenceId": stable_evidence_id(source_url),
     }
+    published = page_metadata.get("publishedDate")
+    modified = page_metadata.get("modifiedDate")
+    declared = page_metadata.get("declaredDate")
+    if published:
+        metadata["publishedTime"] = published
+        metadata["article:published_time"] = published
+    if modified:
+        metadata["modifiedTime"] = modified
+        metadata["article:modified_time"] = modified
+    if declared:
+        metadata["date"] = declared
+    for key in ("language", "author", "description", "version_context"):
+        if page_metadata.get(key):
+            metadata[key] = page_metadata[key]
     data: dict[str, Any] = {"markdown": content, "metadata": metadata}
     links = page.get("links")
     if isinstance(links, list):
@@ -1255,26 +1469,54 @@ async def research(
                 results: list[dict[str, Any]] = []
                 try:
                     async with asyncio.timeout(budget.total_seconds):
-                        candidates, search_diagnostics = await _searx_search(
+                        direct_candidates = _direct_url_candidates(
                             request.query,
-                            mode=mode,
-                            max_results=min(MAX_SEARCH_RESULTS, budget.search_results),
-                            language=request.language,
-                            time_range=request.time_range,
-                            categories=request.categories,
+                            min(MAX_SEARCH_RESULTS, budget.search_results),
                         )
+                        if direct_candidates:
+                            candidates = direct_candidates
+                            search_diagnostics = []
+                            diagnostics["direct_url_count"] = len(candidates)
+                        else:
+                            candidates, search_diagnostics = await _searx_search(
+                                request.query,
+                                mode=mode,
+                                max_results=min(
+                                    MAX_SEARCH_RESULTS, budget.search_results
+                                ),
+                                language=request.language,
+                                time_range=request.time_range,
+                                categories=request.categories,
+                            )
                         diagnostics["searches"] = search_diagnostics
                         if not candidates:
                             raise RuntimeError("SearXNG returned no usable candidates")
 
-                        candidate_documents = [
-                            {
-                                "text": f"{item['title']}\n{item['snippet']}",
-                                "candidate_index": index,
-                                "authority_score": item.get("source_authority", 0.0),
-                            }
-                            for index, item in enumerate(candidates)
-                        ]
+                        candidate_documents = []
+                        for index, item in enumerate(candidates):
+                            context = [
+                                str(item["title"]),
+                                str(item["snippet"]),
+                                f"Source type: {item.get('source_type') or 'general_web'}",
+                            ]
+                            if item.get("published_at"):
+                                context.append(f"Published: {item['published_at']}")
+                            if item.get("modified_at"):
+                                context.append(f"Modified: {item['modified_at']}")
+                            if item.get("version_context"):
+                                context.append(
+                                    "Version context: "
+                                    + ", ".join(item["version_context"][:8])
+                                )
+                            candidate_documents.append(
+                                {
+                                    "text": "\n".join(context),
+                                    "candidate_index": index,
+                                    "authority_score": item.get(
+                                        "source_authority", 0.0
+                                    ),
+                                }
+                            )
                         crawl_deadline = deadline - FINALIZATION_RESERVE_SECONDS
                         candidate_rerank_timeout = min(
                             CANDIDATE_RERANKER_TIMEOUT_SECONDS,
@@ -1321,6 +1563,7 @@ async def research(
                             pages,
                             ranked,
                             min(request.max_results, budget.final_results),
+                            request.query,
                         )
                 except TimeoutError:
                     diagnostics["partial"] = True
@@ -1335,6 +1578,7 @@ async def research(
                             pages,
                             ranked,
                             min(request.max_results, budget.final_results),
+                            request.query,
                         )
 
                 if len(results) < min(request.max_results, budget.final_results):
@@ -1349,6 +1593,26 @@ async def research(
                             "engines": item["engines"],
                             "score": item["discovery_score"],
                             "publishedDate": item["published_at"],
+                            "modifiedDate": item.get("modified_at"),
+                            "source_type": item.get("source_type"),
+                            "source_tier": item.get("source_tier"),
+                            "authority_score": item.get("authority_score"),
+                            "primary_source_candidate": item.get(
+                                "primary_source_candidate", False
+                            ),
+                            "source_classification_method": item.get(
+                                "source_classification_method"
+                            ),
+                            "freshness_score": item.get("freshness_score", 0.0),
+                            "version_context": item.get("version_context") or [],
+                            "evidence_id": item.get("evidence_id")
+                            or stable_evidence_id(item["url"]),
+                            "citation_url": item.get("citation_url") or item["url"],
+                            "citation": {
+                                "id": item.get("evidence_id")
+                                or stable_evidence_id(item["url"]),
+                                "url": item.get("citation_url") or item["url"],
+                            },
                             "img_src": item.get("image_url"),
                             "thumbnail_src": item.get("thumbnail_url"),
                         }
@@ -1364,6 +1628,10 @@ async def research(
                 if not results:
                     raise RuntimeError("Search produced no usable evidence")
 
+                coverage = evidence_summary(
+                    results, request.query, time_range=request.time_range
+                )
+                diagnostics["evidence_status"] = coverage["status"]
                 result = {
                     "query": request.query,
                     "number_of_results": len(results),
@@ -1378,6 +1646,7 @@ async def research(
                         for item in search.get("unresponsive_engines", [])
                     ],
                     "diagnostics": diagnostics,
+                    "evidence_summary": coverage,
                     "duration_seconds": round(time.monotonic() - started, 3),
                     "cache": "miss",
                 }
@@ -1416,7 +1685,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Private Evidence Search Gateway",
-    version="1.0.0",
+    version="1.1.0",
     docs_url=None,
     redoc_url=None,
     openapi_url=None,

@@ -141,3 +141,10 @@ def test_ci_validates_real_searxng_with_required_secrets():
     assert "SEARXNG_IMAGE: alpine" not in workflow
     assert "docker compose up -d --no-deps --wait searxng" in workflow
     assert workflow.count("SEARXNG_SECRET: ci-only-searxng-secret") >= 3
+
+
+def test_gateway_image_contains_quality_runtime_and_evaluation_files():
+    dockerfile = (PROJECT_ROOT / "Dockerfile.gateway").read_text("utf-8")
+    assert "evidence_quality.py" in dockerfile
+    assert "evaluate_search_quality.py" in dockerfile
+    assert "COPY --chown=app:app evals ./evals" in dockerfile

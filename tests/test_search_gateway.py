@@ -488,6 +488,68 @@ async def test_research_returns_searx_compatible_enriched_results(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_research_direct_url_bypasses_searxng_and_keeps_citation_metadata(
+    monkeypatch,
+):
+    search_gateway._QUERY_LOCKS.clear()
+    search_gateway._QUERY_LOCK_USERS.clear()
+
+    async def no_cache(_):
+        return None
+
+    async def ignore_cache(*_):
+        return None
+
+    async def unexpected_search(*args, **kwargs):
+        raise AssertionError("direct URL research must bypass SearXNG")
+
+    async def rerank(query, documents, top_k):
+        ranked = []
+        for index, document in enumerate(documents[:top_k]):
+            item = dict(document)
+            item["rerank_score"] = 1.0 - index * 0.01
+            item["ranking_score"] = item["rerank_score"]
+            ranked.append(item)
+        return ranked, "ok"
+
+    async def crawl(candidates, query, deadline):
+        assert candidates[0]["url"] == "https://docs.example.com/install"
+        return (
+            [
+                {
+                    "url": candidates[0]["url"],
+                    "title": "Example install guide",
+                    "content": "Install Example with the supported package manager. " * 80,
+                    "content_chars": 4320,
+                    "links": [],
+                    "extraction_method": "direct",
+                    "metadata": {"modifiedDate": "2026-08-01"},
+                    "search": candidates[0],
+                }
+            ],
+            [],
+        )
+
+    monkeypatch.setattr(search_gateway, "_cache_get", no_cache)
+    monkeypatch.setattr(search_gateway, "_cache_set", ignore_cache)
+    monkeypatch.setattr(search_gateway, "_searx_search", unexpected_search)
+    monkeypatch.setattr(search_gateway, "_rerank", rerank)
+    monkeypatch.setattr(search_gateway, "_crawl_candidates", crawl)
+
+    response = await search_gateway.research(
+        search_gateway.SearchRequest(
+            query="Read https://docs.example.com/install and summarize it",
+            max_results=1,
+        )
+    )
+    result = response["results"][0]
+    assert response["diagnostics"]["direct_url_count"] == 1
+    assert result["citation_url"] == "https://docs.example.com/install"
+    assert result["evidence_id"].startswith("ev-")
+    assert result["modifiedDate"] == "2026-08-01"
+
+
+@pytest.mark.asyncio
 async def test_research_uses_snippets_when_every_page_is_blocked(monkeypatch):
     search_gateway._QUERY_LOCKS.clear()
     search_gateway._QUERY_LOCK_USERS.clear()

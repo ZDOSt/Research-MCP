@@ -37,9 +37,10 @@ RUN apt-get update \
     && mkdir -p /run/search-gateway-web /run/search-gateway-pdf /home/app/.cache \
     && chown -R app:app /app /home/app /run/search-gateway-web /run/search-gateway-pdf \
     && chmod -R a+rX /ms-playwright
-COPY --chown=app:app browser.py egress_policy.py extractors.py gateway_fetch.py \
+COPY --chown=app:app browser.py egress_policy.py evidence_quality.py extractors.py gateway_fetch.py \
     gateway_pdf_runner.py pdf_sandbox.py redaction.py request_limits.py safe_egress.py \
-    search_gateway.py socks5_client.py web_runner.py ./
+    search_gateway.py socks5_client.py web_runner.py evaluate_search_quality.py ./
+COPY --chown=app:app evals ./evals
 USER app
 EXPOSE 8080
 ENTRYPOINT ["dumb-init", "--"]
