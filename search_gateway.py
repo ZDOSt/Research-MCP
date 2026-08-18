@@ -119,7 +119,7 @@ FIRECRAWL_MAX_RESPONSE_BYTES = max(
 FIRECRAWL_MAX_RESULTS = max(
     1, int(os.getenv("FIRECRAWL_MAX_RESULTS", "20"))
 )
-CACHE_SCHEMA_VERSION = "quality-v3"
+CACHE_SCHEMA_VERSION = "quality-v4"
 
 
 _CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
@@ -143,6 +143,20 @@ INSTRUCTION_RE = re.compile(
 )
 REPOSITORY_INTENT_RE = re.compile(
     r"\b(?:commit|github|gitlab|issue|pull request|repository|repo|source code|tag)\b",
+    re.I,
+)
+WEB_PLATFORM_RE = re.compile(
+    r"\b(?:browser|css|dom|html|javascript|service worker|typescript|web api|webextension)\b",
+    re.I,
+)
+PROGRAMMING_RE = re.compile(
+    r"\b(?:c\+\+|compile|compiler|function|golang|java|javascript|node\.js|python|"
+    r"rust|source code|stack trace|typescript)\b",
+    re.I,
+)
+UBUNTU_RE = re.compile(r"\b(?:apt|debian|linux mint|ubuntu)\b", re.I)
+TROUBLESHOOT_RE = re.compile(
+    r"\b(?:bug|crash|error|exception|failed|failure|fix|problem|stack trace|troubleshoot)\b",
     re.I,
 )
 DOCKER_DOCUMENTATION_QUERY_RE = re.compile(
@@ -201,7 +215,6 @@ SOURCE_PENALTIES = {
 }
 AUTHORITY_RANK_WEIGHT = 0.12
 BROAD_WEB_ENGINES = ("startpage", "bing", "brave")
-TECHNICAL_ENGINES = ("mdn", "stackoverflow", "askubuntu")
 NEWS_ENGINES = ("startpage news", "bing news", "brave.news", "reuters")
 ACADEMIC_ENGINES = ("arxiv", "pubmed", "semantic scholar", "openalex", "crossref")
 IMAGE_ENGINES = (
@@ -209,6 +222,35 @@ IMAGE_ENGINES = (
     "bing images",
     "brave.images",
     "wikicommons.images",
+)
+GENERIC_INTENT_TERMS = frozenset(
+    {
+        "best",
+        "compare",
+        "comparison",
+        "configure",
+        "configuration",
+        "current",
+        "error",
+        "fix",
+        "guide",
+        "install",
+        "installation",
+        "latest",
+        "manual",
+        "news",
+        "recommend",
+        "recommended",
+        "release",
+        "settings",
+        "setup",
+        "steps",
+        "today",
+        "troubleshoot",
+        "troubleshooting",
+        "upgrade",
+        "version",
+    }
 )
 
 
@@ -357,7 +399,12 @@ def _search_engines(
     engines = list(BROAD_WEB_ENGINES)
     site_restricted = bool(re.search(r"(?:^|\s)site:[^\s]+", variant, re.I))
     if "it" in effective and not site_restricted:
-        engines.extend(TECHNICAL_ENGINES)
+        if WEB_PLATFORM_RE.search(query):
+            engines.append("mdn")
+        if PROGRAMMING_RE.search(query) or TROUBLESHOOT_RE.search(query):
+            engines.append("stackoverflow")
+        if UBUNTU_RE.search(query):
+            engines.append("askubuntu")
     if "news" in effective:
         engines.extend(NEWS_ENGINES)
     if "science" in effective:
@@ -493,6 +540,21 @@ def _lexical_score(query: str, text: str) -> float:
     return matched / len(query_terms) + 0.25 * phrase
 
 
+def _subject_terms(query: str) -> list[str]:
+    return [term for term in _tokens(query) if term not in GENERIC_INTENT_TERMS]
+
+
+def _contains_term(text: str, term: str) -> bool:
+    return re.search(rf"(?<!\w){re.escape(term)}(?!\w)", text, re.I) is not None
+
+
+def _subject_coverage(query: str, text: str) -> float:
+    terms = _subject_terms(query)
+    if not terms:
+        return 1.0
+    return sum(_contains_term(text, term) for term in terms) / len(terms)
+
+
 def _candidate_score(
     query: str,
     item: dict[str, Any],
@@ -501,6 +563,10 @@ def _candidate_score(
 ) -> float:
     domain = _domain(str(item.get("url") or ""))
     text = f"{item.get('title', '')} {item.get('content', '')}"
+    subject_coverage = _subject_coverage(
+        query,
+        f"{text} {item.get('url', '')}",
+    )
     profile = source_profile(
         item.get("url"),
         title=str(item.get("title") or ""),
@@ -511,6 +577,7 @@ def _candidate_score(
     published = normalize_date(item.get("publishedDate") or item.get("published_at"))
     modified = normalize_date(item.get("modifiedDate") or item.get("modified_at"))
     score = 3.0 * _lexical_score(query, text)
+    score += 1.5 * subject_coverage
     score += 1.0 / max(1, rank)
     score += _source_adjustment(domain)
     score += float(profile["authority_adjustment"])
@@ -592,6 +659,9 @@ def _normalize_search_result(
     ):
         return None
     snippet = re.sub(r"\s+", " ", str(item.get("content") or "")).strip()
+    subject_coverage = _subject_coverage(query, f"{title} {snippet} {url}")
+    if _subject_terms(query) and subject_coverage == 0:
+        return None
     profile = source_profile(url, title=title, snippet=snippet, query=query)
     published = normalize_date(item.get("publishedDate") or item.get("published_at"))
     modified = normalize_date(item.get("modifiedDate") or item.get("modified_at"))
@@ -619,6 +689,7 @@ def _normalize_search_result(
         "primary_source_candidate": profile["primary_source_candidate"],
         "source_classification_method": profile["classification_method"],
         "intent_source_adjustment": intent_adjustment,
+        "subject_coverage": round(subject_coverage, 4),
         "published_at": published,
         "modified_at": modified,
         "freshness_score": max(

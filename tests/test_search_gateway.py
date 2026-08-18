@@ -72,12 +72,50 @@ def test_search_engines_are_bounded_by_intent_and_exclude_repository_search():
         "startpage",
         "bing",
         "brave",
-        "mdn",
-        "stackoverflow",
         "askubuntu",
     ]
     assert targeted == ["startpage", "bing", "brave"]
     assert "github" not in technical
+
+
+def test_specialized_engines_require_matching_subject_intent():
+    web = search_gateway._search_engines(
+        "How does the browser InstallEvent Web API work?", [], "browser installevent web api"
+    )
+    programming = search_gateway._search_engines(
+        "Python stack trace error in an async function", [], "python async error"
+    )
+    assert "mdn" in web
+    assert "stackoverflow" in programming
+    assert "mdn" not in programming
+
+
+def test_zero_subject_match_is_rejected_before_authority_can_boost_it():
+    result = search_gateway._normalize_search_result(
+        {
+            "title": "InstallEvent: InstallEvent() constructor",
+            "url": "https://developer.mozilla.org/en-US/docs/Web/API/InstallEvent/InstallEvent",
+            "content": "The InstallEvent constructor creates an event.",
+            "engine": "mdn",
+        },
+        "How do I install Docker Compose on Ubuntu?",
+        1,
+    )
+    assert result is None
+
+
+def test_subject_matching_does_not_accept_partial_words():
+    result = search_gateway._normalize_search_result(
+        {
+            "title": "Trusted package installation guide",
+            "url": "https://developer.example.com/trusted-packages",
+            "content": "Install a package from a trusted source.",
+            "engine": "startpage",
+        },
+        "How do I install Rust?",
+        1,
+    )
+    assert result is None
 
 
 def test_game_query_uses_strategy_terms_not_product_measurements():
