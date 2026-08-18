@@ -1,10 +1,11 @@
 # Private Search Gateway
 
 This project is a deterministic, self-hosted search and page-retrieval backend
-for AI frontends. It exposes a SearXNG-compatible search endpoint, discovers
-sources with a small set of search engines, opens the strongest pages, extracts
-their actual contents, follows a bounded number of relevant same-site links,
-reranks evidence locally, and returns cited source URLs and page-derived text.
+for AI frontends. It exposes a fast SearXNG-compatible discovery endpoint, a
+bounded integrated search route, and Firecrawl-compatible scrape/search routes.
+The gateway discovers sources with a small set of search engines, opens pages
+only when the selected route asks for it, extracts their actual contents,
+reranks evidence locally, and returns source URLs and page-derived text.
 
 It does not call a paid search API or an internal language model. The frontend's
 model receives the retrieved evidence and writes the answer. This keeps the
@@ -62,16 +63,18 @@ cp .env.example .env
 chmod 600 .env
 ```
 
-Generate two different secrets:
+Generate three different secrets:
 
 ```console
 openssl rand -hex 32
 openssl rand -hex 32
+openssl rand -hex 32
 ```
 
-Edit `.env` and replace `SEARXNG_SECRET` and `CRAWL4AI_API_TOKEN` with those
-values. Change `CLIENT_DOCKER_NETWORK` only if your frontend uses a different
-external Docker network.
+Edit `.env` and replace `SEARXNG_SECRET`, `CRAWL4AI_API_TOKEN`, and
+`FIRECRAWL_API_KEY` with three different values. Change
+`CLIENT_DOCKER_NETWORK` only if your frontend uses a different external Docker
+network.
 
 Validate and start the complete stack:
 
@@ -102,9 +105,9 @@ docker exec your-frontend-container sh -lc \
   "wget -qO- 'http://search-gateway:8080/search?q=how+to+install+docker+compose&format=json' | head -c 1000"
 ```
 
-The response should contain `results`, source URLs, extracted `content`, and
-diagnostics. Search snippets are used only as a clearly labeled fallback when a
-site blocks extraction or the request deadline is reached.
+The response should contain `results`, source URLs, search snippets, and
+diagnostics. This endpoint intentionally does not crawl pages, so it returns
+quickly and is suitable for standard SearXNG integrations.
 
 ## Frontend setup
 
@@ -120,12 +123,15 @@ If it asks for the complete search path, use:
 http://search-gateway:8080/search
 ```
 
-AnythingLLM requires the complete search path even though its field is labeled
-`SearXNG API Base URL`. Configure it as:
+AnythingLLM requires the complete discovery path even though its field is
+labeled `SearXNG API Base URL`. Configure it as:
 
 ```text
 http://search-gateway:8080/search
 ```
+
+Use `http://search-gateway:8080/integrated/search` in that field instead when
+you specifically want AnythingLLM's search request to include a bounded crawl.
 
 The standard request is:
 
@@ -143,9 +149,67 @@ Supported query parameters include:
 
 When no category is supplied, the gateway infers useful SearXNG categories from
 the request. `auto` uses quick mode for simple lookups and balanced mode for
-technical questions and recommendations.
+technical questions and recommendations. The discovery route never crawls.
 
-For direct integrations, a richer JSON endpoint is also available:
+### Integrated search and Firecrawl compatibility
+
+For a frontend that has one combined search/scraper setting, use the bounded
+integrated route:
+
+```text
+http://search-gateway:8080/integrated/search
+```
+
+It performs SearXNG discovery, crawls at most the configured number of top
+pages, and returns page-derived `content`. Its default timeout and crawl budget
+are intentionally smaller than `/v1/research`.
+
+For LibreChat, Open WebUI, or LobeChat Firecrawl settings, use this API base:
+
+```text
+http://search-gateway:8080
+```
+
+The gateway implements `POST /v2/scrape` and `POST /v2/search`. Set the
+frontend's Firecrawl API key to the same value as `FIRECRAWL_API_KEY` in the
+gateway `.env`. The scraper accepts the common Markdown request and returns
+`success`, `data.markdown`, and `data.metadata.sourceURL`. The Firecrawl routes
+require a Bearer token and use the existing URL validation, direct extraction,
+Crawl4AI, Playwright, and PDF isolation controls.
+
+Use these internal Docker URLs:
+
+| Frontend | Search setting | Scraper setting |
+| --- | --- | --- |
+| AnythingLLM | `http://search-gateway:8080/search` or `/integrated/search` | Use the integrated route when its separate scraper cannot be changed |
+| LibreChat | SearXNG base `http://search-gateway:8080` | Firecrawl base `http://search-gateway:8080` |
+| Open WebUI | SearXNG query URL `http://search-gateway:8080/search?q=<query>&format=json` | `FIRECRAWL_API_BASE_URL=http://search-gateway:8080` |
+| LobeChat | Configure its preferred search provider separately | `FIRECRAWL_URL=http://search-gateway:8080/v2` |
+
+For Open WebUI select the Firecrawl web loader and set `FIRECRAWL_API_KEY`.
+For LobeChat include Firecrawl in `CRAWLER_IMPLS` and set the same key. For
+LibreChat select SearXNG as the search provider and Firecrawl as the scraper;
+permit the private `search-gateway` address in its web-search allowlist.
+
+Examples:
+
+```http
+POST /v2/scrape
+Authorization: Bearer <FIRECRAWL_API_KEY>
+Content-Type: application/json
+
+{"url":"https://example.com","formats":["markdown"]}
+```
+
+```http
+POST /v2/search
+Authorization: Bearer <FIRECRAWL_API_KEY>
+Content-Type: application/json
+
+{"query":"how to install Docker Compose","limit":5}
+```
+
+For direct integrations, the full bounded research endpoint is also available:
 
 ```http
 POST /v1/research

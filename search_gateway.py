@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import json
 import logging
 import math
@@ -17,7 +18,7 @@ from typing import Any, Literal
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
-from fastapi import FastAPI, HTTPException, Query, Response
+from fastapi import FastAPI, Header, HTTPException, Query, Response
 from pydantic import BaseModel, ConfigDict, Field
 
 from gateway_fetch import fetch_page
@@ -68,6 +69,38 @@ FINALIZATION_RESERVE_SECONDS = max(
 )
 CANDIDATE_RERANKER_TIMEOUT_SECONDS = max(
     0.25, float(os.getenv("GATEWAY_CANDIDATE_RERANKER_TIMEOUT_SECONDS", "2"))
+)
+
+# Compatibility routes deliberately have smaller budgets than deep research.
+# They are intended for frontends that expect a quick search or one-page scrape.
+INTEGRATED_TIMEOUT_SECONDS = max(
+    5.0, float(os.getenv("GATEWAY_INTEGRATED_TIMEOUT_SECONDS", "20"))
+)
+INTEGRATED_MAX_SEARCH_RESULTS = max(
+    4, int(os.getenv("GATEWAY_INTEGRATED_MAX_SEARCH_RESULTS", "16"))
+)
+INTEGRATED_MAX_CRAWL_PAGES = max(
+    1, int(os.getenv("GATEWAY_INTEGRATED_MAX_CRAWL_PAGES", "3"))
+)
+INTEGRATED_MAX_RESULTS = max(
+    1, int(os.getenv("GATEWAY_INTEGRATED_MAX_RESULTS", "5"))
+)
+FIRECRAWL_API_KEY = os.getenv("FIRECRAWL_API_KEY", "").strip()
+FIRECRAWL_TIMEOUT_SECONDS = max(
+    5.0, float(os.getenv("FIRECRAWL_TIMEOUT_SECONDS", "20"))
+)
+FIRECRAWL_MAX_TIMEOUT_SECONDS = max(
+    FIRECRAWL_TIMEOUT_SECONDS,
+    float(os.getenv("FIRECRAWL_MAX_TIMEOUT_SECONDS", "45")),
+)
+FIRECRAWL_MAX_CONTENT_CHARS = max(
+    10_000, int(os.getenv("FIRECRAWL_MAX_CONTENT_CHARS", "300000"))
+)
+FIRECRAWL_MAX_RESPONSE_BYTES = max(
+    65_536, int(os.getenv("FIRECRAWL_MAX_RESPONSE_BYTES", "4194304"))
+)
+FIRECRAWL_MAX_RESULTS = max(
+    1, int(os.getenv("FIRECRAWL_MAX_RESULTS", "20"))
 )
 
 
@@ -150,6 +183,33 @@ class SearchRequest(BaseModel):
     language: str = Field(default="auto", min_length=1, max_length=32)
     time_range: Literal["day", "week", "month", "year"] | None = None
     categories: list[str] = Field(default_factory=list, max_length=8)
+
+
+class DiscoveryRequest(SearchRequest):
+    """Search-only request that may ask for more candidates than final evidence."""
+
+    max_results: int = Field(default=5, ge=1, le=MAX_SEARCH_RESULTS)
+
+
+class FirecrawlScrapeRequest(BaseModel):
+    """Subset of Firecrawl v2 scrape options used by supported frontends."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    url: str = Field(min_length=1, max_length=8192)
+    formats: list[str] = Field(default_factory=lambda: ["markdown"], max_length=8)
+    timeout: int | None = Field(default=None, ge=1000, le=120_000)
+
+
+class FirecrawlSearchRequest(BaseModel):
+    """Subset of Firecrawl v2 search options mapped to SearXNG discovery."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    query: str = Field(min_length=1, max_length=QUERY_MAX_CHARS)
+    limit: int = Field(default=5, ge=1, le=FIRECRAWL_MAX_RESULTS)
+    lang: str = Field(default="auto", min_length=1, max_length=32)
+    tbs: str | None = Field(default=None, max_length=16)
 
 
 class GatewayBusyError(RuntimeError):
@@ -353,6 +413,9 @@ def _normalize_search_result(item: dict[str, Any], query: str, rank: int) -> dic
         "engines": item.get("engines") or ([item.get("engine")] if item.get("engine") else []),
         "image_url": item.get("img_src") or item.get("image_url"),
         "thumbnail_url": item.get("thumbnail_src") or item.get("thumbnail"),
+        "category": item.get("category"),
+        "template": item.get("template"),
+        "parsed_url": item.get("parsed_url"),
     }
 
 
@@ -759,8 +822,12 @@ def _assemble_results(
     return output[:limit]
 
 
-def _cache_key(request: SearchRequest) -> str:
-    payload = json.dumps(request.model_dump(), sort_keys=True, separators=(",", ":"))
+def _cache_key(request: SearchRequest, pipeline: str = "research") -> str:
+    payload = json.dumps(
+        {"pipeline": pipeline, "request": request.model_dump()},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -810,17 +877,253 @@ async def _cache_set(key: str, result: dict[str, Any]) -> None:
     if client is not None:
         with suppress(Exception):
             await asyncio.wait_for(
-                client.setex(
+                client.set(
                     f"search-gateway:v1:{key}",
-                    CACHE_STALE_SECONDS,
                     json.dumps(cached, ensure_ascii=False),
+                    ex=CACHE_STALE_SECONDS,
                 ),
                 0.25,
             )
 
 
-async def research(request: SearchRequest) -> dict[str, Any]:
-    key = _cache_key(request)
+def _searx_result(item: dict[str, Any]) -> dict[str, Any]:
+    """Map an internal candidate back to the fields SearXNG clients expect."""
+
+    return {
+        "title": item.get("title", ""),
+        "url": item.get("url", ""),
+        "content": item.get("snippet", ""),
+        "snippet": item.get("snippet", ""),
+        "engine": "search-gateway",
+        "engines": item.get("engines") or ["search-gateway"],
+        "score": item.get("discovery_score", 0.0),
+        "publishedDate": item.get("published_at"),
+        "img_src": item.get("image_url"),
+        "thumbnail_src": item.get("thumbnail_url"),
+        "category": item.get("category"),
+        "template": item.get("template"),
+        "parsed_url": item.get("parsed_url"),
+    }
+
+
+def _truncate_utf8(value: str, max_bytes: int) -> str:
+    encoded = value.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return value
+    return encoded[:max_bytes].decode("utf-8", errors="ignore")
+
+
+def _search_payload(
+    query: str,
+    candidates: list[dict[str, Any]],
+    diagnostics: dict[str, Any],
+    started: float,
+    *,
+    cache: str,
+) -> dict[str, Any]:
+    results = [_searx_result(item) for item in candidates]
+    return {
+        "query": query,
+        "number_of_results": len(results),
+        "results": results,
+        "suggestions": [],
+        "answers": [],
+        "corrections": [],
+        "infoboxes": [],
+        "unresponsive_engines": [
+            item
+            for search in diagnostics.get("searches", [])
+            for item in search.get("unresponsive_engines", [])
+        ],
+        "diagnostics": diagnostics,
+        "duration_seconds": round(time.monotonic() - started, 3),
+        "cache": cache,
+    }
+
+
+async def discovery_search(request: SearchRequest) -> dict[str, Any]:
+    """Return bounded SearXNG discovery results without crawling pages."""
+
+    key = _cache_key(request, "search")
+    cached = await _cache_get(key)
+    if cached and time.time() - cached["cached_at"] <= CACHE_TTL_SECONDS:
+        result = dict(cached["result"])
+        result["cache"] = "fresh"
+        return result
+
+    lock = _QUERY_LOCKS.setdefault(key, asyncio.Lock())
+    _QUERY_LOCK_USERS[key] = _QUERY_LOCK_USERS.get(key, 0) + 1
+    try:
+        async with lock:
+            cached = await _cache_get(key)
+            if cached and time.time() - cached["cached_at"] <= CACHE_TTL_SECONDS:
+                result = dict(cached["result"])
+                result["cache"] = "fresh-coalesced"
+                return result
+
+            acquired = False
+            try:
+                await asyncio.wait_for(_ADMISSION.acquire(), ADMISSION_TIMEOUT_SECONDS)
+                acquired = True
+            except TimeoutError as exc:
+                raise GatewayBusyError("Search gateway is at capacity") from exc
+
+            try:
+                started = time.monotonic()
+                mode = _mode_for(request.query, request.mode)
+                diagnostics: dict[str, Any] = {
+                    "mode": mode,
+                    "pipeline": "discovery",
+                    "partial": False,
+                }
+                timed_out = False
+                try:
+                    async with asyncio.timeout(
+                        max(SEARCH_TIMEOUT_SECONDS + 1.0, 3.0)
+                    ):
+                        candidates, search_diagnostics = await _searx_search(
+                            request.query,
+                            mode=mode,
+                            max_results=min(MAX_SEARCH_RESULTS, request.max_results),
+                            language=request.language,
+                            time_range=request.time_range,
+                            categories=request.categories,
+                        )
+                    diagnostics["searches"] = search_diagnostics
+                except TimeoutError:
+                    diagnostics["partial"] = True
+                    diagnostics["deadline_exceeded"] = True
+                    timed_out = True
+                    candidates, search_diagnostics = [], []
+                    diagnostics["searches"] = search_diagnostics
+                if timed_out:
+                    raise TimeoutError("SearXNG discovery deadline exceeded")
+                if candidates == [] and diagnostics["searches"] and all(
+                    item.get("status") == "failed"
+                    for item in diagnostics["searches"]
+                ):
+                    raise RuntimeError("SearXNG discovery failed")
+                result = _search_payload(
+                    request.query,
+                    candidates[: request.max_results],
+                    diagnostics,
+                    started,
+                    cache="miss",
+                )
+                await _cache_set(key, result)
+                return result
+            finally:
+                if acquired:
+                    _ADMISSION.release()
+    except Exception as exc:
+        if cached and cached.get("result"):
+            result = dict(cached["result"])
+            result["cache"] = "stale-fallback"
+            diagnostics = dict(result.get("diagnostics") or {})
+            diagnostics["refresh_error"] = type(exc).__name__
+            result["diagnostics"] = diagnostics
+            return result
+        raise
+    finally:
+        users = _QUERY_LOCK_USERS.get(key, 1) - 1
+        if users <= 0:
+            _QUERY_LOCK_USERS.pop(key, None)
+            _QUERY_LOCKS.pop(key, None)
+        else:
+            _QUERY_LOCK_USERS[key] = users
+
+
+def _scrape_cache_key(url: str) -> str:
+    payload = json.dumps(
+        {"pipeline": "scrape", "url": url},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _firecrawl_scrape_payload(
+    page: dict[str, Any], requested_url: str
+) -> dict[str, Any]:
+    source_url = str(page.get("url") or requested_url)
+    content = _truncate_utf8(
+        str(page.get("content") or "")[:FIRECRAWL_MAX_CONTENT_CHARS],
+        FIRECRAWL_MAX_RESPONSE_BYTES,
+    )
+    metadata = {
+        "title": page.get("title") or "",
+        "sourceURL": source_url,
+        "statusCode": page.get("status_code"),
+    }
+    data: dict[str, Any] = {"markdown": content, "metadata": metadata}
+    links = page.get("links")
+    if isinstance(links, list):
+        data["links"] = [
+            item.get("url")
+            for item in links
+            if isinstance(item, dict) and item.get("url")
+        ][:500]
+    return {"success": True, "data": data}
+
+
+async def scrape_page(url: str, timeout_seconds: float) -> dict[str, Any]:
+    """Fetch one public page with cache, coalescing, and admission control."""
+
+    canonical_url = _canonical_url(url)
+    if canonical_url is None:
+        raise ValueError("Invalid scrape URL")
+    key = _scrape_cache_key(canonical_url)
+    cached = await _cache_get(key)
+    if cached and time.time() - cached["cached_at"] <= CACHE_TTL_SECONDS:
+        return dict(cached["result"])
+
+    lock = _QUERY_LOCKS.setdefault(key, asyncio.Lock())
+    _QUERY_LOCK_USERS[key] = _QUERY_LOCK_USERS.get(key, 0) + 1
+    try:
+        async with lock:
+            cached = await _cache_get(key)
+            if cached and time.time() - cached["cached_at"] <= CACHE_TTL_SECONDS:
+                return dict(cached["result"])
+
+            acquired = False
+            try:
+                await asyncio.wait_for(_ADMISSION.acquire(), ADMISSION_TIMEOUT_SECONDS)
+                acquired = True
+            except TimeoutError as exc:
+                raise GatewayBusyError("Search gateway is at capacity") from exc
+            try:
+                page = await fetch_page(
+                    canonical_url,
+                    "Extract the useful information from this page.",
+                    timeout_seconds,
+                    allow_expensive_fallback=True,
+                )
+                result = _firecrawl_scrape_payload(page, canonical_url)
+                await _cache_set(key, result)
+                return result
+            finally:
+                if acquired:
+                    _ADMISSION.release()
+    except Exception:
+        if cached and cached.get("result"):
+            return dict(cached["result"])
+        raise
+    finally:
+        users = _QUERY_LOCK_USERS.get(key, 1) - 1
+        if users <= 0:
+            _QUERY_LOCK_USERS.pop(key, None)
+            _QUERY_LOCKS.pop(key, None)
+        else:
+            _QUERY_LOCK_USERS[key] = users
+
+
+async def research(
+    request: SearchRequest,
+    *,
+    budget_override: Budget | None = None,
+    pipeline: str = "research",
+) -> dict[str, Any]:
+    key = _cache_key(request, pipeline)
     cached = await _cache_get(key)
     if cached and time.time() - cached["cached_at"] <= CACHE_TTL_SECONDS:
         result = dict(cached["result"])
@@ -849,7 +1152,9 @@ async def research(request: SearchRequest) -> dict[str, Any]:
             try:
                 started = time.monotonic()
                 mode = _mode_for(request.query, request.mode)
-                budget = MODE_BUDGETS[mode]
+                budget = budget_override or MODE_BUDGETS[mode]
+                if budget_override is not None:
+                    mode = "integrated"
                 deadline = started + budget.total_seconds
                 diagnostics: dict[str, Any] = {"mode": mode, "partial": False}
                 candidates: list[dict[str, Any]] = []
@@ -1062,8 +1367,8 @@ async def searx_compatible_search(
     del format, pageno
     category_list = [item.strip() for item in categories.split(",") if item.strip()][:8]
     try:
-        return await research(
-            SearchRequest(
+        return await discovery_search(
+            DiscoveryRequest(
                 query=q,
                 mode=mode,
                 max_results=max_results,
@@ -1083,6 +1388,156 @@ async def searx_compatible_search(
     except Exception as exc:
         LOGGER.warning("Search request failed: %s", type(exc).__name__)
         raise HTTPException(status_code=502, detail="Search retrieval failed") from exc
+
+
+@app.get("/integrated/search")
+async def integrated_search(
+    q: str = Query(min_length=1, max_length=QUERY_MAX_CHARS),
+    format: Literal["json"] = "json",
+    language: str = Query(default="auto", min_length=1, max_length=32),
+    time_range: Literal["day", "week", "month", "year"] | None = None,
+    categories: str = Query(default="", max_length=200),
+    max_results: int = Query(default=5, ge=1, le=MAX_FINAL_RESULTS),
+    mode: Literal["auto", "quick", "balanced", "deep"] = "auto",
+) -> dict[str, Any]:
+    """AnythingLLM-friendly bounded search plus page extraction."""
+
+    del format
+    category_list = [item.strip() for item in categories.split(",") if item.strip()][:8]
+    request = SearchRequest(
+        query=q,
+        mode=mode,
+        max_results=min(max_results, INTEGRATED_MAX_RESULTS),
+        language=language,
+        time_range=time_range,
+        categories=category_list,
+    )
+    budget = Budget(
+        search_results=min(MAX_SEARCH_RESULTS, INTEGRATED_MAX_SEARCH_RESULTS),
+        crawl_pages=min(MAX_CRAWL_PAGES, INTEGRATED_MAX_CRAWL_PAGES),
+        follow_links=0,
+        final_results=min(MAX_FINAL_RESULTS, INTEGRATED_MAX_RESULTS),
+        total_seconds=INTEGRATED_TIMEOUT_SECONDS,
+    )
+    try:
+        return await research(request, budget_override=budget, pipeline="integrated")
+    except TimeoutError as exc:
+        raise HTTPException(status_code=504, detail="Integrated search deadline exceeded") from exc
+    except GatewayBusyError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Search gateway is busy",
+            headers={"Retry-After": "1"},
+        ) from exc
+    except Exception as exc:
+        LOGGER.warning("Integrated search request failed: %s", type(exc).__name__)
+        raise HTTPException(status_code=502, detail="Integrated search failed") from exc
+
+
+def _require_firecrawl_auth(
+    authorization: str | None,
+    x_api_key: str | None,
+) -> None:
+    """Require the configured frontend credential for Firecrawl compatibility."""
+
+    if not FIRECRAWL_API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="Firecrawl compatibility is not configured",
+        )
+    supplied = ""
+    if authorization:
+        scheme, _, token = authorization.partition(" ")
+        if scheme.casefold() == "bearer":
+            supplied = token.strip()
+    if not supplied and x_api_key:
+        supplied = x_api_key.strip()
+    if not supplied or not hmac.compare_digest(supplied, FIRECRAWL_API_KEY):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid Firecrawl API key",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
+@app.post("/v2/scrape")
+async def firecrawl_scrape(
+    request: FirecrawlScrapeRequest,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict[str, Any]:
+    """Firecrawl v2-compatible scrape backed by the protected fetch pipeline."""
+
+    _require_firecrawl_auth(authorization, x_api_key)
+    formats = {str(item).strip() for item in request.formats if str(item).strip()}
+    if formats and "markdown" not in formats:
+        raise HTTPException(
+            status_code=422,
+            detail="This compatible scraper supports the markdown format",
+        )
+    timeout_seconds = FIRECRAWL_TIMEOUT_SECONDS
+    if request.timeout is not None:
+        timeout_seconds = min(
+            FIRECRAWL_MAX_TIMEOUT_SECONDS,
+            max(1.0, request.timeout / 1000.0),
+        )
+    try:
+        async with asyncio.timeout(timeout_seconds):
+            return await scrape_page(request.url, timeout_seconds)
+    except TimeoutError as exc:
+        raise HTTPException(status_code=504, detail="Scrape deadline exceeded") from exc
+    except GatewayBusyError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Search gateway is busy",
+            headers={"Retry-After": "1"},
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="Invalid scrape URL") from exc
+    except Exception as exc:
+        LOGGER.warning("Firecrawl scrape failed: %s", type(exc).__name__)
+        raise HTTPException(status_code=502, detail="Page scrape failed") from exc
+
+
+@app.post("/v2/search")
+async def firecrawl_search(
+    request: FirecrawlSearchRequest,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict[str, Any]:
+    """Firecrawl v2-compatible discovery search backed by SearXNG."""
+
+    _require_firecrawl_auth(authorization, x_api_key)
+    search_request = DiscoveryRequest(
+        query=request.query,
+        mode="quick",
+        max_results=min(request.limit, MAX_SEARCH_RESULTS),
+        language=request.lang,
+        time_range=None,
+        categories=[],
+    )
+    try:
+        result = await discovery_search(search_request)
+    except TimeoutError as exc:
+        raise HTTPException(status_code=504, detail="Search deadline exceeded") from exc
+    except GatewayBusyError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Search gateway is busy",
+            headers={"Retry-After": "1"},
+        ) from exc
+    except Exception as exc:
+        LOGGER.warning("Firecrawl search failed: %s", type(exc).__name__)
+        raise HTTPException(status_code=502, detail="Search retrieval failed") from exc
+    web = [
+        {
+            "url": item.get("url", ""),
+            "title": item.get("title", ""),
+            "description": item.get("snippet", ""),
+        }
+        for item in result.get("results", [])
+    ]
+    return {"success": True, "data": {"web": web}}
 
 
 @app.post("/v1/research")
@@ -1107,6 +1562,8 @@ async def root() -> dict[str, str]:
     return {
         "service": "private-evidence-search-gateway",
         "search": "/search?q=your+question&format=json",
+        "integrated_search": "/integrated/search?q=your+question&format=json",
+        "firecrawl": "/v2/scrape",
         "health": "/healthz",
     }
 

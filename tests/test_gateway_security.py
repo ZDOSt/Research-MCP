@@ -107,6 +107,7 @@ class ChunkedBody(httpx.AsyncByteStream):
     ("app", "path", "limit"),
     [
         (search_gateway.app, "/v1/research", search_gateway.MAX_REQUEST_BYTES),
+        (search_gateway.app, "/v2/scrape", search_gateway.MAX_REQUEST_BYTES),
         (web_runner.app, "/v1/explore", web_runner.WEB_RUNNER_MAX_REQUEST_BYTES),
     ],
 )
@@ -154,7 +155,7 @@ async def test_cached_search_bypasses_saturated_admission(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_searx_compatible_endpoint_returns_gateway_results(monkeypatch):
+async def test_searx_compatible_endpoint_returns_discovery_results(monkeypatch):
     expected = {
         "query": "install example",
         "number_of_results": 1,
@@ -167,11 +168,11 @@ async def test_searx_compatible_endpoint_returns_gateway_results(monkeypatch):
         ],
     }
 
-    async def fake_research(request):
+    async def fake_discovery(request):
         assert request.query == "install example"
         return expected
 
-    monkeypatch.setattr(search_gateway, "research", fake_research)
+    monkeypatch.setattr(search_gateway, "discovery_search", fake_discovery)
     transport = httpx.ASGITransport(app=search_gateway.app)
     async with httpx.AsyncClient(transport=transport, base_url="http://gateway") as client:
         response = await client.get(

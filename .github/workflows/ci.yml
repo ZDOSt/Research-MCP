@@ -45,11 +45,13 @@ jobs:
         env:
           SEARXNG_SECRET: ci-only-searxng-secret
           CRAWL4AI_API_TOKEN: ci-only-crawl4ai-token
+          FIRECRAWL_API_KEY: ci-only-firecrawl-key
         run: docker compose config --quiet
       - name: Validate real SearXNG startup with read-only config
         env:
           SEARXNG_SECRET: ci-only-searxng-secret
           CRAWL4AI_API_TOKEN: ci-only-crawl4ai-token
+          FIRECRAWL_API_KEY: ci-only-firecrawl-key
         run: |
           docker compose up -d --no-deps --wait searxng
           docker compose exec -T searxng wget -qO- http://127.0.0.1:8080/ >/dev/null
@@ -59,6 +61,7 @@ jobs:
           CLIENT_DOCKER_NETWORK: ci-client-network
           SEARXNG_SECRET: ci-only-searxng-secret
           CRAWL4AI_API_TOKEN: ci-only-crawl4ai-token
+          FIRECRAWL_API_KEY: ci-only-firecrawl-key
         run: |
           docker compose config --format json |
             python -c 'import json, sys; compose = json.load(sys.stdin); assert all(not service.get("ports") for service in compose["services"].values()); assert compose["networks"]["client"]["name"] == "ci-client-network"'
