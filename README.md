@@ -177,14 +177,27 @@ gateway `.env`. The scraper accepts the common Markdown request and returns
 require a Bearer token and use the existing URL validation, direct extraction,
 Crawl4AI, Playwright, and PDF isolation controls.
 
+The gateway also implements a Jina-compatible `POST /v1/rerank` endpoint backed
+by the stack's local BGE reranker. It uses the same Bearer credential as the
+Firecrawl routes. This adapter lets LibreChat include relevant passages from
+scraped pages in the model-visible Web Search result without a hosted reranking
+service. If the local model is unavailable or exceeds its bounded deadline, the
+adapter returns lexical fallback passages instead of an empty result.
+
+Queries containing an explicit HTTP or HTTPS URL bypass SearXNG discovery. The
+supplied URL is returned as the deterministic direct discovery result and
+then passes through the same authenticated Firecrawl-compatible scraper. This
+prevents direct-page requests from depending on whether a search engine happens
+to index the supplied URL.
+
 Use these internal Docker URLs:
 
-| Frontend | Search setting | Scraper setting |
-| --- | --- | --- |
-| AnythingLLM | `http://search-gateway:8080/search` or `/integrated/search` | Use the integrated route when its separate scraper cannot be changed |
-| LibreChat | SearXNG base `http://search-gateway:8080` | Firecrawl base `http://search-gateway:8080` |
-| Open WebUI | SearXNG query URL `http://search-gateway:8080/search?q=<query>&format=json` | `FIRECRAWL_API_BASE_URL=http://search-gateway:8080` |
-| LobeChat | Configure its preferred search provider separately | `FIRECRAWL_URL=http://search-gateway:8080/v2` |
+| Frontend | Search setting | Scraper setting | Reranker setting |
+| --- | --- | --- | --- |
+| AnythingLLM | `http://search-gateway:8080/search` or `/integrated/search` | Use the integrated route when its separate scraper cannot be changed | Included in integrated search |
+| LibreChat | SearXNG base `http://search-gateway:8080` | Firecrawl base `http://search-gateway:8080` | Jina URL `http://search-gateway:8080/v1/rerank` |
+| Open WebUI | SearXNG query URL `http://search-gateway:8080/search?q=<query>&format=json` | `FIRECRAWL_API_BASE_URL=http://search-gateway:8080` | Configure separately in the frontend |
+| LobeChat | Configure its preferred search provider separately | `FIRECRAWL_URL=http://search-gateway:8080/v2` | Configure separately in the frontend |
 
 For Open WebUI select the Firecrawl web loader and set `FIRECRAWL_API_KEY`.
 For LobeChat include Firecrawl in `CRAWLER_IMPLS` and set the same key. For
@@ -207,6 +220,20 @@ Authorization: Bearer <FIRECRAWL_API_KEY>
 Content-Type: application/json
 
 {"query":"how to install Docker Compose","limit":5}
+```
+
+```http
+POST /v1/rerank
+Authorization: Bearer <FIRECRAWL_API_KEY>
+Content-Type: application/json
+
+{
+  "model": "jina-reranker-v2-base-multilingual",
+  "query": "Docker Engine Ubuntu installation commands",
+  "documents": ["first passage", "second passage"],
+  "top_n": 5,
+  "return_documents": true
+}
 ```
 
 For direct integrations, the full bounded research endpoint is also available:

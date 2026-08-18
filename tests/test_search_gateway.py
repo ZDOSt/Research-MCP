@@ -148,6 +148,34 @@ async def test_reranker_falls_back_to_lexical_order(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_reranker_falls_back_without_queueing_when_at_capacity(monkeypatch):
+    class UnexpectedClient:
+        async def __aenter__(self):
+            raise AssertionError("capacity fallback must not contact the reranker")
+
+        async def __aexit__(self, *args):
+            return False
+
+    semaphore = asyncio.Semaphore(1)
+    await semaphore.acquire()
+    monkeypatch.setattr(search_gateway, "_RERANK_ADMISSION", semaphore)
+    monkeypatch.setattr(search_gateway, "RERANKER_ADMISSION_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(
+        search_gateway.httpx, "AsyncClient", lambda **kwargs: UnexpectedClient()
+    )
+    docs = [
+        {"text": "unrelated text", "document_index": 0},
+        {"text": "apt-get install docker-ce", "document_index": 1},
+    ]
+
+    ranked, status = await search_gateway._rerank("install docker-ce", docs, 1)
+    semaphore.release()
+
+    assert status == "fallback:capacity"
+    assert ranked[0]["document_index"] == 1
+
+
+@pytest.mark.asyncio
 async def test_reranker_preserves_unscored_documents(monkeypatch):
     response = httpx.Response(
         200,

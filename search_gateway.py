@@ -29,6 +29,7 @@ LOGGER = logging.getLogger("search-gateway")
 SEARXNG_URL = os.getenv("SEARXNG_URL", "http://searxng:8080").rstrip("/")
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0").strip()
 RERANKER_URL = os.getenv("RERANKER_URL", "http://reranker:8000").rstrip("/")
+RERANKER_MODEL = os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-base").strip()
 REQUEST_TIMEOUT_SECONDS = max(
     5.0, float(os.getenv("GATEWAY_REQUEST_TIMEOUT_SECONDS", "28"))
 )
@@ -56,7 +57,13 @@ RERANKER_TIMEOUT_SECONDS = max(
 RERANKER_MAX_RESPONSE_BYTES = max(
     65_536, int(os.getenv("GATEWAY_RERANKER_MAX_RESPONSE_BYTES", "2097152"))
 )
-MAX_REQUEST_BYTES = max(4096, int(os.getenv("GATEWAY_MAX_REQUEST_BYTES", "65536")))
+MAX_CONCURRENT_RERANKS = max(
+    1, int(os.getenv("GATEWAY_MAX_CONCURRENT_RERANKS", "2"))
+)
+RERANKER_ADMISSION_TIMEOUT_SECONDS = max(
+    0.01, float(os.getenv("GATEWAY_RERANKER_ADMISSION_TIMEOUT_SECONDS", "0.25"))
+)
+MAX_REQUEST_BYTES = max(4096, int(os.getenv("GATEWAY_MAX_REQUEST_BYTES", "262144")))
 QUERY_MAX_CHARS = max(256, int(os.getenv("GATEWAY_QUERY_MAX_CHARS", "4000")))
 MAX_CONCURRENT_REQUESTS = max(
     1, int(os.getenv("GATEWAY_MAX_CONCURRENT_REQUESTS", "4"))
@@ -87,11 +94,11 @@ INTEGRATED_MAX_RESULTS = max(
 )
 FIRECRAWL_API_KEY = os.getenv("FIRECRAWL_API_KEY", "").strip()
 FIRECRAWL_TIMEOUT_SECONDS = max(
-    5.0, float(os.getenv("FIRECRAWL_TIMEOUT_SECONDS", "20"))
+    5.0, float(os.getenv("FIRECRAWL_TIMEOUT_SECONDS", "30"))
 )
 FIRECRAWL_MAX_TIMEOUT_SECONDS = max(
     FIRECRAWL_TIMEOUT_SECONDS,
-    float(os.getenv("FIRECRAWL_MAX_TIMEOUT_SECONDS", "45")),
+    float(os.getenv("FIRECRAWL_MAX_TIMEOUT_SECONDS", "60")),
 )
 FIRECRAWL_MAX_CONTENT_CHARS = max(
     10_000, int(os.getenv("FIRECRAWL_MAX_CONTENT_CHARS", "300000"))
@@ -109,6 +116,7 @@ _CACHE_LOCK = asyncio.Lock()
 _QUERY_LOCKS: dict[str, asyncio.Lock] = {}
 _QUERY_LOCK_USERS: dict[str, int] = {}
 _ADMISSION = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+_RERANK_ADMISSION = asyncio.Semaphore(MAX_CONCURRENT_RERANKS)
 _REDIS = None
 
 
@@ -144,6 +152,7 @@ RECOMMENDATION_RE = re.compile(
     re.I,
 )
 ERROR_QUOTE_RE = re.compile(r"(?:error|exception|failed|failure)[:\s]+(.{8,220})", re.I)
+URL_IN_QUERY_RE = re.compile(r"https?://[^\s<>\"']+", re.I)
 WORD_RE = re.compile(r"[^\W_]+(?:[-.][^\W_]+)*", re.UNICODE)
 STOP_WORDS = frozenset(
     "a an and are as at be best by can could do does find for from give how i in information "
@@ -210,6 +219,18 @@ class FirecrawlSearchRequest(BaseModel):
     limit: int = Field(default=5, ge=1, le=FIRECRAWL_MAX_RESULTS)
     lang: str = Field(default="auto", min_length=1, max_length=32)
     tbs: str | None = Field(default=None, max_length=16)
+
+
+class JinaRerankRequest(BaseModel):
+    """Subset of Jina's rerank request used by LibreChat web search."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    model: str = Field(default="BAAI/bge-reranker-base", min_length=1, max_length=200)
+    query: str = Field(min_length=1, max_length=QUERY_MAX_CHARS)
+    documents: list[str] = Field(min_length=1, max_length=1000)
+    top_n: int = Field(default=5, ge=1, le=20)
+    return_documents: bool = True
 
 
 class GatewayBusyError(RuntimeError):
@@ -333,6 +354,53 @@ def _canonical_url(value: object) -> str | None:
     ):
         display_host = f"{display_host}:{port}"
     return urlunsplit((scheme, display_host, parsed.path or "/", parsed.query, ""))
+
+
+def _extract_query_urls(query: str) -> list[str]:
+    """Return unique HTTP(S) URLs explicitly supplied in a query."""
+
+    urls: list[str] = []
+    seen: set[str] = set()
+    for match in URL_IN_QUERY_RE.finditer(query):
+        candidate = match.group(0).rstrip(".,;:!?")
+        for opening, closing in (("(", ")"), ("[", "]"), ("{", "}")):
+            while candidate.endswith(closing) and candidate.count(closing) > candidate.count(opening):
+                candidate = candidate[:-1]
+        canonical = _canonical_url(candidate)
+        if canonical is None or canonical in seen:
+            continue
+        seen.add(canonical)
+        urls.append(canonical)
+    return urls
+
+
+def _direct_url_candidates(query: str, max_results: int) -> list[dict[str, Any]]:
+    """Build deterministic discovery rows for URLs explicitly supplied by the client."""
+
+    candidates: list[dict[str, Any]] = []
+    for rank, url in enumerate(_extract_query_urls(query)[:max_results], start=1):
+        parsed = urlsplit(url)
+        domain = (parsed.hostname or "").lower()
+        path = parsed.path.rstrip("/") or "/"
+        candidates.append(
+            {
+                "title": f"{domain}{path}",
+                "url": url,
+                "domain": domain,
+                "snippet": "User-supplied URL selected for direct page extraction.",
+                "search_rank": rank,
+                "discovery_score": round(10.0 + _source_adjustment(domain), 4),
+                "source_authority": round(_source_adjustment(domain), 4),
+                "published_at": None,
+                "engines": ["direct-url"],
+                "image_url": None,
+                "thumbnail_url": None,
+                "category": "general",
+                "template": None,
+                "parsed_url": None,
+            }
+        )
+    return candidates
 
 
 def _source_adjustment(domain: str) -> float:
@@ -539,6 +607,12 @@ async def _rerank(
         return [], "empty"
     texts = [str(document["text"])[:MAX_PASSAGE_CHARS] for document in documents]
     try:
+        await asyncio.wait_for(
+            _RERANK_ADMISSION.acquire(), RERANKER_ADMISSION_TIMEOUT_SECONDS
+        )
+    except TimeoutError:
+        return _lexical_rerank(query, documents, top_k), "fallback:capacity"
+    try:
         async with asyncio.timeout(RERANKER_TIMEOUT_SECONDS):
             async with httpx.AsyncClient(
                 timeout=httpx.Timeout(RERANKER_TIMEOUT_SECONDS), trust_env=False
@@ -592,6 +666,8 @@ async def _rerank(
     except Exception as exc:
         LOGGER.warning("Reranker unavailable; using lexical fallback: %s", type(exc).__name__)
         return _lexical_rerank(query, documents, top_k), f"fallback:{type(exc).__name__}"
+    finally:
+        _RERANK_ADMISSION.release()
 
 
 def _lexical_rerank(
@@ -943,6 +1019,23 @@ def _search_payload(
 
 async def discovery_search(request: SearchRequest) -> dict[str, Any]:
     """Return bounded SearXNG discovery results without crawling pages."""
+
+    started = time.monotonic()
+    direct_candidates = _direct_url_candidates(request.query, request.max_results)
+    if direct_candidates:
+        return _search_payload(
+            request.query,
+            direct_candidates,
+            {
+                "mode": "direct",
+                "pipeline": "discovery",
+                "partial": False,
+                "direct_url_count": len(direct_candidates),
+                "searches": [],
+            },
+            started,
+            cache="bypass",
+        )
 
     key = _cache_key(request, "search")
     cached = await _cache_get(key)
@@ -1434,16 +1527,16 @@ async def integrated_search(
         raise HTTPException(status_code=502, detail="Integrated search failed") from exc
 
 
-def _require_firecrawl_auth(
+def _require_compat_auth(
     authorization: str | None,
     x_api_key: str | None,
 ) -> None:
-    """Require the configured frontend credential for Firecrawl compatibility."""
+    """Require the configured frontend credential for compatibility APIs."""
 
     if not FIRECRAWL_API_KEY:
         raise HTTPException(
             status_code=503,
-            detail="Firecrawl compatibility is not configured",
+            detail="Gateway compatibility APIs are not configured",
         )
     supplied = ""
     if authorization:
@@ -1455,9 +1548,44 @@ def _require_firecrawl_auth(
     if not supplied or not hmac.compare_digest(supplied, FIRECRAWL_API_KEY):
         raise HTTPException(
             status_code=401,
-            detail="Invalid Firecrawl API key",
+            detail="Invalid gateway API key",
             headers={"WWW-Authenticate": "Bearer"},
         )
+
+
+@app.post("/v1/rerank")
+async def jina_compatible_rerank(
+    request: JinaRerankRequest,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict[str, Any]:
+    """Jina-compatible adapter backed by the stack's local BGE reranker."""
+
+    _require_compat_auth(authorization, x_api_key)
+    documents = [
+        {"text": text, "document_index": index}
+        for index, text in enumerate(request.documents)
+    ]
+    ranked, status = await _rerank(
+        request.query,
+        documents,
+        min(request.top_n, len(documents)),
+    )
+    results: list[dict[str, Any]] = []
+    for item in ranked:
+        index = int(item["document_index"])
+        row: dict[str, Any] = {
+            "index": index,
+            "relevance_score": float(item.get("rerank_score") or 0.0),
+        }
+        if request.return_documents:
+            row["document"] = {"text": request.documents[index]}
+        results.append(row)
+    return {
+        "model": RERANKER_MODEL,
+        "results": results,
+        "backend_status": status,
+    }
 
 
 @app.post("/v2/scrape")
@@ -1468,7 +1596,7 @@ async def firecrawl_scrape(
 ) -> dict[str, Any]:
     """Firecrawl v2-compatible scrape backed by the protected fetch pipeline."""
 
-    _require_firecrawl_auth(authorization, x_api_key)
+    _require_compat_auth(authorization, x_api_key)
     formats = {str(item).strip() for item in request.formats if str(item).strip()}
     if formats and "markdown" not in formats:
         raise HTTPException(
@@ -1507,7 +1635,7 @@ async def firecrawl_search(
 ) -> dict[str, Any]:
     """Firecrawl v2-compatible discovery search backed by SearXNG."""
 
-    _require_firecrawl_auth(authorization, x_api_key)
+    _require_compat_auth(authorization, x_api_key)
     search_request = DiscoveryRequest(
         query=request.query,
         mode="quick",
@@ -1564,6 +1692,7 @@ async def root() -> dict[str, str]:
         "search": "/search?q=your+question&format=json",
         "integrated_search": "/integrated/search?q=your+question&format=json",
         "firecrawl": "/v2/scrape",
+        "reranker": "/v1/rerank",
         "health": "/healthz",
     }
 

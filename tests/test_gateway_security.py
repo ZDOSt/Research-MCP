@@ -107,6 +107,7 @@ class ChunkedBody(httpx.AsyncByteStream):
     ("app", "path", "limit"),
     [
         (search_gateway.app, "/v1/research", search_gateway.MAX_REQUEST_BYTES),
+        (search_gateway.app, "/v1/rerank", search_gateway.MAX_REQUEST_BYTES),
         (search_gateway.app, "/v2/scrape", search_gateway.MAX_REQUEST_BYTES),
         (web_runner.app, "/v1/explore", web_runner.WEB_RUNNER_MAX_REQUEST_BYTES),
     ],

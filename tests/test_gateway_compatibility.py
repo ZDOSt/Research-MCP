@@ -58,6 +58,37 @@ async def test_search_is_discovery_only_and_searx_compatible(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_search_routes_supplied_url_without_calling_searxng(monkeypatch):
+    async def unexpected(*args, **kwargs):
+        raise AssertionError("a supplied URL must bypass SearXNG discovery")
+
+    monkeypatch.setattr(search_gateway, "_cache_get", unexpected)
+    monkeypatch.setattr(search_gateway, "_searx_search", unexpected)
+
+    async with _client() as client:
+        response = await client.get(
+            "/search",
+            params={
+                "q": (
+                    "Read [the Docker guide]"
+                    "(https://docs.docker.com/engine/install/ubuntu/) and summarize it"
+                )
+            },
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["number_of_results"] == 1
+    assert payload["results"][0]["url"] == (
+        "https://docs.docker.com/engine/install/ubuntu/"
+    )
+    assert payload["results"][0]["engines"] == ["direct-url"]
+    assert payload["diagnostics"]["mode"] == "direct"
+    assert payload["diagnostics"]["direct_url_count"] == 1
+    assert payload["cache"] == "bypass"
+
+
+@pytest.mark.asyncio
 async def test_integrated_search_uses_bounded_research_budget(monkeypatch):
     captured = {}
 
@@ -120,6 +151,57 @@ async def test_firecrawl_scrape_requires_bearer_and_returns_markdown(monkeypatch
     assert payload["data"]["markdown"] == "# Extracted content"
     assert payload["data"]["metadata"]["sourceURL"] == "https://example.com/final"
     assert called and called[0][0] == "https://example.com/"
+
+
+@pytest.mark.asyncio
+async def test_jina_rerank_adapter_requires_auth_and_returns_librechat_shape(
+    monkeypatch,
+):
+    monkeypatch.setattr(search_gateway, "FIRECRAWL_API_KEY", "test-key")
+    captured = {}
+
+    async def rerank(query, documents, top_k):
+        captured.update(query=query, documents=documents, top_k=top_k)
+        selected = dict(documents[1])
+        selected["rerank_score"] = 0.91
+        return [selected], "ok"
+
+    monkeypatch.setattr(search_gateway, "_rerank", rerank)
+    request = {
+        "model": "jina-reranker-v2-base-multilingual",
+        "query": "Docker Engine Ubuntu installation commands",
+        "documents": [
+            "Docker documentation navigation",
+            "sudo apt-get install docker-ce docker-ce-cli containerd.io",
+        ],
+        "top_n": 1,
+        "return_documents": True,
+    }
+    async with _client() as client:
+        unauthorized = await client.post("/v1/rerank", json=request)
+        response = await client.post(
+            "/v1/rerank",
+            headers={"Authorization": "Bearer test-key"},
+            json=request,
+        )
+
+    assert unauthorized.status_code == 401
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["model"] == search_gateway.RERANKER_MODEL
+    assert payload["results"] == [
+        {
+            "index": 1,
+            "relevance_score": 0.91,
+            "document": {
+                "text": "sudo apt-get install docker-ce docker-ce-cli containerd.io"
+            },
+        }
+    ]
+    assert payload["backend_status"] == "ok"
+    assert captured["query"] == request["query"]
+    assert captured["top_k"] == 1
+    assert captured["documents"][1]["document_index"] == 1
 
 
 @pytest.mark.asyncio
