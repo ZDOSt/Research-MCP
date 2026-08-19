@@ -124,7 +124,7 @@ FIRECRAWL_MAX_RESPONSE_BYTES = max(
 FIRECRAWL_MAX_RESULTS = max(
     1, int(os.getenv("FIRECRAWL_MAX_RESULTS", "20"))
 )
-CACHE_SCHEMA_VERSION = "quality-v5"
+CACHE_SCHEMA_VERSION = "quality-v6"
 
 
 _CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
@@ -138,7 +138,8 @@ _REDIS = None
 
 TECHNICAL_RE = re.compile(
     r"\b(?:api|compose|config(?:uration)?|container|docker|error|exception|fix|github|"
-    r"install|kubernetes|linux|log|manual|postgres|server|setup|stack trace|vps)\b",
+    r"install|kubernetes|linux|log|manual|nginx|postgres|python|redis|server|setup|"
+    r"stack trace|vps|virtual environment)\b",
     re.I,
 )
 INSTRUCTION_RE = re.compile(
@@ -169,12 +170,12 @@ DOCKER_DOCUMENTATION_QUERY_RE = re.compile(
     r"(?:docker(?:\s+compose)?|docker-compose)\b|"
     r"\b(?:docker(?:\s+compose)?|docker-compose)\s+"
     r"(?:config(?:uration)?|error|exception|fix|guide|install(?:ation)?|manual|"
-    r"setup|troubleshoot(?:ing)?)\b|\bcompose\.ya?ml\b|"
-    r"\bcompose\s+(?:file|plugin|stack)\b)",
+    r"reference|schema|setup|specification|troubleshoot(?:ing)?)\b|"
+    r"\bcompose\s+plugin\b)",
     re.I,
 )
 CURRENT_RE = re.compile(
-    r"\b(?:current|latest|new|news|patch|release|recent|today|tonight|version)\b",
+    r"\b(?:current|latest|new|news|patch|release|recent|today|tonight)\b",
     re.I,
 )
 ACADEMIC_RE = re.compile(
@@ -182,22 +183,14 @@ ACADEMIC_RE = re.compile(
     re.I,
 )
 IMAGE_RE = re.compile(r"\b(?:image|images|photo|photos|picture|pictures|wallpaper)\b", re.I)
-GAME_RE = re.compile(
-    r"\b(?:game|gaming|team composition|tier list|character build|party composition)\b",
-    re.I,
-)
-GAME_CONTEXT_RE = re.compile(
-    r"(?:\bawakening\b.*\b(?:armor|build|character|equipment|gear|karma|party|team|"
-    r"weapon)\b|\b(?:armor|build|character|equipment|gear|karma|party|team|weapon)\b"
-    r".*\bawakening\b)",
-    re.I,
-)
 RECOMMENDATION_RE = re.compile(
     r"\b(?:best|compare|comparison|recommend|recommended|settings|team composition|tier list)\b",
     re.I,
 )
+COMPARISON_INTENT_RE = re.compile(r"\b(?:compare|comparison|versus|vs\.?)(?:\b|$)", re.I)
 ERROR_QUOTE_RE = re.compile(r"(?:error|exception|failed|failure)[:\s]+(.{8,220})", re.I)
 URL_IN_QUERY_RE = re.compile(r"https?://[^\s<>\"']+", re.I)
+QUOTED_PHRASE_RE = re.compile(r'"([^"\r\n]{2,160})"')
 WORD_RE = re.compile(r"[^\W_]+(?:[-.][^\W_]+)*", re.UNICODE)
 STOP_WORDS = frozenset(
     "a an and are as at be best by can could do does find for from give how i in information "
@@ -261,6 +254,25 @@ GENERIC_INTENT_TERMS = frozenset(
         "troubleshooting",
         "upgrade",
         "version",
+    }
+)
+ANCHOR_CONNECTORS = frozenset({"and", "of", "the", "vs", "versus"})
+ANCHOR_EXCLUDED_TERMS = frozenset(
+    {
+        *STOP_WORDS,
+        *GENERIC_INTENT_TERMS,
+        "current",
+        "latest",
+        "new",
+        "recent",
+        "today",
+        "tonight",
+        "use",
+        "using",
+        "read",
+        "explain",
+        "show",
+        "help",
     }
 )
 
@@ -348,37 +360,209 @@ def _tokens(value: object) -> list[str]:
     seen: set[str] = set()
     for token in WORD_RE.findall(str(value or "").casefold()):
         token = token.strip("-.")
-        if len(token) < 2 or token in STOP_WORDS or token in seen:
+        if (len(token) < 2 and not token.isdigit()) or token in STOP_WORDS or token in seen:
             continue
         seen.add(token)
         output.append(token)
     return output[:80]
 
 
+def _topic_anchor(query: str) -> str | None:
+    """Extract a high-confidence subject without requiring domain-specific labels.
+
+    This is deliberately conservative. A model-provided quoted phrase, a product
+    identifier, acronym, version number, or proper-name phrase is useful for
+    relevance gating. Ordinary natural-language queries remain unanchored so the
+    gateway does not reject valid paraphrases.
+    """
+
+    quoted = [
+        re.sub(r"\s+", " ", match.group(1)).strip()
+        for match in QUOTED_PHRASE_RE.finditer(query)
+    ]
+    quoted = [
+        phrase
+        for phrase in quoted
+        if len(re.sub(r"[\W_]+", "", phrase, flags=re.UNICODE)) >= 2
+    ]
+    if quoted:
+        return quoted[0]
+
+    words = list(WORD_RE.finditer(query))
+    if not words:
+        return None
+
+    def is_identifier(word: str) -> bool:
+        letters = re.sub(r"[^a-zA-Z]", "", word)
+        return bool(
+            re.search(r"\d", word)
+            or re.search(r"[a-z][A-Z]|[A-Z][a-z].*[A-Z]", word)
+            or (letters and letters.isupper() and len(letters) >= 2)
+        )
+
+    def is_candidate(word: str, index: int) -> bool:
+        normalized = word.casefold().strip("-.")
+        if not normalized or normalized in ANCHOR_EXCLUDED_TERMS:
+            return False
+        return is_identifier(word) or (
+            index > 0 and word[:1].isupper() and word[1:].islower()
+        )
+
+    candidates = [
+        is_candidate(word.group(0).strip("-."), index)
+        for index, word in enumerate(words)
+    ]
+    for index, word in enumerate(words):
+        if (
+            candidates[index]
+            or word.group(0).casefold() in ANCHOR_EXCLUDED_TERMS
+            or not word.group(0)[:1].isupper()
+            or not word.group(0)[1:].islower()
+        ):
+            continue
+        cursor = index + 1
+        while (
+            cursor < len(words)
+            and words[cursor].group(0).casefold() in ANCHOR_CONNECTORS
+        ):
+            cursor += 1
+        if cursor < len(words) and candidates[cursor]:
+            candidates[index] = True
+    groups: list[tuple[list[str], int, int]] = []
+    for start, word in enumerate(words):
+        if not candidates[start]:
+            continue
+        group = [word.group(0).strip("-.")]
+        identifiers = int(is_identifier(group[0]))
+        cursor = start + 1
+        while cursor < len(words):
+            if candidates[cursor]:
+                group.append(words[cursor].group(0).strip("-."))
+                identifiers += int(is_identifier(group[-1]))
+                cursor += 1
+                continue
+            if (
+                words[cursor].group(0).casefold() in ANCHOR_CONNECTORS
+                and cursor + 1 < len(words)
+                and candidates[cursor + 1]
+            ):
+                group.extend(
+                    [
+                        words[cursor].group(0).casefold(),
+                        words[cursor + 1].group(0).strip("-."),
+                    ]
+                )
+                identifiers += int(is_identifier(group[-1]))
+                cursor += 2
+                continue
+            break
+        if len(_tokens(" ".join(group))) >= 2:
+            groups.append((group, identifiers, start))
+
+    if groups:
+        group, _, _ = min(
+            groups,
+            key=lambda item: (
+                item[2],
+                not bool(item[1]),
+                -item[1],
+                -len(_tokens(" ".join(item[0]))),
+            ),
+        )
+        return " ".join(group)
+
+    # A single identifier can still be a precise subject (AW3426DW, HTTP, NIST).
+    return next(
+        (word.group(0).strip("-.") for index, word in enumerate(words) if candidates[index] and is_identifier(word.group(0))),
+        None,
+    )
+
+
+def _anchor_matches(anchor: str, text: str) -> bool:
+    """Match compact, spaced, and multi-entity spellings without substrings."""
+
+    anchor_words = WORD_RE.findall(anchor)
+    anchor_parts: list[str] = []
+    for word in anchor_words:
+        # Treat CamelCase subjects (for example DragonSword) as either a
+        # compact or spaced spelling, while keeping numeric versions bounded.
+        anchor_parts.extend(re.findall(r"[A-Z]+(?=[A-Z][a-z]|\d|$)|[A-Z]?[a-z]+|\d+", word))
+    anchor_parts = anchor_parts[:32]
+    compact_pattern = r"[\W_]{0,16}".join(
+        re.escape(part) for part in anchor_parts
+    )
+    if compact_pattern and re.search(
+        rf"(?<!\w){compact_pattern}(?!\w)", text, re.I
+    ):
+        return True
+    terms = _tokens(anchor)
+    identifiers = [
+        term
+        for term in terms
+        if len(re.sub(r"[^a-z0-9]", "", term)) >= 4
+        and re.search(r"[a-z]", term, re.I)
+        and re.search(r"\d", term)
+    ]
+    if identifiers and any(_contains_term(text, term) for term in identifiers):
+        return True
+    return bool(terms) and all(_contains_term(text, term) for term in terms)
+
+
+def _anchor_query(anchor: str, query: str) -> str:
+    """Quote the subject while preserving the model's wording and intent."""
+
+    if any(anchor.casefold() == phrase.casefold() for phrase in QUOTED_PHRASE_RE.findall(query)):
+        return query
+    return re.sub(re.escape(anchor), f'"{anchor}"', query, count=1, flags=re.I)
+
+
+def _topic_anchor_is_strict(query: str, anchor: str | None) -> bool:
+    """Return whether a topic is precise enough for hard relevance filtering."""
+
+    if not anchor:
+        return False
+    if any(anchor.casefold() == phrase.casefold() for phrase in QUOTED_PHRASE_RE.findall(query)):
+        return True
+    terms = WORD_RE.findall(anchor)
+    if not terms:
+        return False
+    # Short feature labels (4K, HDR, USB, Wi-Fi) are useful soft signals but
+    # have many natural-language paraphrases. Keep them out of hard filtering.
+    if len(terms) == 1:
+        term = terms[0]
+        compact = re.sub(r"[\W_]+", "", term)
+        if re.search(r"\d", term):
+            return len(compact) >= 4
+        if re.search(r"[a-z][A-Z]", term) and not re.search(r"[-.]", term):
+            return len(compact) >= 6
+        return term.isupper() and len(compact) >= 4
+    # A multiword subject containing a version/model marker is precise enough
+    # to require a topic match (for example iPhone 17 or Path of Exile 2).
+    return any(bool(re.search(r"\d", term)) for term in terms)
+
+
 def _query_variants(query: str, mode: str) -> list[str]:
     normalized = re.sub(r"\s+", " ", query).strip()
-    terms = _tokens(normalized)
-    compact = " ".join(terms[:16])
-    variants = [compact or normalized]
+    topic_anchor = _topic_anchor(normalized)
+    strict_anchor = _topic_anchor_is_strict(normalized, topic_anchor)
+    variants = [_anchor_query(topic_anchor, normalized)] if topic_anchor else [normalized]
     error = ERROR_QUOTE_RE.search(normalized)
-    if error:
+    if error and not strict_anchor:
         variants.append(f'"{error.group(1).strip()}"')
-    if TECHNICAL_RE.search(normalized):
-        if DOCKER_DOCUMENTATION_QUERY_RE.search(normalized):
-            variants.append(f"{compact or normalized} site:docs.docker.com")
-        else:
-            variants.append(f"{compact or normalized} official documentation guide")
-    elif GAME_RE.search(normalized) or GAME_CONTEXT_RE.search(normalized):
-        variants.append(f"{compact or normalized} strategy guide wiki")
-    elif RECOMMENDATION_RE.search(normalized):
-        variants.append(f"{compact or normalized} review measurements guide")
+    if DOCKER_DOCUMENTATION_QUERY_RE.search(normalized):
+        variants.append(f"{normalized} site:docs.docker.com")
+    elif TECHNICAL_RE.search(normalized) and INSTRUCTION_RE.search(normalized):
+        variants.append(f"{normalized} official documentation")
     elif CURRENT_RE.search(normalized):
-        variants.append(f"{compact or normalized} latest")
-    elif compact.casefold() != normalized.casefold():
+        variants.append(f"{normalized} latest")
+    elif topic_anchor:
         variants.append(normalized)
+    elif TECHNICAL_RE.search(normalized):
+        variants.append(f"{normalized} official documentation")
     if mode == "deep" and len(variants) < 3:
-        variants.append(f"{compact or normalized} authoritative sources")
-    return list(dict.fromkeys(variants))[:3]
+        variants.append(f"{normalized} authoritative sources")
+    limit = 3 if mode == "deep" else 2
+    return list(dict.fromkeys(variants))[:limit]
 
 
 def _search_categories(query: str, categories: list[str]) -> list[str]:
@@ -589,6 +773,9 @@ def _candidate_score(
     modified = normalize_date(item.get("modifiedDate") or item.get("modified_at"))
     score = 3.0 * _lexical_score(query, text)
     score += 1.5 * subject_coverage
+    topic_anchor = _topic_anchor(query)
+    if topic_anchor:
+        score += 1.4 if _anchor_matches(topic_anchor, f"{text} {item.get('url', '')}") else -0.8
     score += 1.0 / max(1, rank)
     score += _source_adjustment(domain)
     score += float(profile["authority_adjustment"])
@@ -670,7 +857,33 @@ def _normalize_search_result(
     ):
         return None
     snippet = re.sub(r"\s+", " ", str(item.get("content") or "")).strip()
-    subject_coverage = _subject_coverage(query, f"{title} {snippet} {url}")
+    searchable_text = f"{title} {snippet} {url}"
+    topic_anchor = _topic_anchor(query)
+    topic_match = not topic_anchor or _anchor_matches(topic_anchor, searchable_text)
+    topic_strict = _topic_anchor_is_strict(query, topic_anchor)
+    if topic_strict and not topic_match:
+        return None
+    anchor_terms = _tokens(topic_anchor) if topic_anchor else []
+    anchor_match_count = sum(
+        _contains_term(searchable_text, term) for term in anchor_terms
+    )
+    if topic_anchor and not topic_match:
+        soft_anchor = any(
+            (term.isupper() and len(re.sub(r"[\W_]+", "", term)) <= 3)
+            or re.search(r"[-.]", term)
+            or (re.search(r"\d", term) and len(re.sub(r"[\W_]+", "", term)) < 4)
+            for term in WORD_RE.findall(topic_anchor)
+        )
+        required_anchor_terms = (
+            0
+            if soft_anchor and not topic_strict
+            else 1
+            if COMPARISON_INTENT_RE.search(query)
+            else min(2, len(anchor_terms))
+        )
+        if anchor_match_count < required_anchor_terms:
+            return None
+    subject_coverage = _subject_coverage(query, searchable_text)
     if _subject_terms(query) and subject_coverage == 0:
         return None
     profile = source_profile(url, title=title, snippet=snippet, query=query)
@@ -701,6 +914,10 @@ def _normalize_search_result(
         "source_classification_method": profile["classification_method"],
         "intent_source_adjustment": intent_adjustment,
         "subject_coverage": round(subject_coverage, 4),
+        "topic_anchor": topic_anchor,
+        "topic_match": topic_match,
+        "topic_strict": topic_strict,
+        "topic_term_matches": anchor_match_count,
         "published_at": published,
         "modified_at": modified,
         "freshness_score": max(
@@ -1138,7 +1355,7 @@ def _passage_documents(pages: list[dict[str, Any]], query: str) -> list[dict[str
         reranker_context = "\n".join(context_parts)
         for passage_index, passage in enumerate(_chunk_text(str(page.get("content") or ""))):
             lexical = _lexical_score(query, passage)
-            if lexical <= 0 and passage_index > 1:
+            if lexical <= 0 and passage_index > 6:
                 continue
             documents.append(
                 {
@@ -1433,6 +1650,10 @@ async def discovery_search(request: SearchRequest) -> dict[str, Any]:
                     "mode": mode,
                     "pipeline": "discovery",
                     "partial": False,
+                    "topic_anchor": _topic_anchor(request.query),
+                    "topic_strict": _topic_anchor_is_strict(
+                        request.query, _topic_anchor(request.query)
+                    ),
                 }
                 timed_out = False
                 try:

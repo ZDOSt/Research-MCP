@@ -21,7 +21,7 @@ def test_generic_technical_query_uses_general_documentation_variant():
     variants = search_gateway._query_variants(
         "How do I install PostgreSQL on Ubuntu?", "balanced"
     )
-    assert any("official documentation guide" in item for item in variants)
+    assert any("official documentation" in item for item in variants)
     assert all("site:docs.docker.com" not in item for item in variants)
 
 
@@ -37,7 +37,7 @@ def test_installing_an_application_with_docker_does_not_target_docker_docs():
         "How do I install Example with Docker?", "balanced"
     )
     assert all("site:docs.docker.com" not in item for item in variants)
-    assert any("official documentation guide" in item for item in variants)
+    assert any("official documentation" in item for item in variants)
 
 
 def test_search_categories_are_inferred_from_intent():
@@ -54,6 +54,9 @@ def test_search_categories_are_inferred_from_intent():
     assert search_gateway._search_categories("find images of a nebula", []) == [
         "general",
         "images",
+    ]
+    assert search_gateway._search_categories("What is version control?", []) == [
+        "general"
     ]
 
 
@@ -118,23 +121,213 @@ def test_subject_matching_does_not_accept_partial_words():
     assert result is None
 
 
-def test_game_query_uses_strategy_terms_not_product_measurements():
+def test_recommendation_queries_preserve_the_models_subject_and_intent():
     variants = search_gateway._query_variants(
         "Best team composition in DragonSword Awakening", "balanced"
     )
-    assert any("strategy guide wiki" in item for item in variants)
+    assert any("DragonSword" in item for item in variants)
     assert all("measurements" not in item for item in variants)
 
     equipment_variants = search_gateway._query_variants(
         "DragonSword Awakening best equipment Theresia Astria Roxy", "balanced"
     )
-    assert any("strategy guide wiki" in item for item in equipment_variants)
     assert all("measurements" not in item for item in equipment_variants)
 
-    non_game_variants = search_gateway._query_variants(
-        "Best books about spiritual awakening", "balanced"
+    product_variants = search_gateway._query_variants(
+        "Best Android TV box based on measurements", "balanced"
     )
-    assert all("strategy guide wiki" not in item for item in non_game_variants)
+    assert any("android" in item.casefold() for item in product_variants)
+    assert all("strategy guide wiki" not in item for item in product_variants)
+
+
+@pytest.mark.parametrize(
+    ("query", "anchor"),
+    [
+        ("DragonSword Awakening best equipment", "DragonSword Awakening"),
+        ("What are the best Alienware AW3426DW settings?", "Alienware AW3426DW"),
+        ("Who is Taylor Swift?", "Taylor Swift"),
+        ("Best beginner build for Path of Exile 2", "Path of Exile 2"),
+        ("Compare Redis and Valkey licensing", "Redis and Valkey"),
+        ('Fix the error "connection refused by upstream"', "connection refused by upstream"),
+    ],
+)
+def test_topic_anchor_is_domain_agnostic(query, anchor):
+    assert search_gateway._topic_anchor(query) == anchor
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "Recent academic survey of retrieval augmented generation evaluation",
+        "What is the recommended way to create a Python virtual environment?",
+        "Important artificial intelligence regulation news today",
+    ],
+)
+def test_broad_queries_are_not_forced_into_an_entity_anchor(query):
+    assert search_gateway._topic_anchor(query) is None
+
+
+def test_precise_queries_keep_an_exact_and_relaxed_form():
+    inferred = search_gateway._query_variants(
+        "DragonSword Awakening best equipment characters guide", "balanced"
+    )
+    explicit = search_gateway._query_variants(
+        '"DragonSword Awakening" Theresia Astria Roxy', "balanced"
+    )
+
+    assert inferred[0].startswith('"DragonSword Awakening"')
+    assert any(item.startswith("DragonSword Awakening") for item in inferred[1:])
+    assert explicit[0].startswith('"DragonSword Awakening"')
+    assert all(len(item) > len('"DragonSword Awakening"') for item in explicit)
+    assert search_gateway._topic_anchor(
+        '"DragonSword Awakening" Theresia Astria Roxy'
+    ) == "DragonSword Awakening"
+    assert search_gateway._topic_anchor(
+        "Persona 5 best team composition"
+    ) == "Persona 5"
+    assert search_gateway._topic_anchor(
+        "Squid Game character build"
+    ) == "Squid Game"
+
+
+def test_topic_anchor_prefers_the_subject_over_later_feature_terms():
+    assert search_gateway._topic_anchor(
+        "Best Android TV boxes with AV1, Dolby Vision, and gigabit Ethernet"
+    ) == "Android TV"
+    assert search_gateway._topic_anchor("Path of Exile 2 best build") == "Path of Exile 2"
+
+
+@pytest.mark.parametrize("query", [
+    "Best 4K TVs for gaming",
+    "Best HDR monitors",
+    "Best USB microphones",
+    "Best Wi-Fi routers",
+    "Best Android TV boxes",
+])
+def test_generic_feature_anchors_are_soft_not_hard_filters(query):
+    anchor = search_gateway._topic_anchor(query)
+    assert anchor is not None
+    assert not search_gateway._topic_anchor_is_strict(query, anchor)
+
+
+def test_compact_anchor_matching_does_not_match_a_longer_numeric_version():
+    assert search_gateway._anchor_matches(
+        "Path of Exile 2", "Path-of-Exile-2 beginner build"
+    )
+    assert not search_gateway._anchor_matches(
+        "Path of Exile 2", "Path of Exile 20 beginner build"
+    )
+
+
+def test_soft_feature_anchor_allows_a_natural_language_paraphrase():
+    result = search_gateway._normalize_search_result(
+        {
+            "title": "Best televisions for gaming with high dynamic range",
+            "url": "https://display.example/best-gaming-televisions",
+            "content": "A comparison of 4K televisions and HDR support.",
+            "engine": "bing",
+        },
+        "Best 4K TVs for gaming",
+        1,
+    )
+    assert result is not None
+    assert result["topic_strict"] is False
+
+
+def test_entity_filter_rejects_generic_word_matches_before_authority_ranking():
+    query = "DragonSword Awakening best equipment characters guide"
+    unrelated = search_gateway._normalize_search_result(
+        {
+            "title": "Dragon - mythological creature",
+            "url": "https://www.britannica.com/topic/dragon-mythological-creature",
+            "content": "A dragon is a legendary character in folklore.",
+            "engine": "bing",
+        },
+        query,
+        1,
+    )
+    relevant = search_gateway._normalize_search_result(
+        {
+            "title": "Dragon Sword Awakening equipment guide",
+            "url": "https://example.com/dragon-sword-awakening-guide",
+            "content": "Recommended equipment for the playable characters.",
+            "engine": "bing",
+        },
+        query,
+        2,
+    )
+
+    assert unrelated is None
+    assert relevant is not None
+    assert relevant["topic_anchor"] == "DragonSword Awakening"
+    assert relevant["topic_match"] is True
+
+
+def test_spaced_entity_rejects_a_single_ambiguous_word_match():
+    result = search_gateway._normalize_search_result(
+        {
+            "title": "Dragon - mythological creature",
+            "url": "https://www.britannica.com/topic/dragon-mythological-creature",
+            "content": "A dragon is a legendary character in folklore.",
+            "engine": "bing",
+        },
+        "Dragon Sword Awakening game Astria",
+        1,
+    )
+    assert result is None
+
+
+def test_product_identifier_can_match_without_repeating_the_brand():
+    result = search_gateway._normalize_search_result(
+        {
+            "title": "AW3426DW recommended HDR settings",
+            "url": "https://display.example/AW3426DW/settings",
+            "content": "Measured SDR and HDR configuration values.",
+            "engine": "bing",
+        },
+        "Best Alienware AW3426DW settings",
+        1,
+    )
+    assert result is not None
+    assert result["topic_strict"] is True
+
+
+def test_comparison_queries_keep_sources_covering_one_side():
+    result = search_gateway._normalize_search_result(
+        {
+            "title": "Redis licensing and compatibility",
+            "url": "https://redis.io/legal/licenses/",
+            "content": "Redis licensing and migration details.",
+            "engine": "bing",
+        },
+        "Compare Redis and Valkey licensing and migration",
+        1,
+    )
+    assert result is not None
+    assert result["topic_match"] is False
+    assert result["topic_term_matches"] == 1
+
+
+def test_application_compose_search_does_not_target_docker_documentation():
+    variants = search_gateway._query_variants(
+        "Find the best docker-compose file for Immich", "balanced"
+    )
+    assert all("site:docs.docker.com" not in item for item in variants)
+    assert any("immich" in item.casefold() for item in variants)
+
+
+def test_current_queries_get_a_freshness_variant_before_generic_documentation():
+    variants = search_gateway._query_variants(
+        "What is the current version of Docker?", "balanced"
+    )
+    assert any(item.endswith(" latest") for item in variants)
+    assert all("official documentation" not in item for item in variants)
+
+
+def test_variant_count_is_bounded_by_mode():
+    query = "Best current settings for Alienware AW3426DW"
+    assert len(search_gateway._query_variants(query, "balanced")) <= 2
+    assert len(search_gateway._query_variants(query, "deep")) <= 3
 
 
 def test_candidate_scoring_prefers_relevant_official_sources():
@@ -270,6 +463,71 @@ async def test_searx_variants_use_local_rank_and_targeted_engine_routing(monkeyp
     assert targeted["engines"] == "startpage,bing,brave"
     assert all("categories" not in params for params in captured)
     assert diagnostics[1]["requested_engines"] == ["startpage", "bing", "brave"]
+
+
+@pytest.mark.asyncio
+async def test_discovery_rejects_topic_drift_across_exact_and_relaxed_queries(monkeypatch):
+    captured = []
+
+    class Stream:
+        def __init__(self, params):
+            self.params = params
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        def raise_for_status(self):
+            return None
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        def stream(self, method, url, params):
+            captured.append(params["q"])
+            return Stream(params)
+
+    async def read(response, max_bytes=0):
+        return {
+            "results": [
+                {
+                    "title": "Dragon - mythological creature",
+                    "url": "https://www.britannica.com/topic/dragon-mythological-creature",
+                    "content": "A dragon is a legendary character in folklore.",
+                    "engine": "bing",
+                },
+                {
+                    "title": "Dragon Sword Awakening equipment guide",
+                    "url": "https://guide.example/dragon-sword-awakening-equipment",
+                    "content": "Character equipment recommendations and builds.",
+                    "engine": "bing",
+                },
+            ]
+        }
+
+    monkeypatch.setattr(search_gateway.httpx, "AsyncClient", lambda **kwargs: Client())
+    monkeypatch.setattr(search_gateway, "_read_json_response", read)
+
+    results, _ = await search_gateway._searx_search(
+        "DragonSword Awakening best equipment characters guide",
+        mode="balanced",
+        max_results=10,
+        language="auto",
+        time_range=None,
+        categories=[],
+    )
+
+    assert captured == [
+        '"DragonSword Awakening" best equipment characters guide',
+        "DragonSword Awakening best equipment characters guide",
+    ]
+    assert [item["domain"] for item in results] == ["guide.example"]
 
 
 def test_lexical_reranking_preserves_source_authority():
