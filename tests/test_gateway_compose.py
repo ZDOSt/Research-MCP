@@ -30,6 +30,10 @@ def test_web_services_are_isolated_behind_egress_broker():
         assert "seccomp=./seccomp_profile.json" in services[name]["security_opt"]
     assert compose["networks"]["web-sandbox"]["internal"] is True
     assert set(services["safe-egress"]["networks"]) == {"web-sandbox", "egress"}
+    assert (
+        services["crawl4ai"]["environment"]["CRAWL4AI_ALLOW_INTERNAL_URLS"]
+        == "true"
+    )
 
 
 def test_search_and_pdf_control_networks_are_private():
@@ -70,6 +74,7 @@ def test_documented_runtime_limits_are_wired_to_their_consumers():
             "GATEWAY_INTEGRATED_MAX_CRAWL_PAGES",
             "GATEWAY_INTEGRATED_MAX_RESULTS",
             "GATEWAY_CACHE_MAX_ENTRIES",
+            "GATEWAY_RERANKER_MAX_BATCH_SIZE",
             "SAFE_EGRESS_DNS_TIMEOUT_SECONDS",
             "FIRECRAWL_API_KEY",
             "FIRECRAWL_TIMEOUT_SECONDS",

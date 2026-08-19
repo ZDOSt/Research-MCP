@@ -517,12 +517,20 @@ async def fetch_page(
     elapsed = asyncio.get_running_loop().time() - started
     remaining = timeout_seconds - elapsed
     if allow_expensive_fallback and remaining > 2:
+        # Crawl4AI and Playwright cover different failure modes. Preserve time
+        # for the final renderer instead of allowing the first browser to
+        # consume the entire page deadline.
+        browser_reserve = min(8.0, max(3.5, timeout_seconds * 0.35))
+        crawl_timeout = min(10.0, remaining - browser_reserve)
         try:
-            crawled = await crawl4ai_fetch(url, min(remaining, 15.0))
-            if content_is_usable(crawled, 500):
-                return crawled
-            if best is None or crawled.get("content_chars", 0) > best.get("content_chars", 0):
-                best = crawled
+            if crawl_timeout > 1:
+                crawled = await crawl4ai_fetch(url, crawl_timeout)
+                if content_is_usable(crawled, 500):
+                    return crawled
+                if best is None or crawled.get("content_chars", 0) > best.get(
+                    "content_chars", 0
+                ):
+                    best = crawled
         except Exception as exc:
             errors.append(f"crawl4ai:{type(exc).__name__}")
 

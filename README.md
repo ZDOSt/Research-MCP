@@ -186,8 +186,17 @@ The gateway also implements a Jina-compatible `POST /v1/rerank` endpoint backed
 by the stack's local BGE reranker. It uses the same Bearer credential as the
 Firecrawl routes. This adapter lets LibreChat include relevant passages from
 scraped pages in the model-visible Web Search result without a hosted reranking
-service. If the local model is unavailable or exceeds its bounded deadline, the
-adapter returns lexical fallback passages instead of an empty result.
+service. Frontend requests larger than the local model's 32-text client limit
+are split into bounded batches and their scores are merged. If the local model
+is unavailable or exceeds its bounded deadline, the adapter returns lexical
+fallback passages instead of an empty result.
+
+Crawl4AI runs without direct public DNS or Internet access. Its redundant
+in-container destination precheck is disabled because it cannot resolve public
+targets in that topology. URL syntax is checked by `web-runner`, and every
+actual browser connection still passes through the pinning proxy and
+`safe-egress`, which resolves the hostname and rejects private, loopback,
+link-local, metadata, and otherwise non-public destinations.
 
 Queries containing an explicit HTTP or HTTPS URL bypass SearXNG discovery. The
 supplied URL is returned as the deterministic direct discovery result and

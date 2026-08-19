@@ -67,6 +67,11 @@ RERANKER_TIMEOUT_SECONDS = max(
 RERANKER_MAX_RESPONSE_BYTES = max(
     65_536, int(os.getenv("GATEWAY_RERANKER_MAX_RESPONSE_BYTES", "2097152"))
 )
+# The pinned CPU TEI image rejects client batches larger than 32. Keep the
+# gateway-side value capped even if an operator accidentally configures more.
+RERANKER_MAX_BATCH_SIZE = min(
+    32, max(1, int(os.getenv("GATEWAY_RERANKER_MAX_BATCH_SIZE", "32")))
+)
 MAX_CONCURRENT_RERANKS = max(
     1, int(os.getenv("GATEWAY_MAX_CONCURRENT_RERANKS", "2"))
 )
@@ -179,6 +184,12 @@ ACADEMIC_RE = re.compile(
 IMAGE_RE = re.compile(r"\b(?:image|images|photo|photos|picture|pictures|wallpaper)\b", re.I)
 GAME_RE = re.compile(
     r"\b(?:game|gaming|team composition|tier list|character build|party composition)\b",
+    re.I,
+)
+GAME_CONTEXT_RE = re.compile(
+    r"(?:\bawakening\b.*\b(?:armor|build|character|equipment|gear|karma|party|team|"
+    r"weapon)\b|\b(?:armor|build|character|equipment|gear|karma|party|team|weapon)\b"
+    r".*\bawakening\b)",
     re.I,
 )
 RECOMMENDATION_RE = re.compile(
@@ -357,7 +368,7 @@ def _query_variants(query: str, mode: str) -> list[str]:
             variants.append(f"{compact or normalized} site:docs.docker.com")
         else:
             variants.append(f"{compact or normalized} official documentation guide")
-    elif GAME_RE.search(normalized):
+    elif GAME_RE.search(normalized) or GAME_CONTEXT_RE.search(normalized):
         variants.append(f"{compact or normalized} strategy guide wiki")
     elif RECOMMENDATION_RE.search(normalized):
         variants.append(f"{compact or normalized} review measurements guide")
@@ -841,42 +852,60 @@ async def _rerank(
     except TimeoutError:
         return _lexical_rerank(query, documents, top_k), "fallback:capacity"
     try:
-        async with asyncio.timeout(RERANKER_TIMEOUT_SECONDS):
-            async with httpx.AsyncClient(
-                timeout=httpx.Timeout(RERANKER_TIMEOUT_SECONDS), trust_env=False
-            ) as client:
-                async with client.stream(
-                    "POST",
-                    f"{RERANKER_URL}/rerank",
-                    json={"query": query, "texts": texts},
-                ) as response:
-                    response.raise_for_status()
-                    payload = await _read_json_value(
-                        response, RERANKER_MAX_RESPONSE_BYTES
-                    )
-        rows = payload.get("results") if isinstance(payload, dict) else payload
-        if not isinstance(rows, list):
-            raise ValueError("Invalid reranker response")
+        deadline = time.monotonic() + RERANKER_TIMEOUT_SECONDS
         scored: list[dict[str, Any]] = []
         scored_indices: set[int] = set()
-        for row in rows:
-            if not isinstance(row, dict) or not isinstance(row.get("index"), int):
-                continue
-            index = row["index"]
-            if not 0 <= index < len(documents) or index in scored_indices:
-                continue
-            score = float(row.get("score") or 0.0)
-            if not math.isfinite(score):
-                continue
-            item = dict(documents[index])
-            item["rerank_score"] = score
-            item["ranking_score"] = _ranking_score(
-                score, item.get("authority_score")
-            )
-            scored.append(item)
-            scored_indices.add(index)
+        failures: list[str] = []
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(RERANKER_TIMEOUT_SECONDS), trust_env=False
+        ) as client:
+            for offset in range(0, len(texts), RERANKER_MAX_BATCH_SIZE):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    failures.append("deadline")
+                    break
+                batch = texts[offset : offset + RERANKER_MAX_BATCH_SIZE]
+                try:
+                    async with client.stream(
+                        "POST",
+                        f"{RERANKER_URL}/rerank",
+                        json={"query": query, "texts": batch},
+                        timeout=httpx.Timeout(max(0.1, remaining)),
+                    ) as response:
+                        response.raise_for_status()
+                        payload = await _read_json_value(
+                            response, RERANKER_MAX_RESPONSE_BYTES
+                        )
+                except Exception as exc:
+                    failures.append(type(exc).__name__)
+                    continue
+
+                rows = payload.get("results") if isinstance(payload, dict) else payload
+                if not isinstance(rows, list):
+                    failures.append("invalid_response")
+                    continue
+                for row in rows:
+                    if not isinstance(row, dict) or not isinstance(row.get("index"), int):
+                        continue
+                    local_index = row["index"]
+                    index = offset + local_index
+                    if not 0 <= local_index < len(batch) or index in scored_indices:
+                        continue
+                    score = float(row.get("score") or 0.0)
+                    if not math.isfinite(score):
+                        continue
+                    item = dict(documents[index])
+                    item["rerank_score"] = score
+                    item["ranking_score"] = _ranking_score(
+                        score, item.get("authority_score")
+                    )
+                    scored.append(item)
+                    scored_indices.add(index)
+
         if not scored:
-            raise ValueError("Reranker returned no usable scores")
+            reason = failures[0] if failures else "invalid_response"
+            LOGGER.warning("Reranker unavailable; using lexical fallback: %s", reason)
+            return _lexical_rerank(query, documents, top_k), f"fallback:{reason}"
         unscored: list[dict[str, Any]] = []
         for index, document in enumerate(documents):
             if index in scored_indices:
@@ -2048,7 +2077,12 @@ async def firecrawl_scrape(
     except ValueError as exc:
         raise HTTPException(status_code=422, detail="Invalid scrape URL") from exc
     except Exception as exc:
-        LOGGER.warning("Firecrawl scrape failed: %s", type(exc).__name__)
+        detail = re.sub(r"[\r\n]+", " ", str(exc)).strip()[:500]
+        LOGGER.warning(
+            "Firecrawl scrape failed: %s%s",
+            type(exc).__name__,
+            f": {detail}" if detail else "",
+        )
         raise HTTPException(status_code=502, detail="Page scrape failed") from exc
 
 

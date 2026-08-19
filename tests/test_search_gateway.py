@@ -125,6 +125,17 @@ def test_game_query_uses_strategy_terms_not_product_measurements():
     assert any("strategy guide wiki" in item for item in variants)
     assert all("measurements" not in item for item in variants)
 
+    equipment_variants = search_gateway._query_variants(
+        "DragonSword Awakening best equipment Theresia Astria Roxy", "balanced"
+    )
+    assert any("strategy guide wiki" in item for item in equipment_variants)
+    assert all("measurements" not in item for item in equipment_variants)
+
+    non_game_variants = search_gateway._query_variants(
+        "Best books about spiritual awakening", "balanced"
+    )
+    assert all("strategy guide wiki" not in item for item in non_game_variants)
+
 
 def test_candidate_scoring_prefers_relevant_official_sources():
     official = {
@@ -373,6 +384,54 @@ async def test_reranker_preserves_unscored_documents(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_reranker_chunks_large_frontend_batches(monkeypatch):
+    calls = []
+
+    class Stream:
+        def __init__(self, response):
+            self.response = response
+
+        async def __aenter__(self):
+            return self.response
+
+        async def __aexit__(self, *args):
+            return False
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        def stream(self, method, url, **kwargs):
+            texts = kwargs["json"]["texts"]
+            calls.append(texts)
+            rows = [
+                {"index": index, "score": int(text.rsplit(" ", 1)[1]) / 1000}
+                for index, text in enumerate(texts)
+            ]
+            response = httpx.Response(
+                200,
+                json=rows,
+                request=httpx.Request(method, url),
+            )
+            return Stream(response)
+
+    monkeypatch.setattr(search_gateway.httpx, "AsyncClient", lambda **kwargs: Client())
+    docs = [
+        {"text": f"candidate {index}", "candidate_index": index}
+        for index in range(202)
+    ]
+
+    ranked, status = await search_gateway._rerank("candidate", docs, 5)
+
+    assert status == "ok"
+    assert [len(batch) for batch in calls] == [32, 32, 32, 32, 32, 32, 10]
+    assert [item["candidate_index"] for item in ranked] == [201, 200, 199, 198, 197]
+
+
+@pytest.mark.asyncio
 async def test_reranker_uses_source_authority_for_equal_relevance(monkeypatch):
     response = httpx.Response(
         200,
@@ -577,6 +636,46 @@ async def test_fetch_page_escalates_to_crawl4ai(monkeypatch):
     monkeypatch.setattr(gateway_fetch, "crawl4ai_fetch", crawl)
     result = await gateway_fetch.fetch_page("https://example.com", "query", 10)
     assert result["extraction_method"] == "crawl4ai"
+
+
+@pytest.mark.asyncio
+async def test_fetch_page_reserves_time_for_playwright_after_crawl_failure(monkeypatch):
+    calls = []
+
+    async def validate(url):
+        return url
+
+    async def direct(url, timeout):
+        return {"content": "thin", "content_chars": 4}
+
+    async def crawl(url, timeout):
+        calls.append(("crawl4ai", timeout))
+        raise httpx.HTTPStatusError(
+            "blocked",
+            request=httpx.Request("POST", "http://crawl4ai/crawl"),
+            response=httpx.Response(400),
+        )
+
+    async def browser(url, query, timeout):
+        calls.append(("playwright", timeout))
+        return {
+            "content": "rendered evidence " * 100,
+            "content_chars": 1800,
+            "extraction_method": "playwright",
+        }
+
+    monkeypatch.setattr(gateway_fetch, "validate_public_url", validate)
+    monkeypatch.setattr(gateway_fetch, "direct_fetch", direct)
+    monkeypatch.setattr(gateway_fetch, "crawl4ai_fetch", crawl)
+    monkeypatch.setattr(gateway_fetch, "browser_fetch", browser)
+
+    result = await gateway_fetch.fetch_page("https://example.com", "query", 20)
+
+    assert result["extraction_method"] == "playwright"
+    assert calls[0][0] == "crawl4ai"
+    assert calls[0][1] <= 10
+    assert calls[1][0] == "playwright"
+    assert calls[1][1] >= 7
 
 
 @pytest.mark.asyncio
