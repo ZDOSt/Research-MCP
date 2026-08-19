@@ -1,0 +1,188 @@
+[
+  {
+    "id": "docker-compose-install",
+    "query": "How do I install Docker Compose on Ubuntu?",
+    "mode": "balanced",
+    "min_results": 2,
+    "expected_domains": ["docs.docker.com"],
+    "expected_any_terms": ["compose", "apt", "plugin"],
+    "expected_source_types": ["documentation_candidate"]
+  },
+  {
+    "id": "python-venv-current",
+    "query": "What is the current recommended way to create a Python virtual environment?",
+    "mode": "balanced",
+    "min_results": 2,
+    "expected_domains": ["docs.python.org"],
+    "expected_any_terms": ["venv", "virtual environment"]
+  },
+  {
+    "id": "kubernetes-install",
+    "query": "Install the latest stable kubectl on Linux",
+    "mode": "balanced",
+    "min_results": 2,
+    "expected_domains": ["kubernetes.io"],
+    "expected_any_terms": ["kubectl"]
+  },
+  {
+    "id": "node-docker-permission-error",
+    "query": "Fix Docker permission denied while trying to connect to the daemon socket on Linux",
+    "mode": "balanced",
+    "min_results": 2,
+    "expected_any_terms": ["docker", "permission", "group"]
+  },
+  {
+    "id": "nginx-502",
+    "query": "Nginx reverse proxy returns 502 Bad Gateway; how do I troubleshoot it?",
+    "mode": "balanced",
+    "min_results": 2,
+    "expected_any_terms": ["502", "upstream", "proxy"]
+  },
+  {
+    "id": "postgres-connection-refused",
+    "query": "PostgreSQL connection refused from another Docker container",
+    "mode": "balanced",
+    "min_results": 2,
+    "expected_any_terms": ["postgres", "connection", "network"]
+  },
+  {
+    "id": "github-release-notes",
+    "query": "Find the latest Caddy release notes and important changes",
+    "mode": "balanced",
+    "min_results": 2,
+    "expected_domains": ["github.com", "caddyserver.com"],
+    "expected_any_terms": ["caddy", "release"]
+  },
+  {
+    "id": "ubuntu-upgrade-version",
+    "query": "Current supported Ubuntu LTS releases and upgrade guidance",
+    "mode": "deep",
+    "min_results": 3,
+    "expected_domains": ["ubuntu.com"],
+    "expected_any_terms": ["lts", "upgrade"]
+  },
+  {
+    "id": "aw3426dw-settings",
+    "query": "What are the best accurate settings for the Alienware AW3426DW monitor?",
+    "mode": "deep",
+    "min_results": 3,
+    "expected_any_terms": ["aw3426dw", "settings", "hdr"]
+  },
+  {
+    "id": "oled-text-clarity",
+    "query": "Best Windows text clarity settings for a QD-OLED ultrawide monitor",
+    "mode": "balanced",
+    "min_results": 2,
+    "expected_any_terms": ["cleartype", "text", "oled"]
+  },
+  {
+    "id": "android-tv-box-comparison",
+    "query": "Compare current Android TV boxes with AV1, Dolby Vision, and gigabit Ethernet",
+    "mode": "deep",
+    "min_results": 3,
+    "expected_any_terms": ["av1", "dolby vision", "ethernet"]
+  },
+  {
+    "id": "wifi-router-recommendation",
+    "query": "Best Wi-Fi 7 router for a multi-gigabit home network based on measurements",
+    "mode": "deep",
+    "min_results": 3,
+    "expected_any_terms": ["wi-fi 7", "wifi 7", "throughput"]
+  },
+  {
+    "id": "game-team-composition",
+    "query": "Best team composition for DragonSword Awakening and why",
+    "mode": "deep",
+    "min_results": 2,
+    "expected_any_terms": ["dragonsword", "team", "character"]
+  },
+  {
+    "id": "game-build-current-patch",
+    "query": "Best current beginner build for Path of Exile 2",
+    "mode": "deep",
+    "min_results": 3,
+    "expected_any_terms": ["path of exile 2", "build"]
+  },
+  {
+    "id": "rfc-http-semantics",
+    "query": "What does the current HTTP specification say about idempotent methods?",
+    "mode": "balanced",
+    "min_results": 2,
+    "expected_domains": ["rfc-editor.org", "ietf.org"],
+    "expected_any_terms": ["idempotent"],
+    "expected_source_types": ["standard"]
+  },
+  {
+    "id": "nist-password-guidance",
+    "query": "What is the latest NIST password length and rotation guidance?",
+    "mode": "deep",
+    "min_results": 3,
+    "expected_domains": ["nist.gov"],
+    "expected_any_terms": ["password", "memorized secret"],
+    "expected_source_types": ["government"]
+  },
+  {
+    "id": "academic-rag-survey",
+    "query": "Recent academic survey of retrieval augmented generation evaluation methods",
+    "mode": "deep",
+    "min_results": 3,
+    "categories": ["science", "general"],
+    "expected_domains": ["arxiv.org", "acm.org", "ieee.org"],
+    "expected_any_terms": ["retrieval augmented generation", "rag", "evaluation"]
+  },
+  {
+    "id": "current-ai-news",
+    "query": "Most important substantive AI model and regulation news today",
+    "mode": "deep",
+    "time_range": "day",
+    "categories": ["news", "general"],
+    "min_results": 3,
+    "expected_any_terms": ["ai", "artificial intelligence"]
+  },
+  {
+    "id": "current-linux-security",
+    "query": "Current critical Linux kernel security advisories this month",
+    "mode": "deep",
+    "time_range": "month",
+    "min_results": 3,
+    "expected_any_terms": ["linux", "security", "cve"]
+  },
+  {
+    "id": "docker-doc-direct-url",
+    "query": "Read https://docs.docker.com/engine/install/ubuntu/ and extract the supported Ubuntu versions and installation commands",
+    "mode": "balanced",
+    "min_results": 1,
+    "expected_domains": ["docs.docker.com"],
+    "expected_any_terms": ["ubuntu", "docker"]
+  },
+  {
+    "id": "compose-reference-direct-url",
+    "query": "Explain the depends_on behavior documented at https://docs.docker.com/reference/compose-file/services/",
+    "mode": "balanced",
+    "min_results": 1,
+    "expected_domains": ["docs.docker.com"],
+    "expected_any_terms": ["depends_on", "dependency"]
+  },
+  {
+    "id": "redis-vs-valkey",
+    "query": "Compare current Redis and Valkey licensing, compatibility, and migration considerations",
+    "mode": "deep",
+    "min_results": 3,
+    "expected_any_terms": ["redis", "valkey", "license"]
+  },
+  {
+    "id": "browser-api-compatibility",
+    "query": "Current browser support and correct usage for the View Transitions API",
+    "mode": "balanced",
+    "min_results": 3,
+    "expected_domains": ["mozilla.org", "developer.chrome.com"],
+    "expected_any_terms": ["view transition", "browser"]
+  },
+  {
+    "id": "multi-source-vps-hardening",
+    "query": "Create an evidence-based checklist for hardening a new public Ubuntu VPS",
+    "mode": "deep",
+    "min_results": 4,
+    "expected_any_terms": ["ssh", "firewall", "security"]
+  }
+]

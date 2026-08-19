@@ -4,6 +4,7 @@ from extractors import (
     MAX_EXTRACTION_TASK_TERMS,
     _bounded_task_terms,
     estimate_confidence,
+    extract_html_metadata,
     extract_json_script_text,
     extract_sections_from_text,
     extract_table_like_rows,
@@ -126,13 +127,40 @@ class HTMLExtractionTests(unittest.TestCase):
         </body></html>
         """
         text = html_to_text(raw_html)
-        self.assertIn("Name\tCount", text)
-        self.assertIn("Widget\t10", text)
-        self.assertIn("if ready:\n    run_task()", text)
+        self.assertIn("| Name | Count |", text)
+        self.assertIn("| --- | --- |", text)
+        self.assertIn("| Widget | 10 |", text)
+        self.assertIn("```\nif ready:\n    run_task()", text)
         self.assertEqual(
             extract_table_like_rows("Widget       10       Available"),
             ["Widget       10       Available"],
         )
+
+    def test_headings_lists_and_page_metadata_are_preserved(self):
+        raw_html = """
+        <html lang="en-US"><head>
+          <title>Install Widget 4.2</title>
+          <meta name="description" content="Current installation guide">
+          <meta property="article:published_time" content="2026-07-12T10:00:00Z">
+          <script type="application/ld+json">
+            {"@type":"TechArticle","dateModified":"2026-08-01","softwareVersion":"4.2.1",
+             "author":{"name":"Example Docs"}}
+          </script>
+        </head><body>
+          <h1>Installation</h1><ol><li>Download</li><li>Run setup</li></ol>
+        </body></html>
+        """
+        text = html_to_text(raw_html)
+        metadata = extract_html_metadata(raw_html)
+
+        self.assertIn("# Installation", text)
+        self.assertIn("1. Download", text)
+        self.assertIn("2. Run setup", text)
+        self.assertEqual(metadata["publishedDate"], "2026-07-12T10:00:00Z")
+        self.assertEqual(metadata["modifiedDate"], "2026-08-01")
+        self.assertEqual(metadata["language"], "en-US")
+        self.assertEqual(metadata["author"], "Example Docs")
+        self.assertIn("4.2.1", metadata["version_context"])
 
     def test_reveal_controls_do_not_make_extraction_sufficient(self):
         labels = infer_page_labels(task="find release date")

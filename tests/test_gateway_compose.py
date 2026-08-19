@@ -30,6 +30,10 @@ def test_web_services_are_isolated_behind_egress_broker():
         assert "seccomp=./seccomp_profile.json" in services[name]["security_opt"]
     assert compose["networks"]["web-sandbox"]["internal"] is True
     assert set(services["safe-egress"]["networks"]) == {"web-sandbox", "egress"}
+    assert (
+        services["crawl4ai"]["environment"]["CRAWL4AI_ALLOW_INTERNAL_URLS"]
+        == "true"
+    )
 
 
 def test_search_and_pdf_control_networks_are_private():
@@ -70,6 +74,7 @@ def test_documented_runtime_limits_are_wired_to_their_consumers():
             "GATEWAY_INTEGRATED_MAX_CRAWL_PAGES",
             "GATEWAY_INTEGRATED_MAX_RESULTS",
             "GATEWAY_CACHE_MAX_ENTRIES",
+            "GATEWAY_RERANKER_MAX_BATCH_SIZE",
             "SAFE_EGRESS_DNS_TIMEOUT_SECONDS",
             "FIRECRAWL_API_KEY",
             "FIRECRAWL_TIMEOUT_SECONDS",
@@ -115,6 +120,7 @@ def test_searxng_provider_set_is_bounded_and_has_major_keyless_engines():
         "duckduckgo",
         "duckduckgo images",
         "duckduckgo news",
+        "github",
         "mojeek",
         "docker hub",
     }.isdisjoint(engines)
@@ -141,3 +147,10 @@ def test_ci_validates_real_searxng_with_required_secrets():
     assert "SEARXNG_IMAGE: alpine" not in workflow
     assert "docker compose up -d --no-deps --wait searxng" in workflow
     assert workflow.count("SEARXNG_SECRET: ci-only-searxng-secret") >= 3
+
+
+def test_gateway_image_contains_quality_runtime_and_evaluation_files():
+    dockerfile = (PROJECT_ROOT / "Dockerfile.gateway").read_text("utf-8")
+    assert "evidence_quality.py" in dockerfile
+    assert "evaluate_search_quality.py" in dockerfile
+    assert "COPY --chown=app:app evals ./evals" in dockerfile

@@ -153,6 +153,32 @@ async def test_firecrawl_scrape_requires_bearer_and_returns_markdown(monkeypatch
     assert called and called[0][0] == "https://example.com/"
 
 
+def test_firecrawl_payload_exposes_page_declared_dates_and_versions():
+    payload = search_gateway._firecrawl_scrape_payload(
+        {
+            "url": "https://docs.example.com/guide",
+            "title": "Guide",
+            "content": "# Install\n\nRun the command.",
+            "status_code": 200,
+            "metadata": {
+                "publishedDate": "2026-07-01",
+                "modifiedDate": "2026-08-01",
+                "softwareVersion": "4.2.1",
+                "language": "en",
+            },
+        },
+        "https://docs.example.com/guide",
+    )
+    metadata = payload["data"]["metadata"]
+    assert metadata["publishedTime"] == "2026-07-01"
+    assert metadata["modifiedTime"] == "2026-08-01"
+    assert metadata["version_context"] == ["4.2.1"]
+    assert metadata["evidenceId"].startswith("ev-")
+    assert payload["data"]["markdown"].startswith(
+        "> Page-declared metadata (not independently verified)"
+    )
+
+
 @pytest.mark.asyncio
 async def test_jina_rerank_adapter_requires_auth_and_returns_librechat_shape(
     monkeypatch,
