@@ -22,12 +22,7 @@ from egress_policy import (
     validate_http_url_without_dns,
     validate_public_address,
 )
-from evidence_quality import normalize_page_metadata
-from extractors import (
-    extract_html_metadata,
-    html_to_text,
-    parse_maybe_json_text,
-)
+from extractors import extract_title_from_html, html_to_text, parse_maybe_json_text
 
 
 BROWSER_HEADERS = {
@@ -227,21 +222,19 @@ def _extract_body(
     content_type: str,
     encoding: str | None,
     final_url: str,
-) -> tuple[str, str | None, str, list[dict[str, str]], dict[str, Any]]:
+) -> tuple[str, str | None, str, list[dict[str, str]]]:
     media_type = content_type.split(";", 1)[0].strip().lower()
     decoded = _decode(body, encoding)
     if "json" in media_type or decoded.lstrip().startswith(("{", "[")):
-        return parse_maybe_json_text(decoded)[:PAGE_MAX_CHARS], None, "json", [], {}
+        return parse_maybe_json_text(decoded)[:PAGE_MAX_CHARS], None, "json", []
     if "html" in media_type or "<html" in decoded[:2000].lower():
-        metadata = extract_html_metadata(decoded)
         return (
             html_to_text(decoded)[:PAGE_MAX_CHARS],
-            metadata.get("title"),
+            extract_title_from_html(decoded),
             "html",
             _extract_links(decoded, final_url),
-            metadata,
         )
-    return decoded[:PAGE_MAX_CHARS], None, "text", [], {}
+    return decoded[:PAGE_MAX_CHARS], None, "text", []
 
 
 async def _extract_pdf_isolated(body: bytes) -> tuple[str, str | None]:
@@ -322,27 +315,10 @@ async def direct_fetch(url: str, timeout_seconds: float | None = None) -> dict[s
                     text, title = await _extract_pdf_isolated(body)
                     body_format = "pdf"
                     links = []
-                    metadata: dict[str, Any] = {}
                 else:
-                    text, title, body_format, links, metadata = await asyncio.to_thread(
+                    text, title, body_format, links = await asyncio.to_thread(
                         _extract_body, body, content_type, encoding, current_url
                     )
-                metadata = normalize_page_metadata(
-                    metadata,
-                    last_modified=headers.get("last-modified"),
-                ) | {
-                    key: value
-                    for key, value in metadata.items()
-                    if key not in {
-                        "publishedDate",
-                        "modifiedDate",
-                        "declaredDate",
-                        "language",
-                        "author",
-                        "description",
-                        "version_context",
-                    }
-                }
                 return {
                     "url": current_url,
                     "title": title,
@@ -353,7 +329,6 @@ async def direct_fetch(url: str, timeout_seconds: float | None = None) -> dict[s
                     "status_code": status,
                     "redirect_chain": redirects,
                     "extraction_method": "direct",
-                    "metadata": metadata,
                 }
         raise RuntimeError("Too many redirects")
 
@@ -384,26 +359,6 @@ def _normalize_crawl4ai(payload: Any, original_url: str) -> dict[str, Any]:
         else:
             content = parse_maybe_json_text(content)
     metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
-    metadata = {
-        **metadata,
-        **{
-            key: payload[key]
-            for key in (
-                "publishedDate",
-                "publishedTime",
-                "modifiedDate",
-                "modifiedTime",
-                "datePublished",
-                "dateModified",
-                "language",
-                "author",
-                "description",
-                "softwareVersion",
-            )
-            if payload.get(key) not in (None, "", [], {})
-        },
-    }
-    normalized_metadata = normalize_page_metadata(metadata)
     links: list[dict[str, str]] = []
     raw_links = payload.get("links")
     if isinstance(raw_links, dict):
@@ -426,7 +381,6 @@ def _normalize_crawl4ai(payload: Any, original_url: str) -> dict[str, Any]:
         "links": links,
         "status_code": payload.get("status_code"),
         "extraction_method": "crawl4ai",
-        "metadata": normalized_metadata,
     }
 
 
@@ -481,7 +435,6 @@ async def browser_fetch(url: str, query: str, timeout_seconds: float) -> dict[st
                 "links": [],
                 "status_code": 200,
                 "extraction_method": "playwright",
-                "metadata": normalize_page_metadata(payload.get("metadata")),
             }
 
 
@@ -517,20 +470,12 @@ async def fetch_page(
     elapsed = asyncio.get_running_loop().time() - started
     remaining = timeout_seconds - elapsed
     if allow_expensive_fallback and remaining > 2:
-        # Crawl4AI and Playwright cover different failure modes. Preserve time
-        # for the final renderer instead of allowing the first browser to
-        # consume the entire page deadline.
-        browser_reserve = min(8.0, max(3.5, timeout_seconds * 0.35))
-        crawl_timeout = min(10.0, remaining - browser_reserve)
         try:
-            if crawl_timeout > 1:
-                crawled = await crawl4ai_fetch(url, crawl_timeout)
-                if content_is_usable(crawled, 500):
-                    return crawled
-                if best is None or crawled.get("content_chars", 0) > best.get(
-                    "content_chars", 0
-                ):
-                    best = crawled
+            crawled = await crawl4ai_fetch(url, min(remaining, 15.0))
+            if content_is_usable(crawled, 500):
+                return crawled
+            if best is None or crawled.get("content_chars", 0) > best.get("content_chars", 0):
+                best = crawled
         except Exception as exc:
             errors.append(f"crawl4ai:{type(exc).__name__}")
 

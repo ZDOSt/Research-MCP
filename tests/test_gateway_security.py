@@ -50,29 +50,6 @@ async def test_gateway_rejects_mixed_public_and_private_dns_answers():
             await gateway_fetch.validate_public_url("https://mixed.example/")
 
 
-@pytest.mark.asyncio
-async def test_web_runner_validates_crawl_targets_and_owns_proxy_configuration():
-    payload = await web_runner.prepare_crawl_payload(
-        {
-            "urls": ["https://example.com/guide"],
-            "browser_config": {"proxy": "http://attacker.invalid:8080"},
-            "crawler_config": {
-                "proxy_config": {"server": "http://attacker.invalid:8080"},
-                "proxy_rotation_strategy": "caller-controlled",
-            },
-        }
-    )
-
-    assert "proxy" not in payload["browser_config"]
-    assert "proxy_config" not in payload["crawler_config"]
-    assert "proxy_rotation_strategy" not in payload["crawler_config"]
-
-    with pytest.raises(gateway_fetch.UnsafeURLError):
-        await web_runner.prepare_crawl_payload(
-            {"urls": ["http://169.254.169.254/latest/meta-data/"]}
-        )
-
-
 def test_optional_deny_list_blocks_public_vps_address():
     with pytest.raises(safe_egress.EgressPolicyError):
         safe_egress.validate_public_address(

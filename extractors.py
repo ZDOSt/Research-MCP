@@ -4,8 +4,6 @@ import re
 from html.parser import HTMLParser
 from typing import Any, Dict, List, Optional
 
-from evidence_quality import normalize_page_metadata
-
 GENERAL_SECTION_LABELS = [
     "Overview", "Documentation", "Docs", "Guide", "Guides", "Getting Started", "Quickstart",
     "Installation", "Install", "Setup", "Configuration", "Configure", "Usage", "Examples",
@@ -91,8 +89,6 @@ MAX_STRUCTURED_SCRIPT_INPUT_CHARS = 250_000
 MAX_STRUCTURED_SCRIPT_OUTPUT_CHARS = 150_000
 _PRE_START = "\x00PRE_START\x00"
 _PRE_END = "\x00PRE_END\x00"
-_TABLE_START = "\x00TABLE_START\x00"
-_TABLE_END = "\x00TABLE_END\x00"
 
 
 class _ReadableHTMLParser(HTMLParser):
@@ -105,7 +101,6 @@ class _ReadableHTMLParser(HTMLParser):
         self._pre_depth = 0
         self._element_stack: List[tuple[str, bool]] = []
         self._table_cell_count = 0
-        self._list_stack: List[dict[str, int | str]] = []
 
     def _break(self) -> None:
         if self.parts and self.parts[-1] != "\n":
@@ -144,27 +139,6 @@ class _ReadableHTMLParser(HTMLParser):
             self.parts.append(_PRE_START)
             self.parts.append("\n")
             self._pre_depth += 1
-            return
-        if tag == "table":
-            self._break()
-            self.parts.extend([_TABLE_START, "\n"])
-            return
-        if tag in {"ul", "ol"}:
-            self._break()
-            self._list_stack.append({"tag": tag, "count": 0})
-            return
-        if tag == "li":
-            self._break()
-            depth = max(0, len(self._list_stack) - 1)
-            prefix = "- "
-            if self._list_stack and self._list_stack[-1]["tag"] == "ol":
-                self._list_stack[-1]["count"] = int(self._list_stack[-1]["count"]) + 1
-                prefix = f"{self._list_stack[-1]['count']}. "
-            self.parts.append("  " * depth + prefix)
-            return
-        if tag in {"h1", "h2", "h3", "h4", "h5", "h6"}:
-            self._break()
-            self.parts.append("#" * int(tag[1]) + " ")
             return
         if tag == "tr":
             self._break()
@@ -208,15 +182,6 @@ class _ReadableHTMLParser(HTMLParser):
             self.parts.append("\n")
             self._pre_depth = max(0, self._pre_depth - 1)
             return
-        if tag == "table":
-            self._break()
-            self.parts.extend([_TABLE_END, "\n"])
-            return
-        if tag in {"ul", "ol"}:
-            self._break()
-            if self._list_stack:
-                self._list_stack.pop()
-            return
         if tag in {"td", "th"}:
             return
         if tag == "tr":
@@ -240,23 +205,12 @@ class _ReadableHTMLParser(HTMLParser):
         raw = "".join(self.parts).replace("\r\n", "\n").replace("\r", "\n")
         lines = []
         in_pre = False
-        in_table = False
-        table_row_index = 0
         for line in raw.splitlines():
             if line == _PRE_START:
                 in_pre = True
-                lines.append("```")
                 continue
             if line == _PRE_END:
                 in_pre = False
-                lines.append("```")
-                continue
-            if line == _TABLE_START:
-                in_table = True
-                table_row_index = 0
-                continue
-            if line == _TABLE_END:
-                in_table = False
                 continue
             if in_pre:
                 lines.append(line.rstrip())
@@ -264,15 +218,7 @@ class _ReadableHTMLParser(HTMLParser):
 
             cells = line.split("\t")
             cells = [re.sub(r"[ \f\v]+", " ", cell).strip() for cell in cells]
-            cells = [cell.replace("|", "\\|") for cell in cells if cell]
-            normalized = " | ".join(cells)
-            if in_table and normalized:
-                normalized = f"| {normalized} |"
-                if table_row_index == 0:
-                    lines.append(normalized)
-                    lines.append("| " + " | ".join("---" for _ in cells) + " |")
-                    table_row_index += 1
-                    continue
+            normalized = "\t".join(cell for cell in cells if cell)
             if normalized:
                 lines.append(normalized)
         return "\n".join(lines).strip()
@@ -306,57 +252,6 @@ class _ScriptCollector(HTMLParser):
             self.scripts.append((self._attrs, "".join(self._parts)))
             self._attrs = None
             self._parts = []
-
-
-class _MetadataCollector(HTMLParser):
-    def __init__(self) -> None:
-        super().__init__(convert_charrefs=True)
-        self.values: Dict[str, Any] = {}
-        self.time_values: List[tuple[str, str]] = []
-        self._title_depth = 0
-        self._title_parts: List[str] = []
-
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
-        attrs_map = {str(key).lower(): value or "" for key, value in attrs}
-        tag = tag.lower()
-        if tag == "title":
-            self._title_depth += 1
-        elif tag == "html" and attrs_map.get("lang"):
-            self.values.setdefault("language", attrs_map["lang"])
-        elif tag == "meta":
-            key = (
-                attrs_map.get("property")
-                or attrs_map.get("name")
-                or attrs_map.get("itemprop")
-                or attrs_map.get("http-equiv")
-            ).strip()
-            content = attrs_map.get("content", "").strip()
-            if key and content:
-                self.values.setdefault(key, content)
-                self.values.setdefault(key.lower(), content)
-        elif tag == "time" and attrs_map.get("datetime"):
-            hint = " ".join(
-                [
-                    attrs_map.get("itemprop", ""),
-                    attrs_map.get("class", ""),
-                    attrs_map.get("property", ""),
-                ]
-            ).casefold()
-            self.time_values.append((hint[:500], attrs_map["datetime"][:200]))
-        elif tag == "link" and attrs_map.get("rel", "").lower() == "canonical":
-            self.values.setdefault("canonicalUrl", attrs_map.get("href", "")[:8192])
-
-    def handle_endtag(self, tag: str) -> None:
-        if tag.lower() == "title":
-            self._title_depth = max(0, self._title_depth - 1)
-
-    def handle_data(self, data: str) -> None:
-        if self._title_depth:
-            self._title_parts.append(data)
-
-    def title(self) -> Optional[str]:
-        value = re.sub(r"\s+", " ", "".join(self._title_parts)).strip()
-        return value or None
 
 
 def clamp_int(value: int, minimum: int, maximum: int) -> int:
@@ -524,112 +419,6 @@ def extract_title_from_html(raw_html: str) -> Optional[str]:
     title = html.unescape(match.group(1))
     title = re.sub(r"\s+", " ", title).strip()
     return title or None
-
-
-def extract_html_metadata(raw_html: str) -> Dict[str, Any]:
-    """Extract bounded, page-declared metadata from HTML and JSON-LD."""
-
-    raw_html = (raw_html or "")[:2_000_000]
-    collector = _MetadataCollector()
-    try:
-        collector.feed(raw_html)
-        collector.close()
-    except Exception:
-        pass
-
-    lowered = {str(key).casefold(): value for key, value in collector.values.items()}
-
-    def first(*keys: str) -> Any:
-        for key in keys:
-            value = lowered.get(key.casefold())
-            if value not in (None, "", [], {}):
-                return value
-        return None
-
-    raw_metadata: Dict[str, Any] = {
-        "publishedDate": first(
-            "article:published_time",
-            "og:published_time",
-            "datepublished",
-            "citation_publication_date",
-            "publishdate",
-        ),
-        "modifiedDate": first(
-            "article:modified_time",
-            "og:updated_time",
-            "datemodified",
-            "last-modified",
-            "last_modified",
-            "dcterms.modified",
-        ),
-        "author": first("author", "article:author", "byl"),
-        "description": first("description", "og:description", "twitter:description"),
-        "language": first("language", "og:locale"),
-        "version": first("softwareversion", "version", "product:version"),
-        "declaredDate": first("date", "dc.date", "dcterms.date"),
-    }
-    for hint, value in collector.time_values:
-        if re.search(r"modified|updated", hint) and not raw_metadata["modifiedDate"]:
-            raw_metadata["modifiedDate"] = value
-        elif re.search(r"publish|issued|created", hint) and not raw_metadata["publishedDate"]:
-            raw_metadata["publishedDate"] = value
-        elif not raw_metadata["declaredDate"]:
-            raw_metadata["declaredDate"] = value
-
-    script_collector = _ScriptCollector()
-    try:
-        script_collector.feed(raw_html)
-        script_collector.close()
-    except Exception:
-        script_collector.scripts = []
-
-    remaining_nodes = 300
-
-    def visit(value: Any, depth: int = 0) -> None:
-        nonlocal remaining_nodes
-        if remaining_nodes <= 0 or depth > 8:
-            return
-        remaining_nodes -= 1
-        if isinstance(value, list):
-            for item in value[:50]:
-                visit(item, depth + 1)
-            return
-        if not isinstance(value, dict):
-            return
-        for key, item in list(value.items())[:100]:
-            normalized_key = re.sub(r"[^a-z]", "", str(key).casefold())
-            target = {
-                "datepublished": "publishedDate",
-                "datemodified": "modifiedDate",
-                "author": "author",
-                "description": "description",
-                "inlanguage": "language",
-                "softwareversion": "version",
-                "version": "version",
-            }.get(normalized_key)
-            if target and not raw_metadata.get(target) and item not in (None, "", [], {}):
-                raw_metadata[target] = item
-            if isinstance(item, (dict, list)):
-                visit(item, depth + 1)
-
-    for attrs, block in script_collector.scripts:
-        if attrs.get("type", "").split(";", 1)[0].strip().lower() != "application/ld+json":
-            continue
-        if not block or len(block) > MAX_STRUCTURED_SCRIPT_INPUT_CHARS:
-            continue
-        try:
-            visit(json.loads(block))
-        except (TypeError, ValueError, json.JSONDecodeError):
-            continue
-
-    metadata = normalize_page_metadata(raw_metadata)
-    title = collector.title()
-    canonical = collector.values.get("canonicalUrl")
-    if title:
-        metadata["title"] = title[:500]
-    if canonical:
-        metadata["canonicalUrl"] = str(canonical)[:8192]
-    return metadata
 
 
 def extract_json_script_text(raw_html: str) -> str:

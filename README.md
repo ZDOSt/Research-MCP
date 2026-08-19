@@ -7,11 +7,6 @@ The gateway discovers sources with a small set of search engines, opens pages
 only when the selected route asks for it, extracts their actual contents,
 reranks evidence locally, and returns source URLs and page-derived text.
 
-Search results also carry deterministic evidence metadata: an inferred source
-type and tier, an authority score, normalized page-declared dates, version
-markers, and a stable citation ID/URL. These are ranking and coverage aids, not
-claims that the gateway has proved source ownership or verified every claim.
-
 It does not call a paid search API or an internal language model. The frontend's
 model receives the retrieved evidence and writes the answer. This keeps the
 service private, predictable, and usable by any frontend that accepts a custom
@@ -186,30 +181,14 @@ The gateway also implements a Jina-compatible `POST /v1/rerank` endpoint backed
 by the stack's local BGE reranker. It uses the same Bearer credential as the
 Firecrawl routes. This adapter lets LibreChat include relevant passages from
 scraped pages in the model-visible Web Search result without a hosted reranking
-service. Frontend requests larger than the local model's 32-text client limit
-are split into bounded batches and their scores are merged. If the local model
-is unavailable or exceeds its bounded deadline, the adapter returns lexical
-fallback passages instead of an empty result.
-
-Crawl4AI runs without direct public DNS or Internet access. Its redundant
-in-container destination precheck is disabled because it cannot resolve public
-targets in that topology. URL syntax is checked by `web-runner`, and every
-actual browser connection still passes through the pinning proxy and
-`safe-egress`, which resolves the hostname and rejects private, loopback,
-link-local, metadata, and otherwise non-public destinations.
+service. If the local model is unavailable or exceeds its bounded deadline, the
+adapter returns lexical fallback passages instead of an empty result.
 
 Queries containing an explicit HTTP or HTTPS URL bypass SearXNG discovery. The
 supplied URL is returned as the deterministic direct discovery result and
 then passes through the same authenticated Firecrawl-compatible scraper. This
 prevents direct-page requests from depending on whether a search engine happens
 to index the supplied URL.
-
-The `/v1/research` and `/integrated/search` responses include an
-`evidence_summary` with independent-domain coverage, likely primary-source
-coverage, date and extraction coverage, version context, and explicit warnings
-when evidence is thin. Source classification is based on transparent domain,
-path, and query-affinity heuristics. It never represents itself as claim-level
-verification or proof that two domains are organizationally independent.
 
 Use these internal Docker URLs:
 
@@ -298,24 +277,6 @@ docker compose restart search-gateway
 docker compose down
 docker compose up -d --wait
 ```
-
-### Repeatable quality baseline
-
-The opt-in live evaluation suite covers installation guides, errors, hardware
-settings, recommendations, version-sensitive questions, direct URLs,
-multi-source comparisons, gaming, academic material, and current news. It is
-not run automatically and adds no latency to normal gateway requests.
-
-From inside the running gateway container:
-
-```console
-docker compose exec -T search-gateway python evaluate_search_quality.py \
-  --base-url http://127.0.0.1:8080
-```
-
-Run one case while tuning with `--case docker-compose-install`, or retain the
-JSON report with `--output /tmp/search-quality-report.json`. See
-`evals/README.md` for the measured fields and limitations.
 
 `docker compose down` preserves named volumes. `docker compose down -v` deletes
 the cache and downloaded reranker model and should be used only for a deliberate

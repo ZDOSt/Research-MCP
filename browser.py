@@ -759,7 +759,6 @@ async def _playwright_explore_page_inner(
     scrollable_elements = []
     title = None
     final_url = url
-    page_metadata: dict[str, Any] = {}
     dom_char_budget = min(MAX_DOM_ACCUMULATED_CHARS, max(20_000, max_chars * 2))
 
     def append_dom_text(value: object) -> None:
@@ -1051,36 +1050,6 @@ async def _playwright_explore_page_inner(
             final_url = page.url
             await validate_proxy_url_safety(final_url)
 
-            try:
-                metadata_value = await page.evaluate(
-                    """() => {
-                        const output = {};
-                        const put = (key, value) => {
-                            const text = String(value || '').trim().slice(0, 1500);
-                            if (key && text && !output[key]) output[key] = text;
-                        };
-                        put('language', document.documentElement.lang);
-                        for (const element of Array.from(document.querySelectorAll('meta')).slice(0, 150)) {
-                            const key = element.getAttribute('property') ||
-                                element.getAttribute('name') || element.getAttribute('itemprop') ||
-                                element.getAttribute('http-equiv');
-                            put(key, element.getAttribute('content'));
-                        }
-                        const time = document.querySelector('time[datetime]');
-                        if (time) put('date', time.getAttribute('datetime'));
-                        const canonical = document.querySelector('link[rel="canonical"]');
-                        if (canonical) put('canonicalUrl', canonical.href);
-                        return output;
-                    }"""
-                )
-                if isinstance(metadata_value, dict):
-                    page_metadata = {
-                        str(key)[:100]: str(value)[:1500]
-                        for key, value in list(metadata_value.items())[:160]
-                    }
-            except Exception:
-                pass
-
             if capture_tasks:
                 done, pending = await asyncio.wait(capture_tasks, timeout=5)
                 for task in pending:
@@ -1140,7 +1109,6 @@ async def _playwright_explore_page_inner(
             for item in captured_responses[:MAX_NETWORK_RESPONSES]
         ],
         "network_response_count": len(captured_responses),
-        "metadata": page_metadata,
         "errors": errors,
         "extraction_method": f"playwright_{profile}_browser_network_capture_scrollable_tables",
     }

@@ -20,6 +20,7 @@ use_default_settings:
       - reuters
 
       # Technical and software sources.
+      - github
       - mdn
       - stackoverflow
       - askubuntu
