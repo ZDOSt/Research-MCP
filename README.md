@@ -3,18 +3,24 @@
 This project is a deterministic, self-hosted search and page-retrieval backend
 for AI frontends. It exposes a fast SearXNG-compatible discovery endpoint, a
 bounded integrated search route, and Firecrawl-compatible scrape/search routes.
-The gateway discovers sources with a small set of search engines, opens pages
-only when the selected route asks for it, extracts their actual contents,
-reranks evidence locally, and returns source URLs and page-derived text.
+The gateway starts with the user's exact query and a small healthy set of broad
+search engines. It stops when that evidence is already good, or runs one
+bounded fallback wave when relevance, entity coverage, or source diversity is
+weak. It opens pages only when the selected route asks for it, extracts their
+actual contents, reranks evidence locally, and returns source URLs and
+page-derived text.
 
 Search results also carry deterministic evidence metadata: an inferred source
 type and tier, an authority score, normalized page-declared dates, version
-markers, and a stable citation ID/URL. These are ranking and coverage aids, not
-claims that the gateway has proved source ownership or verified every claim.
+markers, a stable citation ID/URL, and exact character spans for selected
+passages. These are ranking and coverage aids, not claims that the gateway has
+proved source ownership or verified every claim.
 
-It does not call a paid search API or an internal language model. The frontend's
-model receives the retrieved evidence and writes the answer. This keeps the
-service private, predictable, and usable by any frontend that accepts a custom
+It does not require a paid search API or an internal language model. An optional
+OpenAI-compatible query planner can be enabled for selected modes, but it is
+strictly bounded and invalid or slow output falls back to deterministic query
+planning. The frontend's model receives the retrieved evidence and writes the
+answer. This keeps the service usable by any frontend that accepts a custom
 SearXNG or JSON search provider.
 
 ## What runs
@@ -26,7 +32,7 @@ SearXNG or JSON search provider.
 - `web-runner`: isolated Crawl4AI and Playwright control over a Unix socket
 - `pdf-runner`: network-isolated PDF extraction
 - `safe-egress`: blocks private-network and metadata destinations for browsers
-- `redis`: response cache and stale-result fallback
+- `redis`: response cache, stale-result fallback, and learned per-domain fetch strategy
 
 The stack publishes no host ports. A frontend reaches it over a shared Docker
 network at:
@@ -154,7 +160,22 @@ Supported query parameters include:
 
 When no category is supplied, the gateway infers useful SearXNG categories from
 the request. `auto` uses quick mode for simple lookups and balanced mode for
-technical questions and recommendations. The discovery route never crawls.
+technical questions and recommendations. `quick` performs one search wave;
+`balanced` conditionally adds one fallback query and a small crawl budget;
+`deep` permits two bounded fallback variants and wider evidence. The discovery
+route never crawls.
+
+Broad web search remains primary. Rate-limited or CAPTCHA-blocked engines enter
+a temporary cooldown, duplicate URLs are combined with reciprocal-rank and
+multi-engine consensus signals, and weak searches may receive keyless
+supplemental candidates from Stack Exchange, Wikipedia, Crossref, or GitHub
+when the request explicitly asks for repository information. Supplemental
+sources never replace broad search or exclude ordinary web results.
+
+To enable the optional planner, set `GATEWAY_PLANNER_BASE_URL`,
+`GATEWAY_PLANNER_MODEL`, and, when required, `GATEWAY_PLANNER_API_KEY` in
+`.env`. `GATEWAY_PLANNER_MODES=deep` is the default. Leave the URL and model
+empty for fully deterministic operation.
 
 ### Integrated search and Firecrawl compatibility
 
@@ -165,9 +186,14 @@ integrated route:
 http://search-gateway:8080/integrated/search
 ```
 
-It performs SearXNG discovery, crawls at most the configured number of top
-pages, and returns page-derived `content`. Its default timeout and crawl budget
-are intentionally smaller than `/v1/research`.
+It performs adaptive discovery, crawls a small initial batch, replaces failed
+or blocked pages from the remaining ranked candidates, and returns page-derived
+`content`. Its default timeout and crawl budget are intentionally smaller than
+`/v1/research`.
+
+Learned browser preferences are not permanent. After the configured re-probe
+interval, the gateway retries direct retrieval so temporary blocks do not keep
+a recovered domain on the slower browser path.
 
 For LibreChat, Open WebUI, or LobeChat Firecrawl settings, use this API base:
 
@@ -207,9 +233,12 @@ to index the supplied URL.
 The `/v1/research` and `/integrated/search` responses include an
 `evidence_summary` with independent-domain coverage, likely primary-source
 coverage, date and extraction coverage, version context, and explicit warnings
-when evidence is thin. Source classification is based on transparent domain,
-path, and query-affinity heuristics. It never represents itself as claim-level
-verification or proof that two domains are organizationally independent.
+when evidence is thin. Each extracted result also includes an `evidence` list
+with stable passage IDs, exact source character spans, section labels when
+available, and passage scores. Source classification is based on transparent
+domain, path, and query-affinity heuristics. It never represents itself as
+claim-level verification or proof that two domains are organizationally
+independent.
 
 Use these internal Docker URLs:
 
@@ -328,6 +357,7 @@ product settings, games, current information, and general research, but it
 cannot guarantee the same coverage as commercial providers. Keyless engines may
 rate-limit datacenter IPs, some sites block all automated browsers, and no
 single VPS has the proprietary search indexes used by Google, Brave, or paid
-answer engines. The gateway compensates with multiple discovery providers,
-concurrent extraction, local reranking, bounded browser fallbacks, caching, and
-honest partial results rather than inventing an answer.
+answer engines. The gateway compensates with adaptive engine cooldowns,
+source-neutral query fallbacks, consensus fusion, keyless supplemental indexes,
+learned extraction strategies, local reranking, bounded browser fallbacks,
+caching, and honest partial results rather than inventing an answer.

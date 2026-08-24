@@ -416,6 +416,12 @@ def evidence_summary(results: list[dict[str, Any]], query: str, *, time_range: s
     )
     extracted_count = sum(bool(item.get("extraction_method")) for item in results)
     citation_count = sum(bool(item.get("citation_url")) for item in results)
+    passage_count = sum(
+        len(item.get("evidence") or [])
+        for item in results
+        if isinstance(item.get("evidence") or [], list)
+    )
+    low_confidence_count = sum(bool(item.get("low_confidence")) for item in results)
     versions: list[str] = []
     for item in results:
         for marker in item.get("version_context") or []:
@@ -433,6 +439,10 @@ def evidence_summary(results: list[dict[str, Any]], query: str, *, time_range: s
         warnings.append("No explicit software or product version context was extracted.")
     if extracted_count < len(results):
         warnings.append("Some results rely on search snippets because page extraction was unavailable.")
+    if low_confidence_count:
+        warnings.append(
+            "Some extracted pages were usable but did not meet the preferred content threshold."
+        )
     return {
         "status": "sufficient" if results and (len(owners) >= 2 or primary_count > 0) else "limited",
         "result_count": len(results),
@@ -441,6 +451,8 @@ def evidence_summary(results: list[dict[str, Any]], query: str, *, time_range: s
         "dated_source_count": dated_count,
         "extracted_source_count": extracted_count,
         "citation_url_count": citation_count,
+        "passage_evidence_count": passage_count,
+        "low_confidence_source_count": low_confidence_count,
         "temporal_requirement": requirement,
         "version_contexts": versions[:12],
         "warnings": warnings,

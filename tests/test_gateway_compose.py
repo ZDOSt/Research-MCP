@@ -1,4 +1,5 @@
 import json
+import re
 from pathlib import Path
 
 import yaml
@@ -69,11 +70,27 @@ def test_documented_runtime_limits_are_wired_to_their_consumers():
             "GATEWAY_ADMISSION_TIMEOUT_SECONDS",
             "GATEWAY_FINALIZATION_RESERVE_SECONDS",
             "GATEWAY_CANDIDATE_RERANKER_TIMEOUT_SECONDS",
+            "GATEWAY_PRIMARY_ENGINE_COUNT",
+            "GATEWAY_FALLBACK_ENGINE_COUNT",
+            "GATEWAY_ENGINE_COOLDOWN_SECONDS",
+            "GATEWAY_ENGINE_HEALTH_MAX_ENTRIES",
+            "GATEWAY_RRF_K",
+            "GATEWAY_ENABLE_KEYLESS_SUPPLEMENTS",
+            "GATEWAY_SUPPLEMENT_TIMEOUT_SECONDS",
+            "GATEWAY_SUPPLEMENT_COOLDOWN_SECONDS",
             "GATEWAY_INTEGRATED_TIMEOUT_SECONDS",
             "GATEWAY_INTEGRATED_MAX_SEARCH_RESULTS",
             "GATEWAY_INTEGRATED_MAX_CRAWL_PAGES",
             "GATEWAY_INTEGRATED_MAX_RESULTS",
             "GATEWAY_CACHE_MAX_ENTRIES",
+            "GATEWAY_PLANNER_BASE_URL",
+            "GATEWAY_PLANNER_API_KEY",
+            "GATEWAY_PLANNER_MODEL",
+            "GATEWAY_PLANNER_TIMEOUT_SECONDS",
+            "GATEWAY_PLANNER_MODES",
+            "GATEWAY_FETCH_LEARNING_TTL_SECONDS",
+            "GATEWAY_FETCH_LEARNING_MAX_DOMAINS",
+            "GATEWAY_FETCH_REPROBE_SECONDS",
             "GATEWAY_RERANKER_MAX_BATCH_SIZE",
             "SAFE_EGRESS_DNS_TIMEOUT_SECONDS",
             "FIRECRAWL_API_KEY",
@@ -110,6 +127,28 @@ def test_documented_runtime_limits_are_wired_to_their_consumers():
     for service_name, variables in expected.items():
         environment = services[service_name]["environment"]
         assert variables.issubset(environment), service_name
+
+
+def test_gateway_python_fallbacks_match_documented_compose_defaults():
+    compose_text = (PROJECT_ROOT / "docker-compose.yml").read_text("utf-8")
+    env_text = (PROJECT_ROOT / ".env.example").read_text("utf-8")
+    names_by_source = {
+        "search_gateway.py": {
+            "GATEWAY_REQUEST_TIMEOUT_SECONDS",
+            "GATEWAY_SEARCH_TIMEOUT_SECONDS",
+            "GATEWAY_PAGE_TIMEOUT_SECONDS",
+            "GATEWAY_MAX_CRAWL_PAGES",
+        },
+        "gateway_fetch.py": {"GATEWAY_FETCH_REPROBE_SECONDS"},
+    }
+    for source_name, names in names_by_source.items():
+        source = (PROJECT_ROOT / source_name).read_text("utf-8")
+        for name in names:
+            code = re.search(rf'os\.getenv\("{name}", "([^"]+)"\)', source)
+            compose = re.search(rf'\$\{{{name}:-([^}}]+)\}}', compose_text)
+            documented = re.search(rf'^{name}=(.+)$', env_text, re.MULTILINE)
+            assert code and compose and documented
+            assert code.group(1) == compose.group(1) == documented.group(1)
 
 
 def test_searxng_provider_set_is_bounded_and_has_major_keyless_engines():

@@ -8,21 +8,52 @@ import gateway_fetch
 import search_gateway
 
 
+@pytest.fixture(autouse=True)
+def reset_adaptive_state(monkeypatch):
+    search_gateway._ENGINE_HEALTH.clear()
+    search_gateway._SUPPLEMENT_COOLDOWNS.clear()
+    gateway_fetch._DOMAIN_FETCH_STATS.clear()
+    monkeypatch.setattr(search_gateway, "ENABLE_KEYLESS_SUPPLEMENTS", False)
+    monkeypatch.setattr(gateway_fetch, "REDIS_URL", "")
+
+
+@pytest.mark.asyncio
+async def test_fetch_resource_cleanup_closes_existing_client_without_recreating_it():
+    class Client:
+        def __init__(self):
+            self.closed = False
+
+        async def aclose(self):
+            self.closed = True
+
+    client = Client()
+    gateway_fetch._FETCH_REDIS = client
+    gateway_fetch._FETCH_REDIS_FAILED_UNTIL = 123.0
+
+    await gateway_fetch.close_fetch_resources()
+
+    assert client.closed is True
+    assert gateway_fetch._FETCH_REDIS is None
+    assert gateway_fetch._FETCH_REDIS_FAILED_UNTIL == 0.0
+
+
 def test_query_variants_are_bounded_and_intent_aware():
     variants = search_gateway._query_variants(
         "How do I install Docker Compose on Ubuntu?", "balanced"
     )
-    assert "install" in variants[0].lower()
-    assert any("site:docs.docker.com" in item for item in variants)
-    assert len(variants) <= 3
+    assert variants[0] == "How do I install Docker Compose on Ubuntu?"
+    assert any('"Docker Compose"' in item for item in variants[1:])
+    assert all("site:" not in item for item in variants)
+    assert len(variants) <= 2
 
 
 def test_generic_technical_query_uses_general_documentation_variant():
     variants = search_gateway._query_variants(
         "How do I install PostgreSQL on Ubuntu?", "balanced"
     )
-    assert any("official documentation" in item for item in variants)
-    assert all("site:docs.docker.com" not in item for item in variants)
+    assert variants[0] == "How do I install PostgreSQL on Ubuntu?"
+    assert any("PostgreSQL" in item for item in variants[1:])
+    assert all("site:" not in item for item in variants)
 
 
 def test_unrelated_compose_verb_does_not_trigger_docker_routing():
@@ -72,18 +103,20 @@ def test_search_engines_are_bounded_by_intent_and_exclude_repository_search():
         "install docker compose ubuntu site:docs.docker.com",
     )
     assert technical == [
-        "startpage",
         "bing",
         "brave",
+        "startpage",
         "askubuntu",
     ]
-    assert targeted == ["startpage", "bing", "brave"]
+    assert targeted == ["bing", "brave", "startpage"]
     assert "github" not in technical
 
 
 def test_specialized_engines_require_matching_subject_intent():
     web = search_gateway._search_engines(
-        "How does the browser InstallEvent Web API work?", [], "browser installevent web api"
+        "How does the browser InstallEvent Web API work?",
+        [],
+        "browser installevent web api",
     )
     programming = search_gateway._search_engines(
         "Python stack trace error in an async function", [], "python async error"
@@ -93,8 +126,8 @@ def test_specialized_engines_require_matching_subject_intent():
     assert "mdn" not in programming
 
 
-def test_zero_subject_match_is_rejected_before_authority_can_boost_it():
-    result = search_gateway._normalize_search_result(
+def test_zero_subject_match_is_strongly_penalized_without_being_hard_filtered():
+    unrelated = search_gateway._normalize_search_result(
         {
             "title": "InstallEvent: InstallEvent() constructor",
             "url": "https://developer.mozilla.org/en-US/docs/Web/API/InstallEvent/InstallEvent",
@@ -104,10 +137,23 @@ def test_zero_subject_match_is_rejected_before_authority_can_boost_it():
         "How do I install Docker Compose on Ubuntu?",
         1,
     )
-    assert result is None
+    relevant = search_gateway._normalize_search_result(
+        {
+            "title": "Install Docker Compose on Ubuntu",
+            "url": "https://docs.example.com/docker-compose-ubuntu",
+            "content": "Docker Compose plugin installation instructions for Ubuntu.",
+            "engine": "bing",
+        },
+        "How do I install Docker Compose on Ubuntu?",
+        2,
+    )
+    assert unrelated is not None
+    assert relevant is not None
+    assert unrelated["subject_coverage"] == 0
+    assert relevant["discovery_score"] > unrelated["discovery_score"] + 5
 
 
-def test_subject_matching_does_not_accept_partial_words():
+def test_subject_matching_does_not_treat_partial_words_as_coverage():
     result = search_gateway._normalize_search_result(
         {
             "title": "Trusted package installation guide",
@@ -118,7 +164,8 @@ def test_subject_matching_does_not_accept_partial_words():
         "How do I install Rust?",
         1,
     )
-    assert result is None
+    assert result is not None
+    assert result["subject_coverage"] == 0
 
 
 def test_recommendation_queries_preserve_the_models_subject_and_intent():
@@ -148,7 +195,10 @@ def test_recommendation_queries_preserve_the_models_subject_and_intent():
         ("Who is Taylor Swift?", "Taylor Swift"),
         ("Best beginner build for Path of Exile 2", "Path of Exile 2"),
         ("Compare Redis and Valkey licensing", "Redis and Valkey"),
-        ('Fix the error "connection refused by upstream"', "connection refused by upstream"),
+        (
+            'Fix the error "connection refused by upstream"',
+            "connection refused by upstream",
+        ),
     ],
 )
 def test_topic_anchor_is_domain_agnostic(query, anchor):
@@ -175,35 +225,42 @@ def test_precise_queries_keep_an_exact_and_relaxed_form():
         '"DragonSword Awakening" Theresia Astria Roxy', "balanced"
     )
 
-    assert inferred[0].startswith('"DragonSword Awakening"')
-    assert any(item.startswith("DragonSword Awakening") for item in inferred[1:])
+    assert inferred[0].startswith("DragonSword Awakening")
+    assert any(item.startswith('"DragonSword Awakening"') for item in inferred[1:])
     assert explicit[0].startswith('"DragonSword Awakening"')
     assert all(len(item) > len('"DragonSword Awakening"') for item in explicit)
-    assert search_gateway._topic_anchor(
-        '"DragonSword Awakening" Theresia Astria Roxy'
-    ) == "DragonSword Awakening"
-    assert search_gateway._topic_anchor(
-        "Persona 5 best team composition"
-    ) == "Persona 5"
-    assert search_gateway._topic_anchor(
-        "Squid Game character build"
-    ) == "Squid Game"
+    assert (
+        search_gateway._topic_anchor('"DragonSword Awakening" Theresia Astria Roxy')
+        == "DragonSword Awakening"
+    )
+    assert (
+        search_gateway._topic_anchor("Persona 5 best team composition") == "Persona 5"
+    )
+    assert search_gateway._topic_anchor("Squid Game character build") == "Squid Game"
 
 
 def test_topic_anchor_prefers_the_subject_over_later_feature_terms():
-    assert search_gateway._topic_anchor(
-        "Best Android TV boxes with AV1, Dolby Vision, and gigabit Ethernet"
-    ) == "Android TV"
-    assert search_gateway._topic_anchor("Path of Exile 2 best build") == "Path of Exile 2"
+    assert (
+        search_gateway._topic_anchor(
+            "Best Android TV boxes with AV1, Dolby Vision, and gigabit Ethernet"
+        )
+        == "Android TV"
+    )
+    assert (
+        search_gateway._topic_anchor("Path of Exile 2 best build") == "Path of Exile 2"
+    )
 
 
-@pytest.mark.parametrize("query", [
-    "Best 4K TVs for gaming",
-    "Best HDR monitors",
-    "Best USB microphones",
-    "Best Wi-Fi routers",
-    "Best Android TV boxes",
-])
+@pytest.mark.parametrize(
+    "query",
+    [
+        "Best 4K TVs for gaming",
+        "Best HDR monitors",
+        "Best USB microphones",
+        "Best Wi-Fi routers",
+        "Best Android TV boxes",
+    ],
+)
 def test_generic_feature_anchors_are_soft_not_hard_filters(query):
     anchor = search_gateway._topic_anchor(query)
     assert anchor is not None
@@ -234,7 +291,7 @@ def test_soft_feature_anchor_allows_a_natural_language_paraphrase():
     assert result["topic_strict"] is False
 
 
-def test_entity_filter_rejects_generic_word_matches_before_authority_ranking():
+def test_entity_relevance_penalty_keeps_generic_word_matches_below_real_results():
     query = "DragonSword Awakening best equipment characters guide"
     unrelated = search_gateway._normalize_search_result(
         {
@@ -257,13 +314,14 @@ def test_entity_filter_rejects_generic_word_matches_before_authority_ranking():
         2,
     )
 
-    assert unrelated is None
+    assert unrelated is not None
     assert relevant is not None
+    assert relevant["discovery_score"] > unrelated["discovery_score"] + 5
     assert relevant["topic_anchor"] == "DragonSword Awakening"
     assert relevant["topic_match"] is True
 
 
-def test_spaced_entity_rejects_a_single_ambiguous_word_match():
+def test_spaced_entity_marks_a_single_ambiguous_word_match_as_partial_only():
     result = search_gateway._normalize_search_result(
         {
             "title": "Dragon - mythological creature",
@@ -274,7 +332,9 @@ def test_spaced_entity_rejects_a_single_ambiguous_word_match():
         "Dragon Sword Awakening game Astria",
         1,
     )
-    assert result is None
+    assert result is not None
+    assert result["topic_match"] is False
+    assert result["topic_partial_match"] is False
 
 
 def test_product_identifier_can_match_without_repeating_the_brand():
@@ -342,9 +402,9 @@ def test_candidate_scoring_prefers_relevant_official_sources():
         "content": "Many displays are available.",
     }
     query = "What are the best settings for my AW3426DW?"
-    assert search_gateway._candidate_score(query, official, 2) > search_gateway._candidate_score(
-        query, weak, 1
-    )
+    assert search_gateway._candidate_score(
+        query, official, 2
+    ) > search_gateway._candidate_score(query, weak, 1)
 
 
 def test_docker_documentation_outranks_docker_hub_for_installation_guides():
@@ -384,16 +444,18 @@ def test_instruction_query_penalizes_source_repository_without_repo_intent():
         snippet=repository["content"],
         query=repository_query,
     )
-    assert search_gateway._intent_source_adjustment(
-        install_query, install_profile
-    ) == -1.25
-    assert search_gateway._intent_source_adjustment(
-        repository_query, repository_profile
-    ) == 0.0
+    assert (
+        search_gateway._intent_source_adjustment(install_query, install_profile)
+        == -1.25
+    )
+    assert (
+        search_gateway._intent_source_adjustment(repository_query, repository_profile)
+        == 0.0
+    )
 
 
 @pytest.mark.asyncio
-async def test_searx_variants_use_local_rank_and_targeted_engine_routing(monkeypatch):
+async def test_searx_uses_original_query_then_a_bounded_fallback_wave(monkeypatch):
     captured = []
 
     class Stream:
@@ -422,7 +484,7 @@ async def test_searx_variants_use_local_rank_and_targeted_engine_routing(monkeyp
 
     async def read(response, max_bytes=0):
         query = response.params["q"]
-        if "site:docs.docker.com" in query:
+        if query != "How do I install Docker Compose on Ubuntu?":
             return {
                 "results": [
                     {
@@ -459,14 +521,148 @@ async def test_searx_variants_use_local_rank_and_targeted_engine_routing(monkeyp
     official = next(item for item in results if item["domain"] == "docs.docker.com")
     assert results[0] == official
     assert official["search_rank"] == 1
-    targeted = next(item for item in captured if "site:docs.docker.com" in item["q"])
-    assert targeted["engines"] == "startpage,bing,brave"
+    assert captured[0]["q"] == "How do I install Docker Compose on Ubuntu?"
+    assert captured[0]["engines"] == "bing,brave"
+    targeted = captured[1]
+    assert '"Docker Compose"' in targeted["q"]
+    assert "github" not in targeted["engines"]
     assert all("categories" not in params for params in captured)
-    assert diagnostics[1]["requested_engines"] == ["startpage", "bing", "brave"]
+    summary = diagnostics[-1]
+    assert summary["fallback_triggered"] is True
+    assert summary["initial_quality"]["status"] == "weak"
 
 
 @pytest.mark.asyncio
-async def test_discovery_rejects_topic_drift_across_exact_and_relaxed_queries(monkeypatch):
+async def test_failed_search_wave_updates_health_before_fallback(monkeypatch):
+    captured = []
+
+    class Stream:
+        def __init__(self, params, fail):
+            self.params = params
+            self.fail = fail
+
+        async def __aenter__(self):
+            if self.fail:
+                raise httpx.ReadTimeout("initial wave timed out")
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        def raise_for_status(self):
+            return None
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        def stream(self, method, url, params):
+            captured.append(params)
+            return Stream(params, len(captured) == 1)
+
+    async def read(response, max_bytes=0):
+        return {
+            "results": [
+                {
+                    "title": "Nebula XZ900 setup guide",
+                    "url": "https://docs.example.com/nebula-xz900",
+                    "content": "Nebula XZ900 installation and configuration guide.",
+                    "engine": "startpage",
+                }
+            ]
+        }
+
+    monkeypatch.setattr(search_gateway.httpx, "AsyncClient", lambda **kwargs: Client())
+    monkeypatch.setattr(search_gateway, "_read_json_response", read)
+
+    results, diagnostics = await search_gateway._searx_search(
+        "Nebula XZ900 setup guide",
+        mode="balanced",
+        max_results=3,
+        language="auto",
+        time_range=None,
+        categories=[],
+    )
+
+    assert results[0]["domain"] == "docs.example.com"
+    assert captured[0]["engines"] == "bing,brave"
+    assert captured[1]["engines"].split(",")[0] == "startpage"
+    failed = diagnostics[0]
+    assert failed["status"] == "failed"
+    assert failed["error"] == "ReadTimeout"
+    assert all(item["failures"] == 1 for item in failed["engine_health"])
+
+
+@pytest.mark.asyncio
+async def test_supplement_failure_does_not_fail_the_core_search(monkeypatch):
+    class Stream:
+        def __init__(self, params):
+            self.params = params
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        def raise_for_status(self):
+            return None
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        def stream(self, method, url, params):
+            return Stream(params)
+
+    async def read(response, max_bytes=0):
+        if response.params["q"] == "Nebula XZ900 setup guide":
+            return {"results": []}
+        return {
+            "results": [
+                {
+                    "title": f"Nebula XZ900 setup guide {index}",
+                    "url": f"https://guide{index}.example/xz900",
+                    "content": "Nebula XZ900 installation and configuration details.",
+                    "engine": "bing",
+                }
+                for index in range(1, 4)
+            ]
+        }
+
+    async def failed_supplement(query, time_range, categories=None):
+        raise ValueError("unexpected provider payload")
+
+    monkeypatch.setattr(search_gateway.httpx, "AsyncClient", lambda **kwargs: Client())
+    monkeypatch.setattr(search_gateway, "_read_json_response", read)
+    monkeypatch.setattr(search_gateway, "_supplemental_search", failed_supplement)
+
+    results, diagnostics = await search_gateway._searx_search(
+        "Nebula XZ900 setup guide",
+        mode="balanced",
+        max_results=3,
+        language="auto",
+        time_range=None,
+        categories=[],
+    )
+
+    assert len(results) == 3
+    assert any(
+        item.get("provider") == "supplemental"
+        and item.get("status") == "failed"
+        and item.get("error") == "ValueError"
+        for item in diagnostics
+    )
+
+
+@pytest.mark.asyncio
+async def test_discovery_softly_penalizes_topic_drift_across_search_waves(monkeypatch):
     captured = []
 
     class Stream:
@@ -524,10 +720,261 @@ async def test_discovery_rejects_topic_drift_across_exact_and_relaxed_queries(mo
     )
 
     assert captured == [
-        '"DragonSword Awakening" best equipment characters guide',
         "DragonSword Awakening best equipment characters guide",
+        '"DragonSword Awakening" best equipment characters guide',
     ]
-    assert [item["domain"] for item in results] == ["guide.example"]
+    assert results[0]["domain"] == "guide.example"
+    unrelated = next(item for item in results if item["domain"] == "britannica.com")
+    assert results[0]["discovery_score"] > unrelated["discovery_score"]
+
+
+@pytest.mark.asyncio
+async def test_strong_initial_wave_skips_fallback(monkeypatch):
+    captured = []
+
+    class Stream:
+        def __init__(self, params):
+            self.params = params
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        def raise_for_status(self):
+            return None
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        def stream(self, method, url, params):
+            captured.append(params)
+            return Stream(params)
+
+    async def read(response, max_bytes=0):
+        return {
+            "results": [
+                {
+                    "title": f"Orchid Falcon XZ900 setup guide {index}",
+                    "url": f"https://source{index}.example/guide",
+                    "content": "Orchid Falcon XZ900 configuration and setup instructions.",
+                    "engine": "bing",
+                }
+                for index in range(1, 4)
+            ]
+        }
+
+    monkeypatch.setattr(search_gateway.httpx, "AsyncClient", lambda **kwargs: Client())
+    monkeypatch.setattr(search_gateway, "_read_json_response", read)
+    results, diagnostics = await search_gateway._searx_search(
+        "Orchid Falcon XZ900 setup guide",
+        mode="balanced",
+        max_results=3,
+        language="auto",
+        time_range=None,
+        categories=[],
+    )
+
+    assert len(results) == 3
+    assert len(captured) == 1
+    assert diagnostics[-1]["fallback_triggered"] is False
+
+
+@pytest.mark.asyncio
+async def test_rate_limited_engine_enters_cooldown_before_fallback(monkeypatch):
+    captured = []
+
+    class Stream:
+        def __init__(self, params):
+            self.params = params
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        def raise_for_status(self):
+            return None
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        def stream(self, method, url, params):
+            captured.append(params)
+            return Stream(params)
+
+    async def read(response, max_bytes=0):
+        if len(captured) == 1:
+            return {
+                "results": [
+                    {
+                        "title": "Unrelated page",
+                        "url": "https://unrelated.example/",
+                        "content": "No product information.",
+                        "engine": "bing",
+                    }
+                ],
+                "unresponsive_engines": [["brave", "too many requests"]],
+            }
+        return {
+            "results": [
+                {
+                    "title": f"Nebula XZ900 setup guide {index}",
+                    "url": f"https://guide{index}.example/xz900",
+                    "content": "Nebula XZ900 installation and configuration details.",
+                    "engine": "bing",
+                }
+                for index in range(1, 4)
+            ]
+        }
+
+    monkeypatch.setattr(search_gateway.httpx, "AsyncClient", lambda **kwargs: Client())
+    monkeypatch.setattr(search_gateway, "_read_json_response", read)
+    _, diagnostics = await search_gateway._searx_search(
+        "Nebula XZ900 setup guide",
+        mode="balanced",
+        max_results=3,
+        language="auto",
+        time_range=None,
+        categories=[],
+    )
+
+    assert "brave" in captured[0]["engines"].split(",")
+    assert "brave" not in captured[1]["engines"].split(",")
+    assert (
+        search_gateway._engine_health_snapshot("brave")["cooldown_remaining_seconds"]
+        > 0
+    )
+    assert diagnostics[-1]["fallback_triggered"] is True
+
+
+def test_rrf_fusion_rewards_independent_query_and_engine_agreement():
+    shared = {
+        "title": "Shared result",
+        "url": "https://example.com/shared",
+        "discovery_score": 3.0,
+        "search_rank": 1,
+        "engines": ["bing"],
+        "query_variant": "original query",
+        "retrieval_rank": 1,
+        "retrieval_weight": 1.0,
+        "retrieval_source": "searxng",
+    }
+    occurrences = [
+        shared,
+        {
+            **shared,
+            "engines": ["startpage"],
+            "query_variant": "relaxed query",
+            "retrieval_rank": 2,
+        },
+        {
+            **shared,
+            "title": "Single result",
+            "url": "https://other.example/single",
+            "retrieval_rank": 1,
+        },
+    ]
+
+    fused = search_gateway._fuse_candidates(occurrences)
+    assert fused[0]["url"] == "https://example.com/shared"
+    assert fused[0]["query_consensus"] == 2
+    assert fused[0]["engine_consensus"] == 2
+
+
+def test_specialized_sources_are_supplements_not_technical_hard_routes(monkeypatch):
+    monkeypatch.setattr(search_gateway, "ENABLE_KEYLESS_SUPPLEMENTS", True)
+    assert search_gateway._supplement_sources_for("Python async stack trace error") == [
+        "stackexchange"
+    ]
+    assert "github" not in search_gateway._supplement_sources_for(
+        "How do I install PostgreSQL?"
+    )
+    assert "github" in search_gateway._supplement_sources_for(
+        "Find the GitHub repository for this package"
+    )
+
+
+@pytest.mark.asyncio
+async def test_image_search_does_not_add_text_only_supplements(monkeypatch):
+    monkeypatch.setattr(search_gateway, "ENABLE_KEYLESS_SUPPLEMENTS", True)
+
+    results, diagnostics = await search_gateway._supplemental_search(
+        "Nebula wallpaper", None, ["images"]
+    )
+
+    assert results == []
+    assert diagnostics == []
+
+
+@pytest.mark.asyncio
+async def test_planner_invalid_output_falls_back_to_deterministic_queries(monkeypatch):
+    class Stream:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        def raise_for_status(self):
+            return None
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        def stream(self, *args, **kwargs):
+            return Stream()
+
+    async def read(response, max_bytes=0):
+        return {"choices": [{"message": {"content": "not json"}}]}
+
+    monkeypatch.setattr(search_gateway, "PLANNER_BASE_URL", "http://planner/v1")
+    monkeypatch.setattr(search_gateway, "PLANNER_MODEL", "planner-model")
+    monkeypatch.setattr(search_gateway, "PLANNER_MODES", {"deep"})
+    monkeypatch.setattr(search_gateway.httpx, "AsyncClient", lambda **kwargs: Client())
+    monkeypatch.setattr(search_gateway, "_read_json_response", read)
+
+    variants, diagnostics = await search_gateway._planner_query_variants(
+        "Nebula XZ900 setup guide", "deep"
+    )
+    assert variants == []
+    assert diagnostics["status"] == "fallback"
+
+
+def test_planner_rejects_non_string_query_variants():
+    assert (
+        search_gateway._planner_variant_is_safe(
+            "Nebula XZ900 setup guide",
+            {"query": "Nebula XZ900 setup guide"},
+        )
+        is None
+    )
+
+
+def test_deep_discovery_timeout_reserves_time_for_enabled_planner(monkeypatch):
+    monkeypatch.setattr(search_gateway, "REQUEST_TIMEOUT_SECONDS", 60.0)
+    monkeypatch.setattr(search_gateway, "SEARCH_TIMEOUT_SECONDS", 7.0)
+    monkeypatch.setattr(search_gateway, "PLANNER_TIMEOUT_SECONDS", 5.0)
+    monkeypatch.setattr(search_gateway, "PLANNER_BASE_URL", "http://planner/v1")
+    monkeypatch.setattr(search_gateway, "PLANNER_MODEL", "planner-model")
+    monkeypatch.setattr(search_gateway, "PLANNER_MODES", {"deep"})
+
+    assert search_gateway._discovery_timeout_seconds("deep") == 28.0
+    assert search_gateway._discovery_timeout_seconds("balanced") == 16.0
 
 
 def test_lexical_reranking_preserves_source_authority():
@@ -553,6 +1000,18 @@ def test_url_canonicalization_and_source_matching_are_strict():
     )
     assert normalized is not None
     assert normalized["url"] == "https://example.com/guide"
+    assert (
+        search_gateway._canonical_url(
+            "https://example.com/guide?utm_source=test&item=2"
+        )
+        == "https://example.com/guide?item=2"
+    )
+    signed = "https://example.com/file?X-Amz-Signature=A%2FB&z=2&a=1"
+    assert search_gateway._canonical_url(signed) == signed
+    signed_path = (
+        "https://EXAMPLE.com:443/files//release.bin?sig=A%2FB&token=preserve"
+    )
+    assert search_gateway._canonical_url(signed_path) == signed_path
     assert search_gateway._canonical_url("https://example.com/" + "a" * 8192) is None
     assert search_gateway._source_adjustment("notdocs.example.com") == 0.0
     assert search_gateway._source_adjustment("docs.example.com") > 0.0
@@ -568,7 +1027,9 @@ async def test_reranker_falls_back_to_lexical_order(monkeypatch):
         async def __aexit__(self, *args):
             return False
 
-    monkeypatch.setattr(search_gateway.httpx, "AsyncClient", lambda **kwargs: FailingClient())
+    monkeypatch.setattr(
+        search_gateway.httpx, "AsyncClient", lambda **kwargs: FailingClient()
+    )
     docs = [
         {"text": "unrelated text", "candidate_index": 0},
         {"text": "AW3426DW recommended HDR settings", "candidate_index": 1},
@@ -678,8 +1139,7 @@ async def test_reranker_chunks_large_frontend_batches(monkeypatch):
 
     monkeypatch.setattr(search_gateway.httpx, "AsyncClient", lambda **kwargs: Client())
     docs = [
-        {"text": f"candidate {index}", "candidate_index": index}
-        for index in range(202)
+        {"text": f"candidate {index}", "candidate_index": index} for index in range(202)
     ]
 
     ranked, status = await search_gateway._rerank("candidate", docs, 5)
@@ -783,6 +1243,267 @@ async def test_crawl_deadline_keeps_completed_pages(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_adaptive_crawl_backfills_a_failed_top_candidate(monkeypatch):
+    calls = []
+
+    async def crawl(candidates, query, deadline):
+        calls.append([item["url"] for item in candidates])
+        candidate = candidates[0]
+        if "blocked" in candidate["url"]:
+            return [], [{"url": candidate["url"], "error": "blocked"}]
+        return [
+            {
+                "url": candidate["url"],
+                "content": "Useful extracted evidence. " * 60,
+                "content_chars": 1600,
+                "links": [],
+                "search": candidate,
+            }
+        ], []
+
+    monkeypatch.setattr(search_gateway, "_crawl_candidates", crawl)
+    pages, failures, batches = await search_gateway._adaptive_crawl_candidates(
+        [
+            {"title": "Blocked", "url": "https://blocked.example/"},
+            {"title": "Working", "url": "https://working.example/"},
+        ],
+        "useful evidence",
+        1,
+        search_gateway.time.monotonic() + 5,
+    )
+
+    assert calls == [
+        ["https://blocked.example/"],
+        ["https://working.example/"],
+    ]
+    assert pages[0]["url"] == "https://working.example/"
+    assert failures[0]["error"] == "blocked"
+    assert batches[1]["backfill"] is True
+
+
+@pytest.mark.asyncio
+async def test_adaptive_crawl_backfills_low_confidence_pages(monkeypatch):
+    calls = []
+
+    async def crawl(candidates, query, deadline):
+        candidate = candidates[0]
+        calls.append(candidate["url"])
+        return [
+            {
+                "url": candidate["url"],
+                "content": "evidence",
+                "content_chars": 8,
+                "links": [],
+                "low_confidence": "weak" in candidate["url"],
+                "search": candidate,
+            }
+        ], []
+
+    monkeypatch.setattr(search_gateway, "_crawl_candidates", crawl)
+    pages, _, _ = await search_gateway._adaptive_crawl_candidates(
+        [
+            {"title": "Weak", "url": "https://weak.example/"},
+            {"title": "Strong", "url": "https://strong.example/"},
+        ],
+        "evidence",
+        1,
+        search_gateway.time.monotonic() + 5,
+    )
+
+    assert calls == ["https://weak.example/", "https://strong.example/"]
+    assert pages[0]["url"] == "https://strong.example/"
+
+
+def test_passage_spans_reproduce_the_exact_source_text():
+    source = (
+        "  Introduction with useful context.\r\n\r\n"
+        "## Setup\r\nInstall the package, then verify the service.\r\n\r\n"
+        "Troubleshooting details follow.  "
+    )
+    chunks = search_gateway._chunk_text_with_spans(source)
+    assert chunks
+    for chunk in chunks:
+        assert source[chunk["start_char"] : chunk["end_char"]] == chunk["text"]
+
+
+@pytest.mark.asyncio
+async def test_domain_fetch_learning_prefers_a_successful_fallback_after_failures():
+    domain = "learned.example"
+    await gateway_fetch._record_domain_outcome(
+        domain, "direct", success=False, latency_seconds=1.0, reason="timeout"
+    )
+    await gateway_fetch._record_domain_outcome(
+        domain, "direct", success=False, latency_seconds=1.0, reason="timeout"
+    )
+    await gateway_fetch._record_domain_outcome(
+        domain, "crawl4ai", success=True, latency_seconds=0.5, reason="usable"
+    )
+    order, preferred, _ = await gateway_fetch._method_order(
+        "https://learned.example/guide"
+    )
+    assert preferred == "crawl4ai"
+    assert order[0] == "crawl4ai"
+
+
+@pytest.mark.asyncio
+async def test_recent_direct_failures_outweigh_old_success_history():
+    domain = "changed.example"
+    gateway_fetch._DOMAIN_FETCH_STATS[domain] = {
+        "direct": {
+            "attempts": 102,
+            "successes": 100,
+            "failures": 2,
+            "consecutive_failures": 2,
+            "latency_total": 20.0,
+            "updated_at": int(gateway_fetch.time.time()),
+        },
+        "crawl4ai": {
+            "attempts": 2,
+            "successes": 2,
+            "failures": 0,
+            "consecutive_failures": 0,
+            "latency_total": 2.0,
+            "updated_at": int(gateway_fetch.time.time()),
+        },
+    }
+
+    order, preferred, _ = await gateway_fetch._method_order(
+        "https://changed.example/guide"
+    )
+
+    assert preferred == "crawl4ai"
+    assert order[0] == "crawl4ai"
+
+
+@pytest.mark.asyncio
+async def test_domain_fetch_learning_reprobes_direct_after_temporary_failures():
+    domain = "recovered.example"
+    await gateway_fetch._record_domain_outcome(
+        domain, "direct", success=False, latency_seconds=1.0, reason="timeout"
+    )
+    await gateway_fetch._record_domain_outcome(
+        domain, "direct", success=False, latency_seconds=1.0, reason="timeout"
+    )
+    await gateway_fetch._record_domain_outcome(
+        domain, "playwright", success=True, latency_seconds=0.5, reason="usable"
+    )
+    gateway_fetch._DOMAIN_FETCH_STATS[domain]["direct"]["updated_at"] = int(
+        gateway_fetch.time.time() - gateway_fetch.FETCH_REPROBE_SECONDS - 1
+    )
+
+    order, preferred, _ = await gateway_fetch._method_order(
+        "https://recovered.example/guide"
+    )
+
+    assert preferred == "playwright"
+    assert order[0] == "direct"
+
+    await gateway_fetch._record_domain_outcome(
+        domain, "direct", success=True, latency_seconds=0.2, reason="usable"
+    )
+    order, _, stats = await gateway_fetch._method_order(
+        "https://recovered.example/guide"
+    )
+    assert stats["direct"]["consecutive_failures"] == 0
+    assert order[0] == "direct"
+
+
+@pytest.mark.asyncio
+async def test_domain_fetch_learning_keeps_direct_fast_paths_first():
+    urls = (
+        ("downloads.example", "https://downloads.example/manual.pdf"),
+        ("downloads.example", "https://downloads.example/releases.json"),
+        ("github.com", "https://github.com/example/project"),
+        (
+            "github.com",
+            "https://github.com/example/project/blob/main/docs/install.md",
+        ),
+    )
+    for domain in {domain for domain, _ in urls}:
+        await gateway_fetch._record_domain_outcome(
+            domain, "direct", success=False, latency_seconds=1.0, reason="timeout"
+        )
+        await gateway_fetch._record_domain_outcome(
+            domain, "direct", success=False, latency_seconds=1.0, reason="timeout"
+        )
+        await gateway_fetch._record_domain_outcome(
+            domain, "playwright", success=True, latency_seconds=0.5, reason="usable"
+        )
+
+    for _, url in urls:
+        order, preferred, _ = await gateway_fetch._method_order(url)
+        assert preferred == "playwright"
+        assert order[0] == "direct"
+        if gateway_fetch._github_fast_path(url):
+            assert order[1] == "github_raw"
+
+
+def test_long_documentation_about_access_denied_is_not_a_challenge():
+    page = {
+        "title": "Troubleshooting access errors",
+        "content": (
+            "This documentation explains Access Denied errors, their causes, "
+            "and the configuration steps used to resolve them. "
+        )
+        * 40,
+        "body_format": "html",
+    }
+
+    assessment = gateway_fetch.assess_content(
+        page, "How do I resolve an Access Denied configuration error?"
+    )
+
+    assert assessment["status"] == "usable"
+    assert assessment["usable"] is True
+
+
+def test_long_documentation_with_one_decisive_marker_is_not_a_challenge():
+    page = {
+        "title": "Diagnosing reverse proxy errors",
+        "content": (
+            "This guide explains how administrators can interpret a Cloudflare Ray ID "
+            "while diagnosing proxy configuration and origin connectivity. "
+            + "Detailed configuration examples and verification steps follow. " * 55
+        ),
+        "body_format": "html",
+    }
+
+    assessment = gateway_fetch.assess_content(
+        page, "How do I diagnose reverse proxy configuration errors?"
+    )
+
+    assert assessment["status"] == "usable"
+    assert assessment["usable"] is True
+
+
+@pytest.mark.asyncio
+async def test_fetch_page_never_returns_a_challenge_shell(monkeypatch):
+    async def validate(url):
+        return url
+
+    async def challenge(*args, **kwargs):
+        return {
+            "url": "https://challenge.example/",
+            "title": "Attention Required",
+            "content": "CAPTCHA. Please verify you are human. " * 80,
+            "content_chars": 3040,
+            "body_format": "html",
+            "links": [],
+            "extraction_method": "test",
+        }
+
+    monkeypatch.setattr(gateway_fetch, "validate_public_url", validate)
+    monkeypatch.setattr(gateway_fetch, "direct_fetch", challenge)
+    monkeypatch.setattr(gateway_fetch, "crawl4ai_fetch", challenge)
+    monkeypatch.setattr(gateway_fetch, "browser_fetch", challenge)
+
+    with pytest.raises(gateway_fetch.PageExtractionError):
+        await gateway_fetch.fetch_page(
+            "https://challenge.example/", "specific answer", 12
+        )
+
+
+@pytest.mark.asyncio
 async def test_follow_links_canonicalizes_and_deduplicates_fragments(monkeypatch):
     captured = []
 
@@ -810,9 +1531,7 @@ async def test_follow_links_canonicalizes_and_deduplicates_fragments(monkeypatch
     await search_gateway._follow_relevant_links(
         pages, "install guide", 5, search_gateway.time.monotonic() + 10
     )
-    assert [item["url"] for item in captured] == [
-        "https://docs.example.co.uk/install"
-    ]
+    assert [item["url"] for item in captured] == ["https://docs.example.co.uk/install"]
 
 
 def test_assemble_results_diversifies_domains_before_duplicates():
@@ -937,6 +1656,64 @@ async def test_fetch_page_reserves_time_for_playwright_after_crawl_failure(monke
 
 
 @pytest.mark.asyncio
+async def test_integrated_budget_preserves_requested_search_mode(monkeypatch):
+    search_gateway._CACHE.clear()
+    search_gateway._QUERY_LOCKS.clear()
+    search_gateway._QUERY_LOCK_USERS.clear()
+    captured = {}
+
+    async def no_cache(_):
+        return None
+
+    async def ignore_cache(*_):
+        return None
+
+    async def search(*args, **kwargs):
+        captured["mode"] = kwargs["mode"]
+        return (
+            [
+                {
+                    "title": "Deep evidence",
+                    "url": "https://example.com/deep",
+                    "domain": "example.com",
+                    "snippet": "Detailed evidence for the requested subject.",
+                    "search_rank": 1,
+                    "discovery_score": 4.0,
+                    "published_at": None,
+                    "engines": ["bing"],
+                }
+            ],
+            [],
+        )
+
+    async def rerank(query, documents, top_k, timeout_seconds):
+        return documents[:top_k], "ok"
+
+    async def crawl(candidates, query, target_pages, deadline):
+        return [], [], []
+
+    monkeypatch.setattr(search_gateway, "_cache_get", no_cache)
+    monkeypatch.setattr(search_gateway, "_cache_set", ignore_cache)
+    monkeypatch.setattr(search_gateway, "_searx_search", search)
+    monkeypatch.setattr(search_gateway, "_rerank_bounded", rerank)
+    monkeypatch.setattr(search_gateway, "_adaptive_crawl_candidates", crawl)
+
+    response = await search_gateway.research(
+        search_gateway.SearchRequest(
+            query="Deep investigation of a subject",
+            mode="deep",
+            max_results=1,
+        ),
+        budget_override=search_gateway.Budget(8, 1, 0, 1, 5),
+        pipeline="integrated",
+    )
+
+    assert captured["mode"] == "deep"
+    assert response["diagnostics"]["mode"] == "deep"
+    assert response["diagnostics"]["pipeline"] == "integrated"
+
+
+@pytest.mark.asyncio
 async def test_research_returns_searx_compatible_enriched_results(monkeypatch):
     search_gateway._CACHE.clear()
     search_gateway._QUERY_LOCKS.clear()
@@ -979,7 +1756,8 @@ async def test_research_returns_searx_compatible_enriched_results(monkeypatch):
                 {
                     "url": candidates[0]["url"],
                     "title": candidates[0]["title"],
-                    "content": "Docker Compose installation steps and configuration. " * 80,
+                    "content": "Docker Compose installation steps and configuration. "
+                    * 80,
                     "content_chars": 4400,
                     "links": [],
                     "extraction_method": "direct",
@@ -1004,6 +1782,9 @@ async def test_research_returns_searx_compatible_enriched_results(monkeypatch):
     assert response["number_of_results"] == 1
     assert response["results"][0]["url"] == "https://docs.example.com/install"
     assert "Docker Compose installation" in response["results"][0]["content"]
+    evidence = response["results"][0]["evidence"][0]
+    assert evidence["id"].startswith(response["results"][0]["evidence_id"])
+    assert evidence["end_char"] > evidence["start_char"]
 
 
 @pytest.mark.asyncio
@@ -1038,7 +1819,8 @@ async def test_research_direct_url_bypasses_searxng_and_keeps_citation_metadata(
                 {
                     "url": candidates[0]["url"],
                     "title": "Example install guide",
-                    "content": "Install Example with the supported package manager. " * 80,
+                    "content": "Install Example with the supported package manager. "
+                    * 80,
                     "content_chars": 4320,
                     "links": [],
                     "extraction_method": "direct",
@@ -1244,7 +2026,7 @@ async def test_final_rerank_timeout_keeps_crawled_evidence(monkeypatch):
 
     async def rerank(query, docs, top_k):
         if docs and "page_index" in docs[0]:
-            await asyncio.sleep(1)
+            await asyncio.sleep(2)
             return [], "late"
         return [dict(docs[0], rerank_score=1.0)], "ok"
 
@@ -1272,7 +2054,7 @@ async def test_final_rerank_timeout_keeps_crawled_evidence(monkeypatch):
     monkeypatch.setitem(
         search_gateway.MODE_BUDGETS,
         "quick",
-        search_gateway.Budget(4, 1, 0, 2, 0.05),
+        search_gateway.Budget(4, 1, 0, 2, 1.6),
     )
     monkeypatch.setattr(search_gateway, "FINALIZATION_RESERVE_SECONDS", 0.01)
     monkeypatch.setattr(search_gateway, "CANDIDATE_RERANKER_TIMEOUT_SECONDS", 0.01)

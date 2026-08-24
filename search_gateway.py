@@ -14,8 +14,9 @@ import time
 from collections import OrderedDict
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
+from html import unescape
 from typing import Any, Literal
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import unquote_plus, urlsplit, urlunsplit
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Query, Response
@@ -31,7 +32,7 @@ from evidence_quality import (
     stable_evidence_id,
     temporal_requirement,
 )
-from gateway_fetch import fetch_page
+from gateway_fetch import close_fetch_resources, fetch_page
 from request_limits import RequestBodyLimitMiddleware
 
 
@@ -41,16 +42,14 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0").strip()
 RERANKER_URL = os.getenv("RERANKER_URL", "http://reranker:8000").rstrip("/")
 RERANKER_MODEL = os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-base").strip()
 REQUEST_TIMEOUT_SECONDS = max(
-    5.0, float(os.getenv("GATEWAY_REQUEST_TIMEOUT_SECONDS", "28"))
+    5.0, float(os.getenv("GATEWAY_REQUEST_TIMEOUT_SECONDS", "30"))
 )
 SEARCH_TIMEOUT_SECONDS = max(
-    2.0, float(os.getenv("GATEWAY_SEARCH_TIMEOUT_SECONDS", "9"))
+    2.0, float(os.getenv("GATEWAY_SEARCH_TIMEOUT_SECONDS", "7"))
 )
-PAGE_TIMEOUT_SECONDS = max(
-    3.0, float(os.getenv("GATEWAY_PAGE_TIMEOUT_SECONDS", "18"))
-)
+PAGE_TIMEOUT_SECONDS = max(3.0, float(os.getenv("GATEWAY_PAGE_TIMEOUT_SECONDS", "16")))
 MAX_SEARCH_RESULTS = max(8, int(os.getenv("GATEWAY_MAX_SEARCH_RESULTS", "30")))
-MAX_CRAWL_PAGES = max(1, int(os.getenv("GATEWAY_MAX_CRAWL_PAGES", "8")))
+MAX_CRAWL_PAGES = max(1, int(os.getenv("GATEWAY_MAX_CRAWL_PAGES", "6")))
 MAX_FOLLOW_LINKS = max(0, int(os.getenv("GATEWAY_MAX_FOLLOW_LINKS", "2")))
 MAX_CONCURRENT_FETCHES = max(1, int(os.getenv("GATEWAY_MAX_CONCURRENT_FETCHES", "4")))
 MAX_FINAL_RESULTS = max(1, int(os.getenv("GATEWAY_MAX_FINAL_RESULTS", "8")))
@@ -72,17 +71,13 @@ RERANKER_MAX_RESPONSE_BYTES = max(
 RERANKER_MAX_BATCH_SIZE = min(
     32, max(1, int(os.getenv("GATEWAY_RERANKER_MAX_BATCH_SIZE", "32")))
 )
-MAX_CONCURRENT_RERANKS = max(
-    1, int(os.getenv("GATEWAY_MAX_CONCURRENT_RERANKS", "2"))
-)
+MAX_CONCURRENT_RERANKS = max(1, int(os.getenv("GATEWAY_MAX_CONCURRENT_RERANKS", "2")))
 RERANKER_ADMISSION_TIMEOUT_SECONDS = max(
     0.01, float(os.getenv("GATEWAY_RERANKER_ADMISSION_TIMEOUT_SECONDS", "0.25"))
 )
 MAX_REQUEST_BYTES = max(4096, int(os.getenv("GATEWAY_MAX_REQUEST_BYTES", "262144")))
 QUERY_MAX_CHARS = max(256, int(os.getenv("GATEWAY_QUERY_MAX_CHARS", "4000")))
-MAX_CONCURRENT_REQUESTS = max(
-    1, int(os.getenv("GATEWAY_MAX_CONCURRENT_REQUESTS", "4"))
-)
+MAX_CONCURRENT_REQUESTS = max(1, int(os.getenv("GATEWAY_MAX_CONCURRENT_REQUESTS", "4")))
 ADMISSION_TIMEOUT_SECONDS = max(
     0.05, float(os.getenv("GATEWAY_ADMISSION_TIMEOUT_SECONDS", "2"))
 )
@@ -92,6 +87,37 @@ FINALIZATION_RESERVE_SECONDS = max(
 CANDIDATE_RERANKER_TIMEOUT_SECONDS = max(
     0.25, float(os.getenv("GATEWAY_CANDIDATE_RERANKER_TIMEOUT_SECONDS", "2"))
 )
+PRIMARY_ENGINE_COUNT = max(
+    1, min(3, int(os.getenv("GATEWAY_PRIMARY_ENGINE_COUNT", "2")))
+)
+FALLBACK_ENGINE_COUNT = max(1, int(os.getenv("GATEWAY_FALLBACK_ENGINE_COUNT", "4")))
+ENGINE_COOLDOWN_SECONDS = max(
+    30.0, float(os.getenv("GATEWAY_ENGINE_COOLDOWN_SECONDS", "900"))
+)
+ENGINE_HEALTH_MAX_ENTRIES = max(
+    16, int(os.getenv("GATEWAY_ENGINE_HEALTH_MAX_ENTRIES", "128"))
+)
+RRF_K = max(1.0, float(os.getenv("GATEWAY_RRF_K", "60")))
+ENABLE_KEYLESS_SUPPLEMENTS = os.getenv(
+    "GATEWAY_ENABLE_KEYLESS_SUPPLEMENTS", "true"
+).strip().casefold() in {"1", "true", "yes", "on"}
+SUPPLEMENT_TIMEOUT_SECONDS = max(
+    1.0, float(os.getenv("GATEWAY_SUPPLEMENT_TIMEOUT_SECONDS", "4"))
+)
+SUPPLEMENT_COOLDOWN_SECONDS = max(
+    30.0, float(os.getenv("GATEWAY_SUPPLEMENT_COOLDOWN_SECONDS", "900"))
+)
+PLANNER_BASE_URL = os.getenv("GATEWAY_PLANNER_BASE_URL", "").strip().rstrip("/")
+PLANNER_API_KEY = os.getenv("GATEWAY_PLANNER_API_KEY", "").strip()
+PLANNER_MODEL = os.getenv("GATEWAY_PLANNER_MODEL", "").strip()
+PLANNER_TIMEOUT_SECONDS = max(
+    1.0, float(os.getenv("GATEWAY_PLANNER_TIMEOUT_SECONDS", "5"))
+)
+PLANNER_MODES = {
+    item.strip().casefold()
+    for item in os.getenv("GATEWAY_PLANNER_MODES", "deep").split(",")
+    if item.strip()
+}
 
 # Compatibility routes deliberately have smaller budgets than deep research.
 # They are intended for frontends that expect a quick search or one-page scrape.
@@ -104,9 +130,7 @@ INTEGRATED_MAX_SEARCH_RESULTS = max(
 INTEGRATED_MAX_CRAWL_PAGES = max(
     1, int(os.getenv("GATEWAY_INTEGRATED_MAX_CRAWL_PAGES", "3"))
 )
-INTEGRATED_MAX_RESULTS = max(
-    1, int(os.getenv("GATEWAY_INTEGRATED_MAX_RESULTS", "5"))
-)
+INTEGRATED_MAX_RESULTS = max(1, int(os.getenv("GATEWAY_INTEGRATED_MAX_RESULTS", "5")))
 FIRECRAWL_API_KEY = os.getenv("FIRECRAWL_API_KEY", "").strip()
 FIRECRAWL_TIMEOUT_SECONDS = max(
     5.0, float(os.getenv("FIRECRAWL_TIMEOUT_SECONDS", "30"))
@@ -121,10 +145,8 @@ FIRECRAWL_MAX_CONTENT_CHARS = max(
 FIRECRAWL_MAX_RESPONSE_BYTES = max(
     65_536, int(os.getenv("FIRECRAWL_MAX_RESPONSE_BYTES", "4194304"))
 )
-FIRECRAWL_MAX_RESULTS = max(
-    1, int(os.getenv("FIRECRAWL_MAX_RESULTS", "20"))
-)
-CACHE_SCHEMA_VERSION = "quality-v6"
+FIRECRAWL_MAX_RESULTS = max(1, int(os.getenv("FIRECRAWL_MAX_RESULTS", "20")))
+CACHE_SCHEMA_VERSION = "adaptive-v1"
 
 
 _CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
@@ -134,6 +156,8 @@ _QUERY_LOCK_USERS: dict[str, int] = {}
 _ADMISSION = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
 _RERANK_ADMISSION = asyncio.Semaphore(MAX_CONCURRENT_RERANKS)
 _REDIS = None
+_ENGINE_HEALTH: OrderedDict[str, dict[str, Any]] = OrderedDict()
+_SUPPLEMENT_COOLDOWNS: dict[str, float] = {}
 
 
 TECHNICAL_RE = re.compile(
@@ -165,15 +189,6 @@ TROUBLESHOOT_RE = re.compile(
     r"\b(?:bug|crash|error|exception|failed|failure|fix|problem|stack trace|troubleshoot)\b",
     re.I,
 )
-DOCKER_DOCUMENTATION_QUERY_RE = re.compile(
-    r"(?:\b(?:configure|fix|install|setup|troubleshoot(?:ing)?)\s+"
-    r"(?:docker(?:\s+compose)?|docker-compose)\b|"
-    r"\b(?:docker(?:\s+compose)?|docker-compose)\s+"
-    r"(?:config(?:uration)?|error|exception|fix|guide|install(?:ation)?|manual|"
-    r"reference|schema|setup|specification|troubleshoot(?:ing)?)\b|"
-    r"\bcompose\s+plugin\b)",
-    re.I,
-)
 CURRENT_RE = re.compile(
     r"\b(?:current|latest|new|news|patch|release|recent|today|tonight)\b",
     re.I,
@@ -182,12 +197,16 @@ ACADEMIC_RE = re.compile(
     r"\b(?:academic|clinical|journal|paper|preprint|research|scientific|study)\b",
     re.I,
 )
-IMAGE_RE = re.compile(r"\b(?:image|images|photo|photos|picture|pictures|wallpaper)\b", re.I)
+IMAGE_RE = re.compile(
+    r"\b(?:image|images|photo|photos|picture|pictures|wallpaper)\b", re.I
+)
 RECOMMENDATION_RE = re.compile(
     r"\b(?:best|compare|comparison|recommend|recommended|settings|team composition|tier list)\b",
     re.I,
 )
-COMPARISON_INTENT_RE = re.compile(r"\b(?:compare|comparison|versus|vs\.?)(?:\b|$)", re.I)
+COMPARISON_INTENT_RE = re.compile(
+    r"\b(?:compare|comparison|versus|vs\.?)(?:\b|$)", re.I
+)
 ERROR_QUOTE_RE = re.compile(r"(?:error|exception|failed|failure)[:\s]+(.{8,220})", re.I)
 URL_IN_QUERY_RE = re.compile(r"https?://[^\s<>\"']+", re.I)
 QUOTED_PHRASE_RE = re.compile(r'"([^"\r\n]{2,160})"')
@@ -202,13 +221,6 @@ SOURCE_LABEL_BOOSTS = {
     "developer": 1.0,
     "support": 0.9,
 }
-SOURCE_DOMAIN_BOOSTS = {
-    "docs.docker.com": 1.4,
-    "stackoverflow.com": 0.65,
-    "serverfault.com": 0.65,
-    "superuser.com": 0.55,
-    "reddit.com": 0.15,
-}
 SOURCE_PENALTIES = {
     "hub.docker.com": -0.35,
     "pinterest.com": -4.0,
@@ -217,8 +229,8 @@ SOURCE_PENALTIES = {
     "tiktok.com": -3.0,
     "fandom.com": -1.0,
 }
-AUTHORITY_RANK_WEIGHT = 0.12
-BROAD_WEB_ENGINES = ("startpage", "bing", "brave")
+AUTHORITY_RANK_WEIGHT = 0.08
+BROAD_WEB_ENGINES = ("bing", "brave", "startpage")
 NEWS_ENGINES = ("startpage news", "bing news", "brave.news", "reuters")
 ACADEMIC_ENGINES = ("arxiv", "pubmed", "semantic scholar", "openalex", "crossref")
 IMAGE_ENGINES = (
@@ -341,9 +353,9 @@ class Budget:
 
 
 MODE_BUDGETS = {
-    "quick": Budget(12, 3, 0, 4, min(14.0, REQUEST_TIMEOUT_SECONDS)),
-    "balanced": Budget(24, 6, 1, 6, REQUEST_TIMEOUT_SECONDS),
-    "deep": Budget(30, 8, 2, 8, max(REQUEST_TIMEOUT_SECONDS, 40.0)),
+    "quick": Budget(12, 1, 0, 4, min(12.0, REQUEST_TIMEOUT_SECONDS)),
+    "balanced": Budget(24, 3, 1, 6, REQUEST_TIMEOUT_SECONDS),
+    "deep": Budget(30, 5, 2, 8, max(REQUEST_TIMEOUT_SECONDS, 40.0)),
 }
 
 
@@ -360,7 +372,11 @@ def _tokens(value: object) -> list[str]:
     seen: set[str] = set()
     for token in WORD_RE.findall(str(value or "").casefold()):
         token = token.strip("-.")
-        if (len(token) < 2 and not token.isdigit()) or token in STOP_WORDS or token in seen:
+        if (
+            (len(token) < 2 and not token.isdigit())
+            or token in STOP_WORDS
+            or token in seen
+        ):
             continue
         seen.add(token)
         output.append(token)
@@ -473,7 +489,11 @@ def _topic_anchor(query: str) -> str | None:
 
     # A single identifier can still be a precise subject (AW3426DW, HTTP, NIST).
     return next(
-        (word.group(0).strip("-.") for index, word in enumerate(words) if candidates[index] and is_identifier(word.group(0))),
+        (
+            word.group(0).strip("-.")
+            for index, word in enumerate(words)
+            if candidates[index] and is_identifier(word.group(0))
+        ),
         None,
     )
 
@@ -486,14 +506,12 @@ def _anchor_matches(anchor: str, text: str) -> bool:
     for word in anchor_words:
         # Treat CamelCase subjects (for example DragonSword) as either a
         # compact or spaced spelling, while keeping numeric versions bounded.
-        anchor_parts.extend(re.findall(r"[A-Z]+(?=[A-Z][a-z]|\d|$)|[A-Z]?[a-z]+|\d+", word))
+        anchor_parts.extend(
+            re.findall(r"[A-Z]+(?=[A-Z][a-z]|\d|$)|[A-Z]?[a-z]+|\d+", word)
+        )
     anchor_parts = anchor_parts[:32]
-    compact_pattern = r"[\W_]{0,16}".join(
-        re.escape(part) for part in anchor_parts
-    )
-    if compact_pattern and re.search(
-        rf"(?<!\w){compact_pattern}(?!\w)", text, re.I
-    ):
+    compact_pattern = r"[\W_]{0,16}".join(re.escape(part) for part in anchor_parts)
+    if compact_pattern and re.search(rf"(?<!\w){compact_pattern}(?!\w)", text, re.I):
         return True
     terms = _tokens(anchor)
     identifiers = [
@@ -511,7 +529,10 @@ def _anchor_matches(anchor: str, text: str) -> bool:
 def _anchor_query(anchor: str, query: str) -> str:
     """Quote the subject while preserving the model's wording and intent."""
 
-    if any(anchor.casefold() == phrase.casefold() for phrase in QUOTED_PHRASE_RE.findall(query)):
+    if any(
+        anchor.casefold() == phrase.casefold()
+        for phrase in QUOTED_PHRASE_RE.findall(query)
+    ):
         return query
     return re.sub(re.escape(anchor), f'"{anchor}"', query, count=1, flags=re.I)
 
@@ -521,7 +542,10 @@ def _topic_anchor_is_strict(query: str, anchor: str | None) -> bool:
 
     if not anchor:
         return False
-    if any(anchor.casefold() == phrase.casefold() for phrase in QUOTED_PHRASE_RE.findall(query)):
+    if any(
+        anchor.casefold() == phrase.casefold()
+        for phrase in QUOTED_PHRASE_RE.findall(query)
+    ):
         return True
     terms = WORD_RE.findall(anchor)
     if not terms:
@@ -542,25 +566,29 @@ def _topic_anchor_is_strict(query: str, anchor: str | None) -> bool:
 
 
 def _query_variants(query: str, mode: str) -> list[str]:
+    """Build conservative fallbacks while preserving the user's query first."""
+
     normalized = re.sub(r"\s+", " ", query).strip()
     topic_anchor = _topic_anchor(normalized)
-    strict_anchor = _topic_anchor_is_strict(normalized, topic_anchor)
-    variants = [_anchor_query(topic_anchor, normalized)] if topic_anchor else [normalized]
+    variants = [normalized]
     error = ERROR_QUOTE_RE.search(normalized)
-    if error and not strict_anchor:
+    if error and not topic_anchor:
         variants.append(f'"{error.group(1).strip()}"')
-    if DOCKER_DOCUMENTATION_QUERY_RE.search(normalized):
-        variants.append(f"{normalized} site:docs.docker.com")
-    elif TECHNICAL_RE.search(normalized) and INSTRUCTION_RE.search(normalized):
-        variants.append(f"{normalized} official documentation")
     elif CURRENT_RE.search(normalized):
         variants.append(f"{normalized} latest")
     elif topic_anchor:
-        variants.append(normalized)
-    elif TECHNICAL_RE.search(normalized):
+        variants.append(_anchor_query(topic_anchor, normalized))
+    elif TECHNICAL_RE.search(normalized) and INSTRUCTION_RE.search(normalized):
         variants.append(f"{normalized} official documentation")
     if mode == "deep" and len(variants) < 3:
-        variants.append(f"{normalized} authoritative sources")
+        if error and all(error.group(1).strip() not in item for item in variants[1:]):
+            variants.append(f'{normalized} "{error.group(1).strip()}"')
+        elif CURRENT_RE.search(normalized):
+            variants.append(f"{normalized} recent authoritative sources")
+        elif TECHNICAL_RE.search(normalized):
+            variants.append(f"{normalized} official documentation")
+        else:
+            variants.append(f"{normalized} authoritative sources")
     limit = 3 if mode == "deep" else 2
     return list(dict.fromkeys(variants))[:limit]
 
@@ -637,7 +665,12 @@ def _canonical_url(value: object) -> str | None:
         port = parsed.port
     except (UnicodeError, ValueError):
         return None
-    if scheme not in {"http", "https"} or not host or parsed.username or parsed.password:
+    if (
+        scheme not in {"http", "https"}
+        or not host
+        or parsed.username
+        or parsed.password
+    ):
         return None
     try:
         host = host.encode("idna").decode("ascii")
@@ -648,7 +681,40 @@ def _canonical_url(value: object) -> str | None:
         (scheme == "http" and port == 80) or (scheme == "https" and port == 443)
     ):
         display_host = f"{display_host}:{port}"
-    return urlunsplit((scheme, display_host, parsed.path or "/", parsed.query, ""))
+    tracking_names = {
+        "fbclid",
+        "gclid",
+        "mc_cid",
+        "mc_eid",
+        "ref_src",
+        "spm",
+    }
+    raw_query_parts = parsed.query.split("&") if parsed.query else []
+    decoded_keys = [
+        unquote_plus(part.partition("=")[0]).casefold() for part in raw_query_parts
+    ]
+    signed_query = any(
+        key in {"signature", "sig", "token", "x-goog-signature"}
+        or key.startswith("x-amz-")
+        for key in decoded_keys
+    )
+    if signed_query:
+        return urlunsplit(
+            (
+                parsed.scheme,
+                parsed.netloc,
+                parsed.path or "/",
+                parsed.query,
+                "",
+            )
+        )
+    query_string = "&".join(
+        part
+        for part, key in zip(raw_query_parts, decoded_keys)
+        if not key.startswith("utm_") and key not in tracking_names
+    )
+    path = re.sub(r"/{2,}", "/", parsed.path or "/")
+    return urlunsplit((scheme, display_host, path, query_string, ""))
 
 
 def _extract_query_urls(query: str) -> list[str]:
@@ -659,7 +725,9 @@ def _extract_query_urls(query: str) -> list[str]:
     for match in URL_IN_QUERY_RE.finditer(query):
         candidate = match.group(0).rstrip(".,;:!?")
         for opening, closing in (("(", ")"), ("[", "]"), ("{", "}")):
-            while candidate.endswith(closing) and candidate.count(closing) > candidate.count(opening):
+            while candidate.endswith(closing) and candidate.count(
+                closing
+            ) > candidate.count(opening):
                 candidate = candidate[:-1]
         canonical = _canonical_url(candidate)
         if canonical is None or canonical in seen:
@@ -716,9 +784,6 @@ def _direct_url_candidates(query: str, max_results: int) -> list[dict[str, Any]]
 def _source_adjustment(domain: str) -> float:
     first_label = domain.split(".", 1)[0]
     adjustment = SOURCE_LABEL_BOOSTS.get(first_label, 0.0)
-    for candidate, value in SOURCE_DOMAIN_BOOSTS.items():
-        if domain == candidate or domain.endswith("." + candidate):
-            adjustment += value
     for candidate, value in SOURCE_PENALTIES.items():
         if domain == candidate or domain.endswith("." + candidate):
             adjustment += value
@@ -771,16 +836,23 @@ def _candidate_score(
     requirement = temporal_requirement(query, time_range)
     published = normalize_date(item.get("publishedDate") or item.get("published_at"))
     modified = normalize_date(item.get("modifiedDate") or item.get("modified_at"))
-    score = 3.0 * _lexical_score(query, text)
-    score += 1.5 * subject_coverage
+    score = 4.0 * _lexical_score(query, text)
+    score += 2.0 * subject_coverage
     topic_anchor = _topic_anchor(query)
     if topic_anchor:
-        score += 1.4 if _anchor_matches(topic_anchor, f"{text} {item.get('url', '')}") else -0.8
-    score += 1.0 / max(1, rank)
-    score += _source_adjustment(domain)
-    score += float(profile["authority_adjustment"])
-    score += _intent_source_adjustment(query, profile)
-    score += 0.55 * max(
+        if _anchor_matches(topic_anchor, f"{text} {item.get('url', '')}"):
+            score += 1.5
+        elif _topic_anchor_is_strict(query, topic_anchor):
+            score -= 2.5
+        else:
+            score -= 0.75
+    if _subject_terms(query) and subject_coverage == 0:
+        score -= 2.0
+    score += 0.75 / max(1, rank)
+    score += 0.2 * _source_adjustment(domain)
+    score += 0.25 * float(profile["authority_adjustment"])
+    score += 0.35 * _intent_source_adjustment(query, profile)
+    score += 0.5 * max(
         freshness_score(published, requirement),
         freshness_score(modified, requirement),
     )
@@ -812,9 +884,10 @@ def _variant_source_adjustment(
         expected = site.group(1).strip(".").casefold()
         if domain == expected or domain.endswith("." + expected):
             return 0.8
-    if "official documentation" in variant.casefold() and result.get(
-        "source_type"
-    ) == "documentation_candidate":
+    if (
+        "official documentation" in variant.casefold()
+        and result.get("source_type") == "documentation_candidate"
+    ):
         return 0.4
     return 0.0
 
@@ -861,8 +934,6 @@ def _normalize_search_result(
     topic_anchor = _topic_anchor(query)
     topic_match = not topic_anchor or _anchor_matches(topic_anchor, searchable_text)
     topic_strict = _topic_anchor_is_strict(query, topic_anchor)
-    if topic_strict and not topic_match:
-        return None
     anchor_terms = _tokens(topic_anchor) if topic_anchor else []
     anchor_match_count = sum(
         _contains_term(searchable_text, term) for term in anchor_terms
@@ -881,11 +952,10 @@ def _normalize_search_result(
             if COMPARISON_INTENT_RE.search(query)
             else min(2, len(anchor_terms))
         )
-        if anchor_match_count < required_anchor_terms:
-            return None
+        topic_partial_match = anchor_match_count >= required_anchor_terms
+    else:
+        topic_partial_match = topic_match
     subject_coverage = _subject_coverage(query, searchable_text)
-    if _subject_terms(query) and subject_coverage == 0:
-        return None
     profile = source_profile(url, title=title, snippet=snippet, query=query)
     published = normalize_date(item.get("publishedDate") or item.get("published_at"))
     modified = normalize_date(item.get("modifiedDate") or item.get("modified_at"))
@@ -903,9 +973,7 @@ def _normalize_search_result(
         "domain": domain,
         "snippet": snippet[:1500],
         "search_rank": rank,
-        "discovery_score": round(
-            _candidate_score(query, item, rank, time_range), 4
-        ),
+        "discovery_score": round(_candidate_score(query, item, rank, time_range), 4),
         "source_authority": round(source_authority, 4),
         "source_type": profile["source_type"],
         "source_tier": profile["source_tier"],
@@ -916,6 +984,7 @@ def _normalize_search_result(
         "subject_coverage": round(subject_coverage, 4),
         "topic_anchor": topic_anchor,
         "topic_match": topic_match,
+        "topic_partial_match": topic_partial_match,
         "topic_strict": topic_strict,
         "topic_term_matches": anchor_match_count,
         "published_at": published,
@@ -927,12 +996,18 @@ def _normalize_search_result(
         "version_context": version_context,
         "evidence_id": stable_evidence_id(url),
         "citation_url": url,
-        "engines": item.get("engines") or ([item.get("engine")] if item.get("engine") else []),
+        "engines": item.get("engines")
+        or ([item.get("engine")] if item.get("engine") else []),
         "image_url": item.get("img_src") or item.get("image_url"),
         "thumbnail_url": item.get("thumbnail_src") or item.get("thumbnail"),
         "category": item.get("category"),
         "template": item.get("template"),
         "parsed_url": item.get("parsed_url"),
+        "query_variants": item.get("query_variants") or [],
+        "retrieval_sources": item.get("retrieval_sources") or [],
+        "query_consensus": item.get("query_consensus", 0),
+        "engine_consensus": item.get("engine_consensus", 0),
+        "fusion_score": item.get("fusion_score", 0.0),
     }
 
 
@@ -964,6 +1039,577 @@ async def _read_json_response(
     return payload
 
 
+def _planner_is_enabled(mode: str) -> bool:
+    return bool(PLANNER_BASE_URL and PLANNER_MODEL and mode.casefold() in PLANNER_MODES)
+
+
+def _discovery_timeout_seconds(mode: str) -> float:
+    wave_count = 1 if mode == "quick" else (3 if mode == "deep" else 2)
+    planner_seconds = PLANNER_TIMEOUT_SECONDS if _planner_is_enabled(mode) else 0.0
+    return min(
+        REQUEST_TIMEOUT_SECONDS,
+        SEARCH_TIMEOUT_SECONDS * wave_count + planner_seconds + 2.0,
+    )
+
+
+def _planner_variant_is_safe(original: str, candidate: object) -> str | None:
+    if not isinstance(candidate, str):
+        return None
+    value = re.sub(r"\s+", " ", str(candidate or "")).strip()
+    if not value or len(value) > min(500, QUERY_MAX_CHARS):
+        return None
+    if URL_IN_QUERY_RE.search(value) and not URL_IN_QUERY_RE.search(original):
+        return None
+    if re.search(r"(?:^|\s)site:[^\s]+", value, re.I) and not re.search(
+        r"(?:^|\s)site:[^\s]+", original, re.I
+    ):
+        return None
+    anchor = _topic_anchor(original)
+    if anchor and not _anchor_matches(anchor, value):
+        return None
+    subject_terms = _subject_terms(original)
+    if subject_terms:
+        matched = sum(_contains_term(value, term) for term in subject_terms)
+        if matched < max(1, math.ceil(len(subject_terms) * 0.4)):
+            return None
+    return value
+
+
+async def _planner_query_variants(
+    query: str, mode: str
+) -> tuple[list[str], dict[str, Any]]:
+    if not _planner_is_enabled(mode):
+        return [], {
+            "status": "disabled"
+            if not (PLANNER_BASE_URL and PLANNER_MODEL)
+            else "not-selected",
+            "model": PLANNER_MODEL or None,
+        }
+    endpoint = (
+        PLANNER_BASE_URL
+        if PLANNER_BASE_URL.endswith("/chat/completions")
+        else f"{PLANNER_BASE_URL}/chat/completions"
+    )
+    headers = {"Content-Type": "application/json"}
+    if PLANNER_API_KEY:
+        headers["Authorization"] = f"Bearer {PLANNER_API_KEY}"
+    instruction = (
+        "Create at most two concise web-search query alternatives for the user's request. "
+        "Preserve named entities, product identifiers, quoted errors, and the actual intent. "
+        "Do not choose a website, domain, or source type unless the user explicitly did. "
+        'Return JSON only: {"queries":["..."]}.'
+    )
+    started = time.monotonic()
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(PLANNER_TIMEOUT_SECONDS), trust_env=False
+        ) as client:
+            async with client.stream(
+                "POST",
+                endpoint,
+                headers=headers,
+                json={
+                    "model": PLANNER_MODEL,
+                    "temperature": 0,
+                    "max_tokens": 180,
+                    "messages": [
+                        {"role": "system", "content": instruction},
+                        {"role": "user", "content": query},
+                    ],
+                },
+            ) as response:
+                response.raise_for_status()
+                payload = await _read_json_response(response, 1_048_576)
+        choices = payload.get("choices")
+        content: Any = None
+        if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+            message = choices[0].get("message")
+            if isinstance(message, dict):
+                content = message.get("content")
+        if isinstance(content, list):
+            content = "".join(
+                str(item.get("text") or "")
+                for item in content
+                if isinstance(item, dict)
+            )
+        text = str(content or "").strip()
+        match = re.search(r"\{.*\}", text, re.S)
+        parsed = json.loads(match.group(0) if match else text)
+        raw_queries = parsed.get("queries") if isinstance(parsed, dict) else None
+        if not isinstance(raw_queries, list):
+            raise ValueError("Planner response did not contain a query list")
+        variants: list[str] = []
+        for raw in raw_queries:
+            candidate = _planner_variant_is_safe(query, raw)
+            if (
+                candidate
+                and candidate.casefold() != query.casefold()
+                and candidate not in variants
+            ):
+                variants.append(candidate)
+            if len(variants) >= 2:
+                break
+        return variants, {
+            "status": "ok",
+            "model": PLANNER_MODEL,
+            "variant_count": len(variants),
+            "duration_seconds": round(time.monotonic() - started, 3),
+        }
+    except Exception as exc:
+        return [], {
+            "status": "fallback",
+            "model": PLANNER_MODEL,
+            "error": type(exc).__name__,
+            "duration_seconds": round(time.monotonic() - started, 3),
+        }
+
+
+def _unresponsive_engine_map(value: object) -> dict[str, str]:
+    output: dict[str, str] = {}
+    if not isinstance(value, list):
+        return output
+    for row in value:
+        if isinstance(row, (list, tuple)) and row:
+            name = str(row[0]).strip().casefold()
+            reason = str(row[1] if len(row) > 1 else "unresponsive").strip()
+        elif isinstance(row, dict):
+            name = str(row.get("engine") or row.get("name") or "").strip().casefold()
+            reason = str(
+                row.get("error") or row.get("reason") or "unresponsive"
+            ).strip()
+        else:
+            continue
+        if name:
+            output[name] = reason[:300]
+    return output
+
+
+def _record_engine_outcomes(
+    requested: list[str], unresponsive: object, latency_seconds: float
+) -> None:
+    now = time.monotonic()
+    failed = _unresponsive_engine_map(unresponsive)
+    for engine in requested:
+        key = engine.casefold()
+        state = dict(_ENGINE_HEALTH.get(key) or {})
+        state.setdefault("successes", 0)
+        state.setdefault("failures", 0)
+        state.setdefault("consecutive_failures", 0)
+        state.setdefault("latency_total", 0.0)
+        state.setdefault("attempts", 0)
+        state["attempts"] += 1
+        state["latency_total"] += max(0.0, latency_seconds)
+        if key in failed:
+            reason = failed[key]
+            state["failures"] += 1
+            state["consecutive_failures"] += 1
+            state["last_failure"] = reason
+            state["last_failure_at"] = now
+            if re.search(
+                r"(?:429|captcha|rate|too many|suspend|blocked)", reason, re.I
+            ):
+                multiplier = min(4, int(state["consecutive_failures"]))
+                state["cooldown_until"] = now + ENGINE_COOLDOWN_SECONDS * multiplier
+        else:
+            state["successes"] += 1
+            state["consecutive_failures"] = 0
+            state["last_success_at"] = now
+            state["cooldown_until"] = 0.0
+        _ENGINE_HEALTH[key] = state
+        _ENGINE_HEALTH.move_to_end(key)
+    while len(_ENGINE_HEALTH) > ENGINE_HEALTH_MAX_ENTRIES:
+        _ENGINE_HEALTH.popitem(last=False)
+
+
+def _engine_health_snapshot(engine: str) -> dict[str, Any]:
+    state = _ENGINE_HEALTH.get(engine.casefold()) or {}
+    attempts = max(1, int(state.get("attempts") or 0))
+    return {
+        "engine": engine,
+        "successes": int(state.get("successes") or 0),
+        "failures": int(state.get("failures") or 0),
+        "average_latency_seconds": round(
+            float(state.get("latency_total") or 0.0) / attempts, 3
+        ),
+        "cooldown_remaining_seconds": round(
+            max(0.0, float(state.get("cooldown_until") or 0.0) - time.monotonic()),
+            3,
+        ),
+        "last_failure": state.get("last_failure"),
+    }
+
+
+def _select_healthy_engines(
+    engines: list[str], limit: int, *, excluded: set[str] | None = None
+) -> tuple[list[str], list[str]]:
+    now = time.monotonic()
+    excluded = {item.casefold() for item in (excluded or set())}
+    unique = list(dict.fromkeys(engines))
+    ready: list[tuple[tuple[float, float, int], str]] = []
+    cooling: list[tuple[float, str]] = []
+    for index, engine in enumerate(unique):
+        if engine.casefold() in excluded:
+            continue
+        state = _ENGINE_HEALTH.get(engine.casefold()) or {}
+        cooldown_until = float(state.get("cooldown_until") or 0.0)
+        if cooldown_until > now:
+            cooling.append((cooldown_until, engine))
+            continue
+        attempts = max(1, int(state.get("attempts") or 0))
+        failure_rate = float(state.get("failures") or 0) / attempts
+        latency = float(state.get("latency_total") or 0.0) / attempts
+        ready.append(((failure_rate, latency, index), engine))
+    ready.sort(key=lambda item: item[0])
+    selected = [engine for _, engine in ready[:limit]]
+    skipped = [engine for _, engine in sorted(cooling)]
+    if not selected and cooling:
+        selected = [min(cooling)[1]]
+        skipped = [engine for _, engine in cooling if engine != selected[0]]
+    return selected, skipped
+
+
+def _engines_for_wave(
+    query: str,
+    categories: list[str],
+    variant: str,
+    wave: int,
+    *,
+    used_engines: set[str] | None = None,
+) -> tuple[list[str], list[str]]:
+    all_engines = _search_engines(query, categories, variant)
+    effective = set(_search_categories(query, categories))
+    image_primary = "images" in effective and not effective.intersection(
+        {"it", "news", "science"}
+    )
+    if effective == {"images"} or image_primary:
+        pool = [engine for engine in all_engines if engine in IMAGE_ENGINES]
+    elif wave == 0:
+        pool = [engine for engine in all_engines if engine in BROAD_WEB_ENGINES]
+    else:
+        used = {item.casefold() for item in (used_engines or set())}
+        unused = [engine for engine in all_engines if engine.casefold() not in used]
+        pool = [*unused, *[engine for engine in all_engines if engine not in unused]]
+    limit = PRIMARY_ENGINE_COUNT if wave == 0 else FALLBACK_ENGINE_COUNT
+    selected, skipped = _select_healthy_engines(pool, limit)
+    if not selected:
+        selected, skipped_retry = _select_healthy_engines(all_engines, 1)
+        skipped = list(dict.fromkeys([*skipped, *skipped_retry]))
+    return selected, skipped
+
+
+def _fuse_candidates(occurrences: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    fused: dict[str, dict[str, Any]] = {}
+    for occurrence in occurrences:
+        url = str(occurrence.get("url") or "")
+        if not url:
+            continue
+        rank = max(
+            1,
+            int(occurrence.get("retrieval_rank") or occurrence.get("search_rank") or 1),
+        )
+        weight = max(0.1, float(occurrence.get("retrieval_weight") or 1.0))
+        rrf = weight * RRF_K / (RRF_K + rank)
+        existing = fused.get(url)
+        if existing is None:
+            existing = dict(occurrence)
+            existing["query_variants"] = []
+            existing["retrieval_sources"] = []
+            existing["rrf_score"] = 0.0
+            existing["search_occurrences"] = 0
+            existing["engines"] = []
+            fused[url] = existing
+        best_rank = min(
+            int(existing.get("search_rank") or rank),
+            int(occurrence.get("search_rank") or rank),
+        )
+        if float(occurrence.get("discovery_score") or 0.0) > float(
+            existing.get("base_discovery_score", existing.get("discovery_score") or 0.0)
+        ):
+            preserved = {
+                key: existing[key]
+                for key in (
+                    "query_variants",
+                    "retrieval_sources",
+                    "rrf_score",
+                    "search_occurrences",
+                    "engines",
+                )
+            }
+            existing.update(occurrence)
+            existing.update(preserved)
+        existing["search_rank"] = best_rank
+        existing["base_discovery_score"] = max(
+            float(existing.get("base_discovery_score") or 0.0),
+            float(occurrence.get("discovery_score") or 0.0),
+        )
+        existing["rrf_score"] += rrf
+        existing["search_occurrences"] += 1
+        variant = str(occurrence.get("query_variant") or "").strip()
+        source = str(occurrence.get("retrieval_source") or "searxng").strip()
+        if variant and variant not in existing["query_variants"]:
+            existing["query_variants"].append(variant)
+        if source and source not in existing["retrieval_sources"]:
+            existing["retrieval_sources"].append(source)
+        for engine in occurrence.get("engines") or []:
+            if engine and engine not in existing["engines"]:
+                existing["engines"].append(engine)
+    for item in fused.values():
+        query_consensus = len(item["query_variants"])
+        engine_consensus = len(item["engines"])
+        consensus_bonus = 0.22 * max(0, min(3, engine_consensus) - 1)
+        consensus_bonus += 0.3 * max(0, min(3, query_consensus) - 1)
+        item["query_consensus"] = query_consensus
+        item["engine_consensus"] = engine_consensus
+        item["fusion_score"] = round(float(item["rrf_score"]) + consensus_bonus, 6)
+        item["discovery_score"] = round(
+            float(item.get("base_discovery_score") or 0.0)
+            + 0.8 * float(item["rrf_score"])
+            + consensus_bonus,
+            4,
+        )
+    return sorted(
+        fused.values(),
+        key=lambda item: float(item.get("discovery_score") or 0.0),
+        reverse=True,
+    )
+
+
+def _candidate_quality(
+    query: str, candidates: list[dict[str, Any]], desired_results: int, mode: str
+) -> dict[str, Any]:
+    sample = candidates[: max(8, min(len(candidates), desired_results * 2))]
+    domains = {_root_domain(str(item.get("domain") or "")) for item in sample}
+    domains.discard("")
+    topic_anchor = _topic_anchor(query)
+    relevant = [
+        item
+        for item in sample
+        if (bool(topic_anchor) and bool(item.get("topic_partial_match")))
+        or float(item.get("subject_coverage") or 0.0) >= 0.34
+        or _lexical_score(query, f"{item.get('title', '')} {item.get('snippet', '')}")
+        >= 0.42
+    ]
+    topic_matches = (
+        sum(bool(item.get("topic_partial_match")) for item in sample)
+        if topic_anchor
+        else 0
+    )
+    target = min(max(1, desired_results), 5 if mode == "deep" else 3)
+    if mode == "deep" and desired_results > 1:
+        target = max(3, target)
+    required_domains = (
+        1 if target == 1 else (3 if mode == "deep" and target >= 4 else 2)
+    )
+    reasons: list[str] = []
+    if len(relevant) < target:
+        reasons.append("too-few-relevant-candidates")
+    if len(domains) < min(required_domains, max(1, len(sample))):
+        reasons.append("limited-domain-diversity")
+    if topic_anchor and topic_matches == 0:
+        reasons.append("named-entity-not-covered")
+    if not sample:
+        reasons.append("no-candidates")
+    return {
+        "status": "sufficient" if not reasons else "weak",
+        "candidate_count": len(candidates),
+        "sample_count": len(sample),
+        "relevant_candidate_count": len(relevant),
+        "independent_domain_count": len(domains),
+        "topic_match_count": topic_matches,
+        "target_relevant_candidates": target,
+        "reasons": reasons,
+    }
+
+
+def _supplement_sources_for(query: str) -> list[str]:
+    if not ENABLE_KEYLESS_SUPPLEMENTS:
+        return []
+    sources: list[str] = []
+    if ACADEMIC_RE.search(query):
+        sources.append("crossref")
+    elif TECHNICAL_RE.search(query) or TROUBLESHOOT_RE.search(query):
+        sources.append("stackexchange")
+    else:
+        sources.append("wikipedia")
+    if REPOSITORY_INTENT_RE.search(query):
+        sources.append("github")
+    now = time.monotonic()
+    return [
+        source
+        for source in sources
+        if float(_SUPPLEMENT_COOLDOWNS.get(source) or 0.0) <= now
+    ]
+
+
+async def _supplemental_search(
+    query: str, time_range: str | None, categories: list[str] | None = None
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    if "images" in _search_categories(query, categories or []):
+        return [], []
+    sources = _supplement_sources_for(query)
+    if not sources:
+        return [], []
+
+    async def request(source: str) -> tuple[str, dict[str, Any]]:
+        if source == "stackexchange":
+            url = "https://api.stackexchange.com/2.3/search/advanced"
+            params: dict[str, Any] = {
+                "site": "stackoverflow",
+                "q": query,
+                "pagesize": 5,
+                "order": "desc",
+                "sort": "relevance",
+                "filter": "default",
+            }
+        elif source == "github":
+            url = "https://api.github.com/search/repositories"
+            params = {"q": query, "per_page": 5}
+        elif source == "crossref":
+            url = "https://api.crossref.org/works"
+            params = {"query": query, "rows": 5}
+        else:
+            url = "https://en.wikipedia.org/w/api.php"
+            params = {
+                "action": "query",
+                "generator": "search",
+                "gsrsearch": query,
+                "gsrlimit": 5,
+                "prop": "extracts|info",
+                "exintro": "1",
+                "explaintext": "1",
+                "inprop": "url",
+                "format": "json",
+            }
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(SUPPLEMENT_TIMEOUT_SECONDS), trust_env=False
+        ) as client:
+            async with client.stream(
+                "GET",
+                url,
+                params=params,
+                headers={"User-Agent": "private-search-gateway/1.0"},
+            ) as response:
+                response.raise_for_status()
+                return source, await _read_json_response(response, 2_097_152)
+
+    outcomes = await asyncio.gather(
+        *(request(source) for source in sources), return_exceptions=True
+    )
+    occurrences: list[dict[str, Any]] = []
+    diagnostics: list[dict[str, Any]] = []
+    for source, outcome in zip(sources, outcomes):
+        if isinstance(outcome, Exception):
+            status_code = (
+                outcome.response.status_code
+                if isinstance(outcome, httpx.HTTPStatusError)
+                else None
+            )
+            if status_code in {403, 429}:
+                _SUPPLEMENT_COOLDOWNS[source] = (
+                    time.monotonic() + SUPPLEMENT_COOLDOWN_SECONDS
+                )
+            diagnostics.append(
+                {
+                    "provider": source,
+                    "wave": "supplemental",
+                    "status": "failed",
+                    "error": type(outcome).__name__,
+                    "status_code": status_code,
+                }
+            )
+            continue
+        _, payload = outcome
+        raw: list[dict[str, Any]] = []
+        if source == "stackexchange":
+            for item in payload.get("items") or []:
+                if isinstance(item, dict):
+                    raw.append(
+                        {
+                            "title": unescape(str(item.get("title") or "")),
+                            "url": item.get("link"),
+                            "content": "Stack Overflow question with community answers.",
+                            "publishedDate": item.get("creation_date"),
+                            "modifiedDate": item.get("last_activity_date"),
+                            "engines": ["stackexchange-api"],
+                        }
+                    )
+        elif source == "github":
+            for item in payload.get("items") or []:
+                if isinstance(item, dict):
+                    raw.append(
+                        {
+                            "title": item.get("full_name") or item.get("name"),
+                            "url": item.get("html_url"),
+                            "content": item.get("description") or "Source repository.",
+                            "modifiedDate": item.get("updated_at"),
+                            "engines": ["github-api"],
+                        }
+                    )
+        elif source == "crossref":
+            message = (
+                payload.get("message")
+                if isinstance(payload.get("message"), dict)
+                else {}
+            )
+            for item in message.get("items") or []:
+                if not isinstance(item, dict):
+                    continue
+                titles = item.get("title") or []
+                title = titles[0] if isinstance(titles, list) and titles else titles
+                raw.append(
+                    {
+                        "title": title,
+                        "url": item.get("URL"),
+                        "content": item.get("abstract")
+                        or "Academic publication record.",
+                        "engines": ["crossref-api"],
+                    }
+                )
+        else:
+            query_payload = (
+                payload.get("query") if isinstance(payload.get("query"), dict) else {}
+            )
+            pages = (
+                query_payload.get("pages")
+                if isinstance(query_payload.get("pages"), dict)
+                else {}
+            )
+            for item in pages.values():
+                if isinstance(item, dict):
+                    raw.append(
+                        {
+                            "title": item.get("title"),
+                            "url": item.get("fullurl"),
+                            "content": item.get("extract") or "Wikipedia article.",
+                            "engines": ["wikipedia-api"],
+                        }
+                    )
+        accepted = 0
+        for rank, item in enumerate(raw, start=1):
+            normalized = _normalize_search_result(item, query, rank, time_range)
+            if normalized is None:
+                continue
+            normalized.update(
+                {
+                    "query_variant": query,
+                    "retrieval_rank": rank,
+                    "retrieval_weight": 0.7,
+                    "retrieval_source": source,
+                }
+            )
+            occurrences.append(normalized)
+            accepted += 1
+        diagnostics.append(
+            {
+                "provider": source,
+                "wave": "supplemental",
+                "status": "ok",
+                "result_count": accepted,
+            }
+        )
+    return occurrences, diagnostics
+
+
 async def _searx_search(
     query: str,
     *,
@@ -973,11 +1619,27 @@ async def _searx_search(
     time_range: str | None,
     categories: list[str],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    variants = _query_variants(query, mode)
+    deterministic = _query_variants(query, mode)
+    planned, planner_diagnostics = await _planner_query_variants(query, mode)
+    variants = [
+        deterministic[0],
+        *[item for item in planned if item.casefold() != deterministic[0].casefold()],
+        *deterministic[1:],
+    ]
+    variant_limit = 3 if mode == "deep" else 2
+    variants = list(dict.fromkeys(variants))[:variant_limit]
     diagnostics: list[dict[str, Any]] = []
+    occurrences: list[dict[str, Any]] = []
+    used_engines: set[str] = set()
 
-    async def one(variant: str) -> dict[str, Any]:
-        engines = _search_engines(query, categories, variant)
+    async def one(variant: str, wave: int) -> tuple[dict[str, Any], dict[str, Any]]:
+        engines, skipped = _engines_for_wave(
+            query,
+            categories,
+            variant,
+            wave,
+            used_engines=used_engines,
+        )
         params: dict[str, str] = {
             "q": variant,
             "format": "json",
@@ -987,29 +1649,91 @@ async def _searx_search(
         }
         if time_range:
             params["time_range"] = time_range
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(SEARCH_TIMEOUT_SECONDS), trust_env=False
-        ) as client:
-            async with client.stream("GET", f"{SEARXNG_URL}/search", params=params) as response:
-                response.raise_for_status()
-                return await _read_json_response(response)
-
-    outcomes = await asyncio.gather(*(one(variant) for variant in variants), return_exceptions=True)
-    by_url: dict[str, dict[str, Any]] = {}
-    for variant, outcome in zip(variants, outcomes):
-        if isinstance(outcome, Exception):
-            diagnostics.append({"query": variant, "status": "failed", "error": type(outcome).__name__})
-            continue
-        raw_results = outcome.get("results") if isinstance(outcome, dict) else None
-        diagnostics.append(
+        started = time.monotonic()
+        diagnostic = {
+            "query": variant,
+            "provider": "searxng",
+            "wave": "initial" if wave == 0 else "fallback",
+            "requested_engines": engines,
+            "cooldown_skipped_engines": skipped,
+        }
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(SEARCH_TIMEOUT_SECONDS), trust_env=False
+            ) as client:
+                async with client.stream(
+                    "GET", f"{SEARXNG_URL}/search", params=params
+                ) as response:
+                    response.raise_for_status()
+                    payload = await _read_json_response(response)
+        except Exception as exc:
+            latency = time.monotonic() - started
+            status_code = (
+                exc.response.status_code
+                if isinstance(exc, httpx.HTTPStatusError)
+                else None
+            )
+            reason = type(exc).__name__
+            if status_code is not None:
+                reason = f"{reason}:{status_code}"
+            _record_engine_outcomes(
+                engines,
+                [[engine, f"request-failed:{reason}"] for engine in engines],
+                latency,
+            )
+            diagnostic.update(
+                {
+                    "status": "failed",
+                    "error": type(exc).__name__,
+                    "status_code": status_code,
+                    "engine_health": [
+                        _engine_health_snapshot(engine) for engine in engines
+                    ],
+                    "latency_seconds": round(latency, 3),
+                }
+            )
+            return {}, diagnostic
+        latency = time.monotonic() - started
+        _record_engine_outcomes(engines, payload.get("unresponsive_engines"), latency)
+        diagnostic.update(
             {
-                "query": variant,
-                "status": "ok",
-                "result_count": len(raw_results) if isinstance(raw_results, list) else 0,
-                "requested_engines": _search_engines(query, categories, variant),
-                "unresponsive_engines": outcome.get("unresponsive_engines", []),
+                "engine_health": [
+                    _engine_health_snapshot(engine) for engine in engines
+                ],
+                "latency_seconds": round(latency, 3),
             }
         )
+        return payload, diagnostic
+
+    async def collect(variant: str, wave: int, weight: float) -> None:
+        try:
+            payload, diagnostic = await one(variant, wave)
+        except Exception as exc:
+            diagnostics.append(
+                {
+                    "query": variant,
+                    "provider": "searxng",
+                    "wave": "initial" if wave == 0 else "fallback",
+                    "status": "failed",
+                    "error": type(exc).__name__,
+                }
+            )
+            return
+        used_engines.update(diagnostic.get("requested_engines") or [])
+        if diagnostic.get("status") == "failed":
+            diagnostics.append(diagnostic)
+            return
+        raw_results = payload.get("results") if isinstance(payload, dict) else None
+        diagnostic.update(
+            {
+                "status": "ok",
+                "result_count": len(raw_results)
+                if isinstance(raw_results, list)
+                else 0,
+                "unresponsive_engines": payload.get("unresponsive_engines", []),
+            }
+        )
+        diagnostics.append(diagnostic)
         for rank, item in enumerate(raw_results or [], start=1):
             if not isinstance(item, dict):
                 continue
@@ -1017,40 +1741,136 @@ async def _searx_search(
             if normalized is None:
                 continue
             normalized["query_variant"] = variant
+            normalized["retrieval_rank"] = rank
+            normalized["retrieval_weight"] = weight
+            normalized["retrieval_source"] = "searxng"
             normalized["discovery_score"] = round(
                 normalized["discovery_score"]
                 + _variant_source_adjustment(variant, normalized),
                 4,
             )
-            existing = by_url.get(normalized["url"])
-            if existing is None or normalized["discovery_score"] > existing["discovery_score"]:
-                by_url[normalized["url"]] = normalized
-    results = sorted(by_url.values(), key=lambda item: item["discovery_score"], reverse=True)
-    return results[:max_results], diagnostics
+            occurrences.append(normalized)
+
+    await collect(variants[0], 0, 1.0)
+    fused = _fuse_candidates(occurrences)
+    initial_quality = _candidate_quality(query, fused, max_results, mode)
+    fallback_triggered = mode != "quick" and initial_quality["status"] != "sufficient"
+    if fallback_triggered:
+        if "images" in _search_categories(query, categories):
+            default_fallback = f"{query} high resolution"
+        elif CURRENT_RE.search(query):
+            default_fallback = f"{query} latest"
+        else:
+            default_fallback = f"{query} authoritative sources"
+        fallback_variants = variants[1:] or [default_fallback]
+        supplement_task = asyncio.create_task(
+            _supplemental_search(query, time_range, categories)
+        )
+        supplemental: list[dict[str, Any]] = []
+        supplemental_diagnostics: list[dict[str, Any]] = []
+        try:
+            for variant in fallback_variants[: (2 if mode == "deep" else 1)]:
+                await collect(variant, 1, 0.9)
+            try:
+                supplemental, supplemental_diagnostics = await supplement_task
+            except Exception as exc:
+                supplemental_diagnostics = [
+                    {
+                        "provider": "supplemental",
+                        "wave": "supplemental",
+                        "status": "failed",
+                        "error": type(exc).__name__,
+                    }
+                ]
+        finally:
+            if not supplement_task.done():
+                supplement_task.cancel()
+                await asyncio.gather(supplement_task, return_exceptions=True)
+        occurrences.extend(supplemental)
+        diagnostics.extend(supplemental_diagnostics)
+        fused = _fuse_candidates(occurrences)
+    final_quality = _candidate_quality(query, fused, max_results, mode)
+    summary = {
+        "provider": "search-gateway",
+        "wave": "summary",
+        "status": "ok",
+        "planner": planner_diagnostics,
+        "variants": variants,
+        "fallback_triggered": fallback_triggered,
+        "fallback_reasons": initial_quality["reasons"] if fallback_triggered else [],
+        "initial_quality": initial_quality,
+        "final_quality": final_quality,
+    }
+    diagnostics.append(summary)
+    return fused[:max_results], diagnostics
+
+
+def _chunk_text_with_spans(text: str) -> list[dict[str, Any]]:
+    normalized = text or ""
+    segments: list[tuple[int, int]] = []
+    for match in re.finditer(r"\S(?:.*?\S)?(?=(?:\r?\n){2,}|\s*\Z)", normalized, re.S):
+        start, end = match.span()
+        while end - start > MAX_PASSAGE_CHARS:
+            upper = start + MAX_PASSAGE_CHARS
+            window = normalized[start:upper]
+            sentence_breaks = [
+                item.end()
+                for item in re.finditer(r"[.!?](?:\s+|$)", window)
+                if item.end() >= int(MAX_PASSAGE_CHARS * 0.55)
+            ]
+            split_at = start + (sentence_breaks[-1] if sentence_breaks else len(window))
+            if split_at <= start:
+                split_at = upper
+            segments.append((start, split_at))
+            start = split_at
+            while start < end and normalized[start].isspace():
+                start += 1
+        if start < end:
+            segments.append((start, end))
+
+    spans: list[tuple[int, int]] = []
+    current: tuple[int, int] | None = None
+    for start, end in segments:
+        if current is None:
+            current = (start, end)
+        elif end - current[0] <= MAX_PASSAGE_CHARS:
+            current = (current[0], end)
+        else:
+            spans.append(current)
+            current = (start, end)
+        if len(spans) >= 40:
+            break
+    if current is not None and len(spans) < 40:
+        spans.append(current)
+
+    output: list[dict[str, Any]] = []
+    for start, end in spans[:40]:
+        while start < end and normalized[start].isspace():
+            start += 1
+        while end > start and normalized[end - 1].isspace():
+            end -= 1
+        if start >= end:
+            continue
+        heading = None
+        prefix = normalized[max(0, start - 500) : start]
+        heading_matches = list(
+            re.finditer(r"(?:^|\r?\n)#{1,6}\s+([^\r\n]{1,200})", prefix)
+        )
+        if heading_matches:
+            heading = heading_matches[-1].group(1).strip()
+        output.append(
+            {
+                "text": normalized[start:end],
+                "start_char": start,
+                "end_char": end,
+                "section": heading,
+            }
+        )
+    return output
 
 
 def _chunk_text(text: str) -> list[str]:
-    text = re.sub(r"\r\n?", "\n", text or "")
-    blocks = [block.strip() for block in re.split(r"\n{2,}", text) if block.strip()]
-    chunks: list[str] = []
-    current = ""
-    for block in blocks:
-        if len(block) > MAX_PASSAGE_CHARS:
-            sentences = re.split(r"(?<=[.!?])\s+", block)
-        else:
-            sentences = [block]
-        for part in sentences:
-            if len(current) + len(part) + 2 <= MAX_PASSAGE_CHARS:
-                current = f"{current}\n\n{part}".strip()
-            else:
-                if current:
-                    chunks.append(current)
-                current = part[:MAX_PASSAGE_CHARS]
-            if len(chunks) >= 40:
-                return chunks
-    if current:
-        chunks.append(current)
-    return chunks[:40]
+    return [item["text"] for item in _chunk_text_with_spans(text)]
 
 
 async def _rerank(
@@ -1102,7 +1922,9 @@ async def _rerank(
                     failures.append("invalid_response")
                     continue
                 for row in rows:
-                    if not isinstance(row, dict) or not isinstance(row.get("index"), int):
+                    if not isinstance(row, dict) or not isinstance(
+                        row.get("index"), int
+                    ):
                         continue
                     local_index = row["index"]
                     index = offset + local_index
@@ -1140,8 +1962,12 @@ async def _rerank(
         status = "ok" if len(scored_indices) == len(documents) else "partial"
         return [*scored, *unscored][:top_k], status
     except Exception as exc:
-        LOGGER.warning("Reranker unavailable; using lexical fallback: %s", type(exc).__name__)
-        return _lexical_rerank(query, documents, top_k), f"fallback:{type(exc).__name__}"
+        LOGGER.warning(
+            "Reranker unavailable; using lexical fallback: %s", type(exc).__name__
+        )
+        return _lexical_rerank(
+            query, documents, top_k
+        ), f"fallback:{type(exc).__name__}"
     finally:
         _RERANK_ADMISSION.release()
 
@@ -1195,11 +2021,16 @@ async def _crawl_candidates(
                     candidate["url"],
                     query,
                     min(PAGE_TIMEOUT_SECONDS, remaining),
-                    allow_expensive_fallback=candidate_index < 3,
+                    allow_expensive_fallback=bool(
+                        candidate.get("_allow_expensive_fallback", candidate_index < 3)
+                    ),
                 )
                 return candidate, page
             except Exception as exc:
-                return candidate, {"error": type(exc).__name__}
+                return candidate, {
+                    "error": type(exc).__name__,
+                    "detail": re.sub(r"[\r\n]+", " ", str(exc)).strip()[:300],
+                }
 
     tasks = {
         asyncio.create_task(one(index, candidate)): (index, candidate)
@@ -1219,24 +2050,78 @@ async def _crawl_candidates(
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
 
-    pairs = [
-        (tasks[task][0], *task.result())
-        for task in done
-        if not task.cancelled()
-    ]
+    pairs = [(tasks[task][0], *task.result()) for task in done if not task.cancelled()]
     pairs.sort(key=lambda pair: pair[0])
     pages: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = [
-        {"url": tasks[task][1]["url"], "error": "deadline"}
-        for task in pending
+        {"url": tasks[task][1]["url"], "error": "deadline"} for task in pending
     ]
     for _, candidate, page in pairs:
         if page is None or page.get("error"):
-            failures.append({"url": candidate["url"], "error": (page or {}).get("error", "deadline")})
+            failure = {
+                "url": candidate["url"],
+                "error": (page or {}).get("error", "deadline"),
+            }
+            if (page or {}).get("detail"):
+                failure["detail"] = page["detail"]
+            failures.append(failure)
             continue
         page["search"] = candidate
         pages.append(page)
     return pages, failures
+
+
+async def _adaptive_crawl_candidates(
+    candidates: list[dict[str, Any]],
+    query: str,
+    target_pages: int,
+    deadline: float,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Fetch small batches and replace failed candidates until the target is met."""
+
+    target_pages = max(1, target_pages)
+    strong_pages: list[dict[str, Any]] = []
+    weak_pages: list[dict[str, Any]] = []
+    failures: list[dict[str, Any]] = []
+    batches: list[dict[str, Any]] = []
+    cursor = 0
+    while cursor < len(candidates) and len(strong_pages) < target_pages:
+        if deadline - time.monotonic() <= 1.25:
+            break
+        needed = target_pages - len(strong_pages)
+        batch_size = min(MAX_CONCURRENT_FETCHES, max(1, min(2, needed)))
+        batch = []
+        for index, candidate in enumerate(
+            candidates[cursor : cursor + batch_size], start=cursor
+        ):
+            row = dict(candidate)
+            row["_allow_expensive_fallback"] = index < max(3, target_pages)
+            batch.append(row)
+        cursor += len(batch)
+        if not batch:
+            break
+        batch_pages, batch_failures = await _crawl_candidates(batch, query, deadline)
+        batch_strong = [page for page in batch_pages if not page.get("low_confidence")]
+        batch_weak = [page for page in batch_pages if page.get("low_confidence")]
+        strong_pages.extend(batch_strong)
+        weak_pages.extend(batch_weak)
+        failures.extend(batch_failures)
+        batches.append(
+            {
+                "attempted": len(batch),
+                "succeeded": len(batch_strong),
+                "low_confidence": len(batch_weak),
+                "failed": len(batch_failures),
+                "backfill": len(batches) > 0,
+            }
+        )
+    if cursor < len(candidates) and deadline - time.monotonic() <= 1.25:
+        failures.extend(
+            {"url": item["url"], "error": "deadline-not-attempted"}
+            for item in candidates[cursor:]
+        )
+    pages = [*strong_pages, *weak_pages]
+    return pages[:target_pages], failures, batches
 
 
 def _follow_link_score(query: str, source_url: str, link: dict[str, str]) -> float:
@@ -1246,11 +2131,35 @@ def _follow_link_score(query: str, source_url: str, link: dict[str, str]) -> flo
     path = urlsplit(url).path.casefold()
     text = f"{link.get('anchor', '')} {path}"
     score = 2.0 * _lexical_score(query, text)
-    if re.search(r"\b(?:docs?|guide|install|setup|config|manual|troubleshoot|faq|support)\b", text, re.I):
+    if re.search(
+        r"\b(?:docs?|guide|install|setup|config|manual|troubleshoot|faq|support)\b",
+        text,
+        re.I,
+    ):
         score += 0.7
     if re.search(r"(?:login|sign.?in|account|privacy|terms|contact|cart)", text, re.I):
         score -= 2.0
     return score
+
+
+def _pages_need_follow_up(
+    pages: list[dict[str, Any]], query: str, target_pages: int
+) -> bool:
+    if len(pages) < target_pages:
+        return True
+    for page in pages:
+        content = str(page.get("content") or "")
+        search = page.get("search") or {}
+        if (
+            len(content) < 1400
+            and (
+                float(search.get("subject_coverage") or 0.0) >= 0.25
+                or _lexical_score(query, content) >= 0.2
+            )
+            and page.get("links")
+        ):
+            return True
+    return False
 
 
 async def _follow_relevant_links(
@@ -1353,7 +2262,10 @@ def _passage_documents(pages: list[dict[str, Any]], query: str) -> list[dict[str
         if versions:
             context_parts.append(f"Version context: {', '.join(versions[:8])}")
         reranker_context = "\n".join(context_parts)
-        for passage_index, passage in enumerate(_chunk_text(str(page.get("content") or ""))):
+        for passage_index, passage_record in enumerate(
+            _chunk_text_with_spans(str(page.get("content") or ""))
+        ):
+            passage = str(passage_record["text"])
             lexical = _lexical_score(query, passage)
             if lexical <= 0 and passage_index > 6:
                 continue
@@ -1363,6 +2275,9 @@ def _passage_documents(pages: list[dict[str, Any]], query: str) -> list[dict[str
                     "reranker_text": f"{reranker_context}\n\n{passage}",
                     "page_index": page_index,
                     "passage_index": passage_index,
+                    "start_char": passage_record["start_char"],
+                    "end_char": passage_record["end_char"],
+                    "section": passage_record.get("section"),
                     "lexical_score": lexical,
                     "source_score": float(search.get("discovery_score") or 0.0),
                     "authority_score": float(search.get("source_authority") or 0.0),
@@ -1422,6 +2337,27 @@ def _assemble_results(
             )
         )[:8]
         evidence_id = search.get("evidence_id") or stable_evidence_id(url)
+        evidence_records = []
+        for passage in passages:
+            start_char = int(passage.get("start_char") or 0)
+            end_char = int(passage.get("end_char") or start_char)
+            passage_text = str(passage.get("text") or "")
+            digest = hashlib.sha256(
+                f"{evidence_id}:{start_char}:{end_char}:{passage_text}".encode("utf-8")
+            ).hexdigest()[:12]
+            evidence_records.append(
+                {
+                    "id": f"{evidence_id}-p-{digest}",
+                    "source_id": evidence_id,
+                    "url": url,
+                    "passage_index": int(passage.get("passage_index") or 0),
+                    "start_char": start_char,
+                    "end_char": end_char,
+                    "section": passage.get("section"),
+                    "text": passage_text,
+                    "score": round(_document_ranking_score(passage), 6),
+                }
+            )
         item = {
             "title": page.get("title") or search.get("title") or page.get("url"),
             "url": url,
@@ -1435,7 +2371,9 @@ def _assemble_results(
             "declaredDate": declared,
             "source_type": search.get("source_type") or profile["source_type"],
             "source_tier": search.get("source_tier") or profile["source_tier"],
-            "authority_score": search.get("authority_score", profile["authority_score"]),
+            "authority_score": search.get(
+                "authority_score", profile["authority_score"]
+            ),
             "primary_source_candidate": search.get(
                 "primary_source_candidate", profile["primary_source_candidate"]
             ),
@@ -1447,8 +2385,13 @@ def _assemble_results(
             "evidence_id": evidence_id,
             "citation_url": url,
             "citation": {"id": evidence_id, "url": url},
+            "evidence": evidence_records,
             "extraction_method": page.get("extraction_method"),
             "content_chars": page.get("content_chars"),
+            "fetch_strategy": page.get("fetch_strategy"),
+            "fetch_assessment": page.get("fetch_assessment"),
+            "extraction_failures": page.get("extraction_errors") or [],
+            "low_confidence": bool(page.get("low_confidence")),
             "img_src": search.get("image_url"),
             "thumbnail_src": search.get("thumbnail_url"),
         }
@@ -1506,12 +2449,15 @@ async def _cache_get(key: str) -> dict[str, Any] | None:
         try:
             raw = await asyncio.wait_for(client.get(f"search-gateway:v1:{key}"), 0.25)
             cached = json.loads(raw) if raw else None
-            if isinstance(cached, dict) and now - float(cached.get("cached_at", 0)) <= CACHE_STALE_SECONDS:
+            if (
+                isinstance(cached, dict)
+                and now - float(cached.get("cached_at", 0)) <= CACHE_STALE_SECONDS
+            ):
                 async with _CACHE_LOCK:
                     _CACHE[key] = cached
                 return cached
-        except Exception:
-            pass
+        except Exception as exc:
+            LOGGER.debug("Redis cache read failed: %s", type(exc).__name__)
     return None
 
 
@@ -1599,6 +2545,29 @@ def _search_payload(
     }
 
 
+def _attach_search_diagnostics(
+    diagnostics: dict[str, Any], searches: list[dict[str, Any]]
+) -> None:
+    diagnostics["searches"] = searches
+    summary = next(
+        (
+            item
+            for item in reversed(searches)
+            if item.get("provider") == "search-gateway"
+            and item.get("wave") == "summary"
+        ),
+        None,
+    )
+    if not summary:
+        return
+    diagnostics["planner"] = summary.get("planner")
+    diagnostics["query_variants"] = summary.get("variants") or []
+    diagnostics["fallback_triggered"] = bool(summary.get("fallback_triggered"))
+    diagnostics["fallback_reasons"] = summary.get("fallback_reasons") or []
+    diagnostics["initial_search_quality"] = summary.get("initial_quality") or {}
+    diagnostics["final_search_quality"] = summary.get("final_quality") or {}
+
+
 async def discovery_search(request: SearchRequest) -> dict[str, Any]:
     """Return bounded SearXNG discovery results without crawling pages."""
 
@@ -1657,9 +2626,8 @@ async def discovery_search(request: SearchRequest) -> dict[str, Any]:
                 }
                 timed_out = False
                 try:
-                    async with asyncio.timeout(
-                        max(SEARCH_TIMEOUT_SECONDS + 1.0, 3.0)
-                    ):
+                    discovery_timeout = _discovery_timeout_seconds(mode)
+                    async with asyncio.timeout(max(discovery_timeout, 3.0)):
                         candidates, search_diagnostics = await _searx_search(
                             request.query,
                             mode=mode,
@@ -1668,18 +2636,24 @@ async def discovery_search(request: SearchRequest) -> dict[str, Any]:
                             time_range=request.time_range,
                             categories=request.categories,
                         )
-                    diagnostics["searches"] = search_diagnostics
+                    _attach_search_diagnostics(diagnostics, search_diagnostics)
                 except TimeoutError:
                     diagnostics["partial"] = True
                     diagnostics["deadline_exceeded"] = True
                     timed_out = True
                     candidates, search_diagnostics = [], []
-                    diagnostics["searches"] = search_diagnostics
+                    _attach_search_diagnostics(diagnostics, search_diagnostics)
                 if timed_out:
                     raise TimeoutError("SearXNG discovery deadline exceeded")
-                if candidates == [] and diagnostics["searches"] and all(
-                    item.get("status") == "failed"
-                    for item in diagnostics["searches"]
+                searx_runs = [
+                    item
+                    for item in diagnostics.get("searches", [])
+                    if item.get("provider") == "searxng"
+                ]
+                if (
+                    candidates == []
+                    and searx_runs
+                    and all(item.get("status") == "failed" for item in searx_runs)
                 ):
                     raise RuntimeError("SearXNG discovery failed")
                 result = _search_payload(
@@ -1855,9 +2829,7 @@ async def research(
 
             acquired = False
             try:
-                await asyncio.wait_for(
-                    _ADMISSION.acquire(), ADMISSION_TIMEOUT_SECONDS
-                )
+                await asyncio.wait_for(_ADMISSION.acquire(), ADMISSION_TIMEOUT_SECONDS)
                 acquired = True
             except TimeoutError as exc:
                 raise GatewayBusyError("Search gateway is at capacity") from exc
@@ -1866,10 +2838,12 @@ async def research(
                 started = time.monotonic()
                 mode = _mode_for(request.query, request.mode)
                 budget = budget_override or MODE_BUDGETS[mode]
-                if budget_override is not None:
-                    mode = "integrated"
                 deadline = started + budget.total_seconds
-                diagnostics: dict[str, Any] = {"mode": mode, "partial": False}
+                diagnostics: dict[str, Any] = {
+                    "mode": mode,
+                    "pipeline": pipeline,
+                    "partial": False,
+                }
                 candidates: list[dict[str, Any]] = []
                 pages: list[dict[str, Any]] = []
                 results: list[dict[str, Any]] = []
@@ -1894,7 +2868,7 @@ async def research(
                                 time_range=request.time_range,
                                 categories=request.categories,
                             )
-                        diagnostics["searches"] = search_diagnostics
+                        _attach_search_diagnostics(diagnostics, search_diagnostics)
                         if not candidates:
                             raise RuntimeError("SearXNG returned no usable candidates")
 
@@ -1928,10 +2902,18 @@ async def research(
                             CANDIDATE_RERANKER_TIMEOUT_SECONDS,
                             max(0.0, crawl_deadline - time.monotonic() - 1.0),
                         )
+                        target_pages = min(
+                            MAX_CRAWL_PAGES,
+                            budget.crawl_pages,
+                            max(1, request.max_results),
+                        )
+                        candidate_pool_size = min(
+                            len(candidates), max(target_pages * 3, target_pages)
+                        )
                         ranked_candidates, candidate_reranker = await _rerank_bounded(
                             request.query,
                             candidate_documents,
-                            min(MAX_CRAWL_PAGES, budget.crawl_pages),
+                            candidate_pool_size,
                             candidate_rerank_timeout,
                         )
                         diagnostics["candidate_reranker"] = candidate_reranker
@@ -1942,12 +2924,29 @@ async def research(
                             <= int(item.get("candidate_index", -1))
                             < len(candidates)
                         ]
-                        pages, failures = await _crawl_candidates(
-                            selected, request.query, crawl_deadline
+                        (
+                            pages,
+                            failures,
+                            crawl_batches,
+                        ) = await _adaptive_crawl_candidates(
+                            selected,
+                            request.query,
+                            target_pages,
+                            crawl_deadline,
                         )
                         diagnostics["crawl_failures"] = failures
+                        diagnostics["crawl_batches"] = crawl_batches
+                        diagnostics["crawl_target_pages"] = target_pages
+                        diagnostics["crawl_successful_pages"] = len(pages)
                         follow_limit = min(MAX_FOLLOW_LINKS, budget.follow_links)
-                        if pages and follow_limit and crawl_deadline - time.monotonic() > 2:
+                        if (
+                            pages
+                            and follow_limit
+                            and _pages_need_follow_up(
+                                pages, request.query, target_pages
+                            )
+                            and crawl_deadline - time.monotonic() > 2
+                        ):
                             followed, follow_failures = await _follow_relevant_links(
                                 pages, request.query, follow_limit, crawl_deadline
                             )
@@ -2025,7 +3024,9 @@ async def research(
                         for item in candidates
                         if item.get("snippet") and item["url"] not in existing_urls
                     ]
-                    needed = min(request.max_results, budget.final_results) - len(results)
+                    needed = min(request.max_results, budget.final_results) - len(
+                        results
+                    )
                     if snippets:
                         results.extend(snippets[:needed])
                         diagnostics["partial"] = True
@@ -2082,11 +3083,17 @@ async def research(
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    yield
-    client = await _redis_client()
-    if client is not None:
+    global _REDIS
+    try:
+        yield
+    finally:
+        client = _REDIS
+        _REDIS = None
         with suppress(Exception):
-            await client.aclose()
+            if client is not None:
+                await client.aclose()
+        with suppress(Exception):
+            await close_fetch_resources()
 
 
 app = FastAPI(
@@ -2146,7 +3153,9 @@ async def searx_compatible_search(
             )
         )
     except TimeoutError as exc:
-        raise HTTPException(status_code=504, detail="Search gateway deadline exceeded") from exc
+        raise HTTPException(
+            status_code=504, detail="Search gateway deadline exceeded"
+        ) from exc
     except GatewayBusyError as exc:
         raise HTTPException(
             status_code=503,
@@ -2190,7 +3199,9 @@ async def integrated_search(
     try:
         return await research(request, budget_override=budget, pipeline="integrated")
     except TimeoutError as exc:
-        raise HTTPException(status_code=504, detail="Integrated search deadline exceeded") from exc
+        raise HTTPException(
+            status_code=504, detail="Integrated search deadline exceeded"
+        ) from exc
     except GatewayBusyError as exc:
         raise HTTPException(
             status_code=503,
@@ -2353,7 +3364,9 @@ async def rich_research(request: SearchRequest) -> dict[str, Any]:
     try:
         return await research(request)
     except TimeoutError as exc:
-        raise HTTPException(status_code=504, detail="Search gateway deadline exceeded") from exc
+        raise HTTPException(
+            status_code=504, detail="Search gateway deadline exceeded"
+        ) from exc
     except GatewayBusyError as exc:
         raise HTTPException(
             status_code=503,
@@ -2362,7 +3375,9 @@ async def rich_research(request: SearchRequest) -> dict[str, Any]:
         ) from exc
     except Exception as exc:
         LOGGER.warning("Research request failed: %s", type(exc).__name__)
-        raise HTTPException(status_code=502, detail="Research retrieval failed") from exc
+        raise HTTPException(
+            status_code=502, detail="Research retrieval failed"
+        ) from exc
 
 
 @app.get("/")
