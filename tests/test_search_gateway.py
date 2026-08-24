@@ -43,6 +43,7 @@ def test_query_variants_are_bounded_and_intent_aware():
     )
     assert variants[0] == "How do I install Docker Compose on Ubuntu?"
     assert any('"Docker Compose"' in item for item in variants[1:])
+    assert any("official documentation" in item for item in variants[1:])
     assert all("site:" not in item for item in variants)
     assert len(variants) <= 2
 
@@ -53,6 +54,7 @@ def test_generic_technical_query_uses_general_documentation_variant():
     )
     assert variants[0] == "How do I install PostgreSQL on Ubuntu?"
     assert any("PostgreSQL" in item for item in variants[1:])
+    assert any("official documentation" in item for item in variants[1:])
     assert all("site:" not in item for item in variants)
 
 
@@ -405,6 +407,57 @@ def test_candidate_scoring_prefers_relevant_official_sources():
     assert search_gateway._candidate_score(
         query, official, 2
     ) > search_gateway._candidate_score(query, weak, 1)
+
+
+def test_crawl_selection_reserves_instructional_slot_and_diversifies_domains():
+    candidates = [
+        {
+            "title": "Community answer one",
+            "url": "https://stackoverflow.com/questions/1/one",
+            "domain": "stackoverflow.com",
+            "source_type": "technical_reference",
+        },
+        {
+            "title": "Community answer two",
+            "url": "https://stackoverflow.com/questions/2/two",
+            "domain": "stackoverflow.com",
+            "source_type": "technical_reference",
+        },
+        {
+            "title": "Install Docker Compose plugin",
+            "url": "https://docs.docker.com/compose/install/linux/",
+            "domain": "docs.docker.com",
+            "source_type": "documentation_candidate",
+            "primary_source_candidate": True,
+        },
+        {
+            "title": "Ubuntu package overview",
+            "url": "https://packages.ubuntu.com/docker-compose-v2",
+            "domain": "packages.ubuntu.com",
+            "source_type": "general_web",
+        },
+    ]
+    ranked = [
+        {"candidate_index": 0},
+        {"candidate_index": 1},
+        {"candidate_index": 3},
+        {"candidate_index": 2},
+    ]
+
+    selected = search_gateway._select_crawl_candidates(
+        "How do I install Docker Compose on Ubuntu?",
+        candidates,
+        ranked,
+        target_pages=3,
+        limit=4,
+    )
+
+    assert selected[0]["domain"] == "docs.docker.com"
+    assert [item["domain"] for item in selected[:3]] == [
+        "docs.docker.com",
+        "packages.ubuntu.com",
+        "stackoverflow.com",
+    ]
 
 
 def test_docker_documentation_outranks_docker_hub_for_installation_guides():
@@ -892,6 +945,35 @@ def test_rrf_fusion_rewards_independent_query_and_engine_agreement():
     assert fused[0]["engine_consensus"] == 2
 
 
+def test_fusion_preserves_prefetched_api_evidence_for_duplicate_urls():
+    shared = {
+        "title": "Shared question",
+        "url": "https://stackoverflow.com/questions/1/shared",
+        "domain": "stackoverflow.com",
+        "search_rank": 1,
+        "discovery_score": 4.0,
+        "engines": ["bing"],
+        "query_variant": "specific error",
+        "retrieval_rank": 1,
+        "retrieval_weight": 1.0,
+    }
+    fused = search_gateway._fuse_candidates(
+        [
+            {**shared, "retrieval_source": "searxng"},
+            {
+                **shared,
+                "retrieval_source": "stackexchange",
+                "prefetched_content": "Question body from the API",
+                "prefetched_content_method": "stackexchange-api-question",
+                "prefetched_low_confidence": True,
+            },
+        ]
+    )
+
+    assert fused[0]["prefetched_content"] == "Question body from the API"
+    assert fused[0]["prefetched_low_confidence"] is True
+
+
 def test_specialized_sources_are_supplements_not_technical_hard_routes(monkeypatch):
     monkeypatch.setattr(search_gateway, "ENABLE_KEYLESS_SUPPLEMENTS", True)
     assert search_gateway._supplement_sources_for("Python async stack trace error") == [
@@ -900,9 +982,75 @@ def test_specialized_sources_are_supplements_not_technical_hard_routes(monkeypat
     assert "github" not in search_gateway._supplement_sources_for(
         "How do I install PostgreSQL?"
     )
+    assert search_gateway._supplement_sources_for("How do I install PostgreSQL?") == []
     assert "github" in search_gateway._supplement_sources_for(
         "Find the GitHub repository for this package"
     )
+
+
+def test_explicit_community_request_enables_stackexchange_supplement(monkeypatch):
+    monkeypatch.setattr(search_gateway, "ENABLE_KEYLESS_SUPPLEMENTS", True)
+    assert search_gateway._supplement_sources_for(
+        "What do users on Stack Overflow recommend for this Python problem?"
+    ) == ["stackexchange"]
+
+
+def test_general_technical_question_keeps_source_neutral_wikipedia_supplement(
+    monkeypatch,
+):
+    monkeypatch.setattr(search_gateway, "ENABLE_KEYLESS_SUPPLEMENTS", True)
+    assert search_gateway._supplement_sources_for("What is Python?") == ["wikipedia"]
+
+
+@pytest.mark.asyncio
+async def test_stackexchange_supplement_preserves_question_body_as_prefetched_evidence(
+    monkeypatch,
+):
+    captured = {}
+
+    class Stream:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        def raise_for_status(self):
+            return None
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        def stream(self, method, url, params, headers):
+            captured.update(params)
+            return Stream()
+
+    async def read(response, max_bytes=0):
+        return {
+            "items": [
+                {
+                    "title": "Example failure",
+                    "link": "https://stackoverflow.com/questions/1/example",
+                    "body": "<p>The command fails with a specific error.</p>",
+                }
+            ]
+        }
+
+    monkeypatch.setattr(search_gateway, "ENABLE_KEYLESS_SUPPLEMENTS", True)
+    monkeypatch.setattr(search_gateway.httpx, "AsyncClient", lambda **kwargs: Client())
+    monkeypatch.setattr(search_gateway, "_read_json_response", read)
+
+    results, _ = await search_gateway._supplemental_search(
+        "Python command failed with an error", None
+    )
+
+    assert captured["filter"] == "withbody"
+    assert "specific error" in results[0]["prefetched_content"]
+    assert results[0]["prefetched_low_confidence"] is True
 
 
 @pytest.mark.asyncio
@@ -1314,6 +1462,78 @@ async def test_adaptive_crawl_backfills_low_confidence_pages(monkeypatch):
     assert pages[0]["url"] == "https://strong.example/"
 
 
+@pytest.mark.asyncio
+async def test_adaptive_crawl_skips_remaining_pages_from_a_blocked_domain(monkeypatch):
+    calls = []
+
+    async def crawl(candidates, query, deadline):
+        candidate = candidates[0]
+        calls.append(candidate["url"])
+        if "blocked.example" in candidate["url"]:
+            return [], [
+                {
+                    "url": candidate["url"],
+                    "error": "PageExtractionError",
+                    "detail": "direct:HTTP-403,playwright:challenge-or-interstitial",
+                }
+            ]
+        return [
+            {
+                "url": candidate["url"],
+                "content": "Useful extracted evidence. " * 60,
+                "content_chars": 1600,
+                "links": [],
+                "search": candidate,
+            }
+        ], []
+
+    monkeypatch.setattr(search_gateway, "_crawl_candidates", crawl)
+    pages, failures, _ = await search_gateway._adaptive_crawl_candidates(
+        [
+            {"title": "Blocked one", "url": "https://blocked.example/one"},
+            {"title": "Blocked two", "url": "https://blocked.example/two"},
+            {"title": "Working", "url": "https://working.example/guide"},
+        ],
+        "useful evidence",
+        1,
+        search_gateway.time.monotonic() + 5,
+    )
+
+    assert calls == [
+        "https://blocked.example/one",
+        "https://working.example/guide",
+    ]
+    assert pages[0]["url"] == "https://working.example/guide"
+    assert any(
+        failure["error"] == "domain-blocked-after-prior-failure" for failure in failures
+    )
+
+
+@pytest.mark.asyncio
+async def test_prefetched_supplement_content_avoids_protected_page_fetch(monkeypatch):
+    async def unexpected_fetch(*args, **kwargs):
+        raise AssertionError("prefetched API content must not trigger a page fetch")
+
+    monkeypatch.setattr(search_gateway, "fetch_page", unexpected_fetch)
+    pages, failures = await search_gateway._crawl_candidates(
+        [
+            {
+                "title": "Protected question",
+                "url": "https://stackoverflow.com/questions/1/protected",
+                "prefetched_content": "Question context from the API. " * 20,
+                "prefetched_content_method": "stackexchange-api-question",
+                "prefetched_low_confidence": True,
+            }
+        ],
+        "specific error",
+        search_gateway.time.monotonic() + 5,
+    )
+
+    assert failures == []
+    assert pages[0]["extraction_method"] == "stackexchange-api-question"
+    assert pages[0]["low_confidence"] is True
+
+
 def test_passage_spans_reproduce_the_exact_source_text():
     source = (
         "  Introduction with useful context.\r\n\r\n"
@@ -1655,6 +1875,15 @@ async def test_fetch_page_reserves_time_for_playwright_after_crawl_failure(monke
     assert calls[1][1] >= 7
 
 
+def test_http_extraction_failure_preserves_status_code_for_domain_backoff():
+    error = httpx.HTTPStatusError(
+        "forbidden",
+        request=httpx.Request("GET", "https://blocked.example/"),
+        response=httpx.Response(403),
+    )
+    assert gateway_fetch._exception_reason(error) == "HTTP-403"
+
+
 @pytest.mark.asyncio
 async def test_integrated_budget_preserves_requested_search_mode(monkeypatch):
     search_gateway._CACHE.clear()
@@ -1895,6 +2124,110 @@ async def test_research_uses_snippets_when_every_page_is_blocked(monkeypatch):
     )
     assert response["results"][0]["content"] == "A useful search-engine excerpt"
     assert response["diagnostics"]["fallback"] == "search-snippets"
+    assert response["diagnostics"]["evidence_status"] == "weak"
+    assert response["evidence_summary"]["status"] == "weak"
+
+
+@pytest.mark.asyncio
+async def test_integrated_failure_pattern_keeps_official_candidate_first(monkeypatch):
+    search_gateway._CACHE.clear()
+    search_gateway._QUERY_LOCKS.clear()
+    search_gateway._QUERY_LOCK_USERS.clear()
+    captured = {}
+
+    async def no_cache(_):
+        return None
+
+    async def ignore_cache(*_):
+        return None
+
+    def candidate(title, url, source_type, rank, primary=False):
+        return {
+            "title": title,
+            "url": url,
+            "domain": search_gateway._domain(url),
+            "snippet": "Docker Compose installation instructions for Ubuntu.",
+            "search_rank": rank,
+            "discovery_score": 5.0 - rank * 0.1,
+            "source_authority": 1.0 if primary else 0.5,
+            "source_type": source_type,
+            "source_tier": 1 if primary else 2,
+            "authority_score": 0.9 if primary else 0.7,
+            "primary_source_candidate": primary,
+            "source_classification_method": "test",
+            "subject_coverage": 0.8,
+            "topic_partial_match": True,
+            "published_at": None,
+            "modified_at": None,
+            "freshness_score": 0.0,
+            "version_context": [],
+            "evidence_id": search_gateway.stable_evidence_id(url),
+            "citation_url": url,
+            "engines": ["bing"],
+            "image_url": None,
+            "thumbnail_url": None,
+        }
+
+    candidates = [
+        candidate(
+            "Installing latest Docker Compose on Ubuntu",
+            "https://stackoverflow.com/questions/1/install",
+            "technical_reference",
+            1,
+        ),
+        candidate(
+            "Another Docker Compose discussion",
+            "https://askubuntu.com/questions/2/install",
+            "technical_reference",
+            2,
+        ),
+        candidate(
+            "Install the Docker Compose plugin",
+            "https://docs.docker.com/compose/install/linux/",
+            "documentation_candidate",
+            3,
+            primary=True,
+        ),
+    ]
+
+    async def search(*args, **kwargs):
+        return candidates, []
+
+    async def rerank(query, documents, top_k, timeout_seconds):
+        return [
+            {"candidate_index": 0},
+            {"candidate_index": 1},
+            {"candidate_index": 2},
+        ], "ok"
+
+    async def crawl(selected, query, target_pages, deadline):
+        captured["selected"] = selected
+        return (
+            [],
+            [
+                {"url": item["url"], "error": "PageExtractionError"}
+                for item in selected
+            ],
+            [],
+        )
+
+    monkeypatch.setattr(search_gateway, "_cache_get", no_cache)
+    monkeypatch.setattr(search_gateway, "_cache_set", ignore_cache)
+    monkeypatch.setattr(search_gateway, "_searx_search", search)
+    monkeypatch.setattr(search_gateway, "_rerank_bounded", rerank)
+    monkeypatch.setattr(search_gateway, "_adaptive_crawl_candidates", crawl)
+
+    response = await search_gateway.research(
+        search_gateway.SearchRequest(
+            query="How do I install Docker Compose on Ubuntu?", max_results=3
+        ),
+        pipeline="integrated",
+    )
+
+    official_url = "https://docs.docker.com/compose/install/linux/"
+    assert captured["selected"][0]["url"] == official_url
+    assert response["results"][0]["url"] == official_url
+    assert response["diagnostics"]["evidence_status"] == "weak"
 
 
 @pytest.mark.asyncio

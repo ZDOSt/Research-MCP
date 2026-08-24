@@ -100,6 +100,16 @@ class PageExtractionError(RuntimeError):
     """Raised when every permitted extraction method returns unusable content."""
 
 
+def _exception_reason(exc: Exception) -> str:
+    """Keep actionable HTTP failure details for gateway-level backoff decisions."""
+
+    if isinstance(exc, httpx.HTTPStatusError):
+        return f"HTTP-{exc.response.status_code}"
+    if isinstance(exc, (httpx.TimeoutException, TimeoutError)):
+        return "timeout"
+    return type(exc).__name__
+
+
 _DOMAIN_FETCH_STATS: OrderedDict[str, dict[str, Any]] = OrderedDict()
 _FETCH_REDIS: Any = None
 _FETCH_REDIS_FAILED_UNTIL = 0.0
@@ -936,7 +946,7 @@ async def fetch_page(
                 best_assessment = assessment
         except Exception as exc:
             latency = time.monotonic() - method_started
-            reason = type(exc).__name__
+            reason = _exception_reason(exc)
             await _record_domain_outcome(
                 domain,
                 method,

@@ -32,6 +32,7 @@ from evidence_quality import (
     stable_evidence_id,
     temporal_requirement,
 )
+from extractors import html_to_text
 from gateway_fetch import close_fetch_resources, fetch_page
 from request_limits import RequestBodyLimitMiddleware
 
@@ -146,7 +147,7 @@ FIRECRAWL_MAX_RESPONSE_BYTES = max(
     65_536, int(os.getenv("FIRECRAWL_MAX_RESPONSE_BYTES", "4194304"))
 )
 FIRECRAWL_MAX_RESULTS = max(1, int(os.getenv("FIRECRAWL_MAX_RESULTS", "20")))
-CACHE_SCHEMA_VERSION = "adaptive-v1"
+CACHE_SCHEMA_VERSION = "adaptive-v2"
 
 
 _CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
@@ -187,6 +188,11 @@ PROGRAMMING_RE = re.compile(
 UBUNTU_RE = re.compile(r"\b(?:apt|debian|linux mint|ubuntu)\b", re.I)
 TROUBLESHOOT_RE = re.compile(
     r"\b(?:bug|crash|error|exception|failed|failure|fix|problem|stack trace|troubleshoot)\b",
+    re.I,
+)
+COMMUNITY_INTENT_RE = re.compile(
+    r"\b(?:askubuntu|community|discussion|forum|reddit|stack\s*exchange|"
+    r"stackoverflow|user reports?|what (?:do|did) (?:people|users))\b",
     re.I,
 )
 CURRENT_RE = re.compile(
@@ -576,10 +582,13 @@ def _query_variants(query: str, mode: str) -> list[str]:
         variants.append(f'"{error.group(1).strip()}"')
     elif CURRENT_RE.search(normalized):
         variants.append(f"{normalized} latest")
+    elif TECHNICAL_RE.search(normalized) and INSTRUCTION_RE.search(normalized):
+        instructional = (
+            _anchor_query(topic_anchor, normalized) if topic_anchor else normalized
+        )
+        variants.append(f"{instructional} official documentation")
     elif topic_anchor:
         variants.append(_anchor_query(topic_anchor, normalized))
-    elif TECHNICAL_RE.search(normalized) and INSTRUCTION_RE.search(normalized):
-        variants.append(f"{normalized} official documentation")
     if mode == "deep" and len(variants) < 3:
         if error and all(error.group(1).strip() not in item for item in variants[1:]):
             variants.append(f'{normalized} "{error.group(1).strip()}"')
@@ -1008,6 +1017,9 @@ def _normalize_search_result(
         "query_consensus": item.get("query_consensus", 0),
         "engine_consensus": item.get("engine_consensus", 0),
         "fusion_score": item.get("fusion_score", 0.0),
+        "prefetched_content": item.get("prefetched_content"),
+        "prefetched_content_method": item.get("prefetched_content_method"),
+        "prefetched_low_confidence": bool(item.get("prefetched_low_confidence")),
     }
 
 
@@ -1353,6 +1365,16 @@ def _fuse_candidates(occurrences: list[dict[str, Any]]) -> list[dict[str, Any]]:
         for engine in occurrence.get("engines") or []:
             if engine and engine not in existing["engines"]:
                 existing["engines"].append(engine)
+        if occurrence.get("prefetched_content") and not existing.get(
+            "prefetched_content"
+        ):
+            existing["prefetched_content"] = occurrence["prefetched_content"]
+            existing["prefetched_content_method"] = occurrence.get(
+                "prefetched_content_method"
+            )
+            existing["prefetched_low_confidence"] = bool(
+                occurrence.get("prefetched_low_confidence")
+            )
     for item in fused.values():
         query_consensus = len(item["query_variants"])
         engine_consensus = len(item["engines"])
@@ -1427,9 +1449,9 @@ def _supplement_sources_for(query: str) -> list[str]:
     sources: list[str] = []
     if ACADEMIC_RE.search(query):
         sources.append("crossref")
-    elif TECHNICAL_RE.search(query) or TROUBLESHOOT_RE.search(query):
+    elif TROUBLESHOOT_RE.search(query) or COMMUNITY_INTENT_RE.search(query):
         sources.append("stackexchange")
-    else:
+    elif not INSTRUCTION_RE.search(query):
         sources.append("wikipedia")
     if REPOSITORY_INTENT_RE.search(query):
         sources.append("github")
@@ -1459,7 +1481,7 @@ async def _supplemental_search(
                 "pagesize": 5,
                 "order": "desc",
                 "sort": "relevance",
-                "filter": "default",
+                "filter": "withbody",
             }
         elif source == "github":
             url = "https://api.github.com/search/repositories"
@@ -1523,11 +1545,16 @@ async def _supplemental_search(
         if source == "stackexchange":
             for item in payload.get("items") or []:
                 if isinstance(item, dict):
+                    body = html_to_text(str(item.get("body") or ""))
                     raw.append(
                         {
                             "title": unescape(str(item.get("title") or "")),
                             "url": item.get("link"),
-                            "content": "Stack Overflow question with community answers.",
+                            "content": body[:1500]
+                            or "Stack Overflow question with community answers.",
+                            "prefetched_content": body or None,
+                            "prefetched_content_method": "stackexchange-api-question",
+                            "prefetched_low_confidence": True,
                             "publishedDate": item.get("creation_date"),
                             "modifiedDate": item.get("last_activity_date"),
                             "engines": ["stackexchange-api"],
@@ -2004,6 +2031,98 @@ async def _rerank_bounded(
         return _lexical_rerank(query, documents, top_k), "fallback:deadline"
 
 
+def _select_crawl_candidates(
+    query: str,
+    candidates: list[dict[str, Any]],
+    ranked_documents: list[dict[str, Any]],
+    target_pages: int,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Keep relevance order while reserving early crawl slots for source diversity."""
+
+    ranked_indices: list[int] = []
+    for document in ranked_documents:
+        try:
+            index = int(document.get("candidate_index", -1))
+        except (TypeError, ValueError):
+            continue
+        if 0 <= index < len(candidates) and index not in ranked_indices:
+            ranked_indices.append(index)
+    ranked_indices.extend(
+        index for index in range(len(candidates)) if index not in ranked_indices
+    )
+
+    instructional = bool(INSTRUCTION_RE.search(query))
+    explicit_community = bool(
+        TROUBLESHOOT_RE.search(query) or COMMUNITY_INTENT_RE.search(query)
+    )
+
+    def is_primary(index: int) -> bool:
+        candidate = candidates[index]
+        source_type = str(candidate.get("source_type") or "")
+        candidate_text = f"{candidate.get('title', '')} {candidate.get('snippet', '')}"
+        relevant = (
+            bool(candidate.get("topic_partial_match"))
+            or float(candidate.get("subject_coverage") or 0.0) >= 0.34
+            or _lexical_score(query, candidate_text) >= 0.35
+        )
+        if not relevant:
+            return False
+        if source_type in {
+            "documentation_candidate",
+            "government",
+            "release_notes",
+            "standard",
+        }:
+            return True
+        return bool(candidate.get("primary_source_candidate")) and (
+            source_type != "source_repository" or REPOSITORY_INTENT_RE.search(query)
+        )
+
+    def is_community(index: int) -> bool:
+        return str(candidates[index].get("source_type") or "") in {
+            "technical_community",
+            "technical_reference",
+        }
+
+    ordered_indices = ranked_indices
+    if instructional:
+        primary = [index for index in ranked_indices if is_primary(index)]
+        remainder = [index for index in ranked_indices if index not in primary]
+        if not explicit_community:
+            non_community = [index for index in remainder if not is_community(index)]
+            community = [index for index in remainder if is_community(index)]
+            remainder = [*non_community, *community]
+        ordered_indices = [*primary, *remainder]
+
+    early_unique_limit = min(limit, max(target_pages * 2, target_pages + 2))
+    selected_indices: list[int] = []
+    deferred_indices: list[int] = []
+    seen_domains: set[str] = set()
+    for index in ordered_indices:
+        domain = _root_domain(str(candidates[index].get("domain") or ""))
+        if len(selected_indices) < early_unique_limit and domain not in seen_domains:
+            selected_indices.append(index)
+            if domain:
+                seen_domains.add(domain)
+        else:
+            deferred_indices.append(index)
+    selected_indices.extend(deferred_indices)
+    return [candidates[index] for index in selected_indices[:limit]]
+
+
+BLOCKING_CRAWL_FAILURE_RE = re.compile(
+    r"(?:HTTP[- ]?(?:403|429)|access denied|captcha|challenge|forbidden|"
+    r"interstitial|rate.?limit|robots?|temporarily blocked|too many requests)",
+    re.I,
+)
+
+
+def _failure_blocks_domain(failure: dict[str, Any]) -> bool:
+    detail = f"{failure.get('error', '')} {failure.get('detail', '')}"
+    return BLOCKING_CRAWL_FAILURE_RE.search(detail) is not None
+
+
 async def _crawl_candidates(
     candidates: list[dict[str, Any]], query: str, deadline: float
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -2013,6 +2132,28 @@ async def _crawl_candidates(
         candidate_index: int, candidate: dict[str, Any]
     ) -> tuple[dict[str, Any], dict[str, Any] | None]:
         async with semaphore:
+            prefetched = str(candidate.get("prefetched_content") or "").strip()
+            if prefetched:
+                return candidate, {
+                    "url": candidate["url"],
+                    "title": candidate.get("title"),
+                    "content": prefetched,
+                    "content_chars": len(prefetched),
+                    "body_format": "text",
+                    "links": [],
+                    "status_code": 200,
+                    "extraction_method": candidate.get("prefetched_content_method")
+                    or "supplemental-api",
+                    "metadata": normalize_page_metadata(
+                        {
+                            "publishedDate": candidate.get("published_at"),
+                            "modifiedDate": candidate.get("modified_at"),
+                        }
+                    ),
+                    "low_confidence": bool(
+                        candidate.get("prefetched_low_confidence", True)
+                    ),
+                }
             remaining = deadline - time.monotonic()
             if remaining <= 1:
                 return candidate, None
@@ -2084,6 +2225,7 @@ async def _adaptive_crawl_candidates(
     weak_pages: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
     batches: list[dict[str, Any]] = []
+    blocked_domains: set[str] = set()
     cursor = 0
     while cursor < len(candidates) and len(strong_pages) < target_pages:
         if deadline - time.monotonic() <= 1.25:
@@ -2091,21 +2233,38 @@ async def _adaptive_crawl_candidates(
         needed = target_pages - len(strong_pages)
         batch_size = min(MAX_CONCURRENT_FETCHES, max(1, min(2, needed)))
         batch = []
-        for index, candidate in enumerate(
-            candidates[cursor : cursor + batch_size], start=cursor
-        ):
+        while cursor < len(candidates) and len(batch) < batch_size:
+            index = cursor
+            candidate = candidates[cursor]
+            cursor += 1
+            root = _root_domain(
+                str(candidate.get("domain") or _domain(candidate["url"]))
+            )
+            if root and root in blocked_domains:
+                failures.append(
+                    {
+                        "url": candidate["url"],
+                        "error": "domain-blocked-after-prior-failure",
+                    }
+                )
+                continue
             row = dict(candidate)
             row["_allow_expensive_fallback"] = index < max(3, target_pages)
             batch.append(row)
-        cursor += len(batch)
         if not batch:
-            break
+            continue
         batch_pages, batch_failures = await _crawl_candidates(batch, query, deadline)
         batch_strong = [page for page in batch_pages if not page.get("low_confidence")]
         batch_weak = [page for page in batch_pages if page.get("low_confidence")]
         strong_pages.extend(batch_strong)
         weak_pages.extend(batch_weak)
         failures.extend(batch_failures)
+        for failure in batch_failures:
+            if not _failure_blocks_domain(failure):
+                continue
+            root = _root_domain(_domain(str(failure.get("url") or "")))
+            if root:
+                blocked_domains.add(root)
         batches.append(
             {
                 "attempted": len(batch),
@@ -2845,6 +3004,7 @@ async def research(
                     "partial": False,
                 }
                 candidates: list[dict[str, Any]] = []
+                fallback_candidates: list[dict[str, Any]] = []
                 pages: list[dict[str, Any]] = []
                 results: list[dict[str, Any]] = []
                 try:
@@ -2871,6 +3031,7 @@ async def research(
                         _attach_search_diagnostics(diagnostics, search_diagnostics)
                         if not candidates:
                             raise RuntimeError("SearXNG returned no usable candidates")
+                        fallback_candidates = candidates
 
                         candidate_documents = []
                         for index, item in enumerate(candidates):
@@ -2908,7 +3069,7 @@ async def research(
                             max(1, request.max_results),
                         )
                         candidate_pool_size = min(
-                            len(candidates), max(target_pages * 3, target_pages)
+                            len(candidates), 15, max(target_pages * 5, 8)
                         )
                         ranked_candidates, candidate_reranker = await _rerank_bounded(
                             request.query,
@@ -2917,12 +3078,21 @@ async def research(
                             candidate_rerank_timeout,
                         )
                         diagnostics["candidate_reranker"] = candidate_reranker
-                        selected = [
-                            candidates[int(item["candidate_index"])]
-                            for item in ranked_candidates
-                            if 0
-                            <= int(item.get("candidate_index", -1))
-                            < len(candidates)
+                        selected = _select_crawl_candidates(
+                            request.query,
+                            candidates,
+                            ranked_candidates,
+                            target_pages,
+                            candidate_pool_size,
+                        )
+                        selected_urls = {item["url"] for item in selected}
+                        fallback_candidates = [
+                            *selected,
+                            *[
+                                item
+                                for item in candidates
+                                if item["url"] not in selected_urls
+                            ],
                         ]
                         (
                             pages,
@@ -3021,7 +3191,7 @@ async def research(
                             "img_src": item.get("image_url"),
                             "thumbnail_src": item.get("thumbnail_url"),
                         }
-                        for item in candidates
+                        for item in (fallback_candidates or candidates)
                         if item.get("snippet") and item["url"] not in existing_urls
                     ]
                     needed = min(request.max_results, budget.final_results) - len(
@@ -3038,6 +3208,20 @@ async def research(
                 coverage = evidence_summary(
                     results, request.query, time_range=request.time_range
                 )
+                strong_page_count = sum(
+                    not bool(page.get("low_confidence")) for page in pages
+                )
+                if strong_page_count == 0:
+                    coverage = dict(coverage)
+                    coverage["status"] = "weak"
+                    warnings = list(coverage.get("warnings") or [])
+                    warning = (
+                        "No high-confidence page content could be extracted; results "
+                        "rely on search-engine snippets or low-confidence API content."
+                    )
+                    if warning not in warnings:
+                        warnings.append(warning)
+                    coverage["warnings"] = warnings
                 diagnostics["evidence_status"] = coverage["status"]
                 result = {
                     "query": request.query,
