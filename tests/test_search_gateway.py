@@ -41,7 +41,7 @@ def test_query_variants_are_bounded_and_intent_aware():
     variants = search_gateway._query_variants(
         "How do I install Docker Compose on Ubuntu?", "balanced"
     )
-    assert variants[0] == "How do I install Docker Compose on Ubuntu?"
+    assert variants[0] == "install docker compose ubuntu"
     assert any('"Docker Compose"' in item for item in variants[1:])
     assert any("official documentation" in item for item in variants[1:])
     assert all("site:" not in item for item in variants)
@@ -52,7 +52,7 @@ def test_generic_technical_query_uses_general_documentation_variant():
     variants = search_gateway._query_variants(
         "How do I install PostgreSQL on Ubuntu?", "balanced"
     )
-    assert variants[0] == "How do I install PostgreSQL on Ubuntu?"
+    assert variants[0] == "install postgresql ubuntu"
     assert any("PostgreSQL" in item for item in variants[1:])
     assert any("official documentation" in item for item in variants[1:])
     assert all("site:" not in item for item in variants)
@@ -71,6 +71,11 @@ def test_installing_an_application_with_docker_does_not_target_docker_docs():
     )
     assert all("site:docs.docker.com" not in item for item in variants)
     assert any("official documentation" in item for item in variants)
+
+
+def test_explicit_search_operators_are_preserved_without_rewriting():
+    query = "docker compose install site:docs.docker.com"
+    assert search_gateway._query_variants(query, "balanced") == [query]
 
 
 def test_search_categories_are_inferred_from_intent():
@@ -175,6 +180,7 @@ def test_recommendation_queries_preserve_the_models_subject_and_intent():
         "Best team composition in DragonSword Awakening", "balanced"
     )
     assert any("DragonSword" in item for item in variants)
+    assert "best" in variants[0]
     assert all("measurements" not in item for item in variants)
 
     equipment_variants = search_gateway._query_variants(
@@ -227,7 +233,7 @@ def test_precise_queries_keep_an_exact_and_relaxed_form():
         '"DragonSword Awakening" Theresia Astria Roxy', "balanced"
     )
 
-    assert inferred[0].startswith("DragonSword Awakening")
+    assert inferred[0].casefold().startswith("dragonsword awakening")
     assert any(item.startswith('"DragonSword Awakening"') for item in inferred[1:])
     assert explicit[0].startswith('"DragonSword Awakening"')
     assert all(len(item) > len('"DragonSword Awakening"') for item in explicit)
@@ -508,7 +514,7 @@ def test_instruction_query_penalizes_source_repository_without_repo_intent():
 
 
 @pytest.mark.asyncio
-async def test_searx_uses_original_query_then_a_bounded_fallback_wave(monkeypatch):
+async def test_searx_uses_compact_query_then_a_bounded_fallback_wave(monkeypatch):
     captured = []
 
     class Stream:
@@ -537,7 +543,7 @@ async def test_searx_uses_original_query_then_a_bounded_fallback_wave(monkeypatc
 
     async def read(response, max_bytes=0):
         query = response.params["q"]
-        if query != "How do I install Docker Compose on Ubuntu?":
+        if query != "install docker compose ubuntu":
             return {
                 "results": [
                     {
@@ -574,7 +580,7 @@ async def test_searx_uses_original_query_then_a_bounded_fallback_wave(monkeypatc
     official = next(item for item in results if item["domain"] == "docs.docker.com")
     assert results[0] == official
     assert official["search_rank"] == 1
-    assert captured[0]["q"] == "How do I install Docker Compose on Ubuntu?"
+    assert captured[0]["q"] == "install docker compose ubuntu"
     assert captured[0]["engines"] == "bing,brave"
     targeted = captured[1]
     assert '"Docker Compose"' in targeted["q"]
@@ -583,6 +589,120 @@ async def test_searx_uses_original_query_then_a_bounded_fallback_wave(monkeypatc
     summary = diagnostics[-1]
     assert summary["fallback_triggered"] is True
     assert summary["initial_quality"]["status"] == "weak"
+
+
+@pytest.mark.asyncio
+async def test_searx_removes_irrelevant_candidates_after_weak_fallback(monkeypatch):
+    class Stream:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        def raise_for_status(self):
+            return None
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        def stream(self, method, url, params):
+            return Stream()
+
+    async def read(response, max_bytes=0):
+        return {
+            "results": [
+                {
+                    "title": "Do - English Grammar Today",
+                    "url": "https://dictionary.example/do",
+                    "content": "Grammar guidance about the English verb do.",
+                    "engine": "bing",
+                }
+            ]
+        }
+
+    monkeypatch.setattr(search_gateway.httpx, "AsyncClient", lambda **kwargs: Client())
+    monkeypatch.setattr(search_gateway, "_read_json_response", read)
+
+    results, diagnostics = await search_gateway._searx_search(
+        "How do I install Docker Compose on Ubuntu?",
+        mode="balanced",
+        max_results=5,
+        language="auto",
+        time_range=None,
+        categories=[],
+    )
+
+    assert results == []
+    summary = diagnostics[-1]
+    assert summary["final_quality"]["status"] == "weak"
+    assert summary["irrelevant_candidates_removed"] == 1
+
+
+@pytest.mark.asyncio
+async def test_integrated_search_returns_clean_empty_result_for_irrelevant_discovery(
+    monkeypatch,
+):
+    search_gateway._CACHE.clear()
+    search_gateway._QUERY_LOCKS.clear()
+    search_gateway._QUERY_LOCK_USERS.clear()
+
+    async def no_cache(_):
+        return None
+
+    async def ignore_cache(*_):
+        return None
+
+    async def search(*args, **kwargs):
+        quality = {
+            "status": "weak",
+            "candidate_count": 0,
+            "reasons": ["no-candidates"],
+        }
+        return [], [
+            {
+                "query": "install docker compose ubuntu",
+                "provider": "searxng",
+                "wave": "initial",
+                "status": "ok",
+                "result_count": 1,
+            },
+            {
+                "provider": "search-gateway",
+                "wave": "summary",
+                "status": "ok",
+                "variants": ["install docker compose ubuntu"],
+                "fallback_triggered": True,
+                "fallback_reasons": ["no-candidates"],
+                "initial_quality": quality,
+                "final_quality": quality,
+            },
+        ]
+
+    async def unexpected_crawl(*args, **kwargs):
+        raise AssertionError("irrelevant discovery must not reach the crawler")
+
+    monkeypatch.setattr(search_gateway, "_cache_get", no_cache)
+    monkeypatch.setattr(search_gateway, "_cache_set", ignore_cache)
+    monkeypatch.setattr(search_gateway, "_searx_search", search)
+    monkeypatch.setattr(
+        search_gateway, "_adaptive_crawl_candidates", unexpected_crawl
+    )
+
+    response = await search_gateway.research(
+        search_gateway.SearchRequest(
+            query="How do I install Docker Compose on Ubuntu?", max_results=5
+        ),
+        pipeline="integrated",
+    )
+
+    assert response["results"] == []
+    assert response["diagnostics"]["no_relevant_candidates"] is True
+    assert response["diagnostics"]["evidence_status"] == "weak"
 
 
 @pytest.mark.asyncio
@@ -675,7 +795,7 @@ async def test_supplement_failure_does_not_fail_the_core_search(monkeypatch):
             return Stream(params)
 
     async def read(response, max_bytes=0):
-        if response.params["q"] == "Nebula XZ900 setup guide":
+        if response.params["q"].casefold() == "nebula xz900 setup guide":
             return {"results": []}
         return {
             "results": [
@@ -715,7 +835,7 @@ async def test_supplement_failure_does_not_fail_the_core_search(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_discovery_softly_penalizes_topic_drift_across_search_waves(monkeypatch):
+async def test_discovery_removes_topic_drift_after_weak_search_waves(monkeypatch):
     captured = []
 
     class Stream:
@@ -773,12 +893,11 @@ async def test_discovery_softly_penalizes_topic_drift_across_search_waves(monkey
     )
 
     assert captured == [
-        "DragonSword Awakening best equipment characters guide",
+        "dragonsword awakening best equipment characters guide",
         '"DragonSword Awakening" best equipment characters guide',
     ]
     assert results[0]["domain"] == "guide.example"
-    unrelated = next(item for item in results if item["domain"] == "britannica.com")
-    assert results[0]["discovery_score"] > unrelated["discovery_score"]
+    assert all(item["domain"] != "britannica.com" for item in results)
 
 
 @pytest.mark.asyncio
@@ -2227,6 +2346,90 @@ async def test_integrated_failure_pattern_keeps_official_candidate_first(monkeyp
     official_url = "https://docs.docker.com/compose/install/linux/"
     assert captured["selected"][0]["url"] == official_url
     assert response["results"][0]["url"] == official_url
+    assert response["diagnostics"]["evidence_status"] == "weak"
+
+
+@pytest.mark.asyncio
+async def test_extracted_but_irrelevant_pages_cannot_be_sufficient_evidence(monkeypatch):
+    search_gateway._CACHE.clear()
+    search_gateway._QUERY_LOCKS.clear()
+    search_gateway._QUERY_LOCK_USERS.clear()
+    url = "https://dictionary.example/do"
+    candidate = {
+        "title": "Do - English Grammar Today",
+        "url": url,
+        "domain": "dictionary.example",
+        "snippet": "Grammar guidance about the English verb do.",
+        "search_rank": 1,
+        "discovery_score": 1.0,
+        "source_authority": 0.0,
+        "source_type": "general_web",
+        "source_tier": 4,
+        "authority_score": 0.45,
+        "primary_source_candidate": False,
+        "source_classification_method": "test",
+        "subject_coverage": 0.0,
+        "topic_partial_match": False,
+        "published_at": None,
+        "modified_at": None,
+        "freshness_score": 0.0,
+        "version_context": [],
+        "evidence_id": search_gateway.stable_evidence_id(url),
+        "citation_url": url,
+        "engines": ["bing"],
+        "image_url": None,
+        "thumbnail_url": None,
+    }
+
+    async def no_cache(_):
+        return None
+
+    async def ignore_cache(*_):
+        return None
+
+    async def search(*args, **kwargs):
+        return [candidate], []
+
+    async def rerank(query, documents, top_k, timeout_seconds):
+        ranked = []
+        for document in documents[:top_k]:
+            item = dict(document)
+            item["rerank_score"] = 1.0
+            item["ranking_score"] = 1.0
+            ranked.append(item)
+        return ranked, "ok"
+
+    async def crawl(candidates, query, target_pages, deadline):
+        return (
+            [
+                {
+                    "url": url,
+                    "title": candidate["title"],
+                    "content": "English grammar examples using the verb do. " * 60,
+                    "content_chars": 2700,
+                    "links": [],
+                    "extraction_method": "direct",
+                    "search": candidate,
+                }
+            ],
+            [],
+            [],
+        )
+
+    monkeypatch.setattr(search_gateway, "_cache_get", no_cache)
+    monkeypatch.setattr(search_gateway, "_cache_set", ignore_cache)
+    monkeypatch.setattr(search_gateway, "_searx_search", search)
+    monkeypatch.setattr(search_gateway, "_rerank_bounded", rerank)
+    monkeypatch.setattr(search_gateway, "_adaptive_crawl_candidates", crawl)
+
+    response = await search_gateway.research(
+        search_gateway.SearchRequest(
+            query="How do I install Docker Compose on Ubuntu?", max_results=1
+        ),
+        pipeline="integrated",
+    )
+
+    assert response["evidence_summary"]["relevant_result_count"] == 0
     assert response["diagnostics"]["evidence_status"] == "weak"
 
 

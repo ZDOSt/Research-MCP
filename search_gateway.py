@@ -147,7 +147,7 @@ FIRECRAWL_MAX_RESPONSE_BYTES = max(
     65_536, int(os.getenv("FIRECRAWL_MAX_RESPONSE_BYTES", "4194304"))
 )
 FIRECRAWL_MAX_RESULTS = max(1, int(os.getenv("FIRECRAWL_MAX_RESULTS", "20")))
-CACHE_SCHEMA_VERSION = "adaptive-v2"
+CACHE_SCHEMA_VERSION = "adaptive-v3"
 
 
 _CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
@@ -215,6 +215,9 @@ COMPARISON_INTENT_RE = re.compile(
 )
 ERROR_QUOTE_RE = re.compile(r"(?:error|exception|failed|failure)[:\s]+(.{8,220})", re.I)
 URL_IN_QUERY_RE = re.compile(r"https?://[^\s<>\"']+", re.I)
+SEARCH_OPERATOR_RE = re.compile(
+    r"(?:^|\s)(?:filetype|intext|intitle|inurl|site):\S+", re.I
+)
 QUOTED_PHRASE_RE = re.compile(r'"([^"\r\n]{2,160})"')
 WORD_RE = re.compile(r"[^\W_]+(?:[-.][^\W_]+)*", re.UNICODE)
 STOP_WORDS = frozenset(
@@ -543,6 +546,45 @@ def _anchor_query(anchor: str, query: str) -> str:
     return re.sub(re.escape(anchor), f'"{anchor}"', query, count=1, flags=re.I)
 
 
+def _search_query_tokens(value: str) -> list[str]:
+    query_stop_words = STOP_WORDS - {"best"}
+    terms: list[str] = []
+    seen: set[str] = set()
+    for token in WORD_RE.findall(value.casefold()):
+        token = token.strip("-.")
+        if (
+            (len(token) < 2 and not token.isdigit())
+            or token in query_stop_words
+            or token in seen
+        ):
+            continue
+        seen.add(token)
+        terms.append(token)
+    return terms[:16]
+
+
+def _compact_search_query(query: str) -> str:
+    """Convert conversational input into bounded, source-neutral search terms."""
+
+    normalized = re.sub(r"\s+", " ", query).strip()
+    if SEARCH_OPERATOR_RE.search(normalized):
+        return normalized
+    terms = _search_query_tokens(normalized)
+    compact = " ".join(terms[:16]) or normalized
+    for phrase in QUOTED_PHRASE_RE.findall(normalized):
+        phrase_terms = " ".join(_search_query_tokens(phrase))
+        if not phrase_terms:
+            continue
+        compact = re.sub(
+            rf"(?<!\w){re.escape(phrase_terms)}(?!\w)",
+            f'"{phrase}"',
+            compact,
+            count=1,
+            flags=re.I,
+        )
+    return compact
+
+
 def _topic_anchor_is_strict(query: str, anchor: str | None) -> bool:
     """Return whether a topic is precise enough for hard relevance filtering."""
 
@@ -572,32 +614,35 @@ def _topic_anchor_is_strict(query: str, anchor: str | None) -> bool:
 
 
 def _query_variants(query: str, mode: str) -> list[str]:
-    """Build conservative fallbacks while preserving the user's query first."""
+    """Build bounded, search-engine-friendly variants from the user's intent."""
 
     normalized = re.sub(r"\s+", " ", query).strip()
+    if SEARCH_OPERATOR_RE.search(normalized):
+        return [normalized]
+    compact = _compact_search_query(normalized)
     topic_anchor = _topic_anchor(normalized)
-    variants = [normalized]
+    variants = [compact]
     error = ERROR_QUOTE_RE.search(normalized)
     if error and not topic_anchor:
         variants.append(f'"{error.group(1).strip()}"')
     elif CURRENT_RE.search(normalized):
-        variants.append(f"{normalized} latest")
+        variants.append(f"{compact} latest")
     elif TECHNICAL_RE.search(normalized) and INSTRUCTION_RE.search(normalized):
         instructional = (
-            _anchor_query(topic_anchor, normalized) if topic_anchor else normalized
+            _anchor_query(topic_anchor, compact) if topic_anchor else compact
         )
         variants.append(f"{instructional} official documentation")
     elif topic_anchor:
-        variants.append(_anchor_query(topic_anchor, normalized))
+        variants.append(_anchor_query(topic_anchor, compact))
     if mode == "deep" and len(variants) < 3:
         if error and all(error.group(1).strip() not in item for item in variants[1:]):
-            variants.append(f'{normalized} "{error.group(1).strip()}"')
+            variants.append(f'{compact} "{error.group(1).strip()}"')
         elif CURRENT_RE.search(normalized):
-            variants.append(f"{normalized} recent authoritative sources")
+            variants.append(f"{compact} recent authoritative sources")
         elif TECHNICAL_RE.search(normalized):
-            variants.append(f"{normalized} official documentation")
+            variants.append(f"{compact} official documentation")
         else:
-            variants.append(f"{normalized} authoritative sources")
+            variants.append(f"{compact} authoritative sources")
     limit = 3 if mode == "deep" else 2
     return list(dict.fromkeys(variants))[:limit]
 
@@ -1396,6 +1441,20 @@ def _fuse_candidates(occurrences: list[dict[str, Any]]) -> list[dict[str, Any]]:
     )
 
 
+def _candidate_is_relevant(query: str, item: dict[str, Any]) -> bool:
+    text = " ".join(
+        str(item.get(key) or "") for key in ("title", "snippet", "content", "url")
+    )
+    topic_anchor = _topic_anchor(query)
+    return (
+        (bool(topic_anchor) and _anchor_matches(topic_anchor, text))
+        or bool(item.get("topic_partial_match"))
+        or float(item.get("subject_coverage") or _subject_coverage(query, text))
+        >= 0.34
+        or _lexical_score(query, text) >= 0.42
+    )
+
+
 def _candidate_quality(
     query: str, candidates: list[dict[str, Any]], desired_results: int, mode: str
 ) -> dict[str, Any]:
@@ -1406,10 +1465,7 @@ def _candidate_quality(
     relevant = [
         item
         for item in sample
-        if (bool(topic_anchor) and bool(item.get("topic_partial_match")))
-        or float(item.get("subject_coverage") or 0.0) >= 0.34
-        or _lexical_score(query, f"{item.get('title', '')} {item.get('snippet', '')}")
-        >= 0.42
+        if _candidate_is_relevant(query, item)
     ]
     topic_matches = (
         sum(bool(item.get("topic_partial_match")) for item in sample)
@@ -1817,6 +1873,13 @@ async def _searx_search(
         diagnostics.extend(supplemental_diagnostics)
         fused = _fuse_candidates(occurrences)
     final_quality = _candidate_quality(query, fused, max_results, mode)
+    irrelevant_candidates_removed = 0
+    if final_quality["status"] != "sufficient":
+        relevant_fused = [item for item in fused if _candidate_is_relevant(query, item)]
+        irrelevant_candidates_removed = len(fused) - len(relevant_fused)
+        fused = relevant_fused
+        final_quality = _candidate_quality(query, fused, max_results, mode)
+        final_quality["irrelevant_candidate_count"] = irrelevant_candidates_removed
     summary = {
         "provider": "search-gateway",
         "wave": "summary",
@@ -1827,6 +1890,7 @@ async def _searx_search(
         "fallback_reasons": initial_quality["reasons"] if fallback_triggered else [],
         "initial_quality": initial_quality,
         "final_quality": final_quality,
+        "irrelevant_candidates_removed": irrelevant_candidates_removed,
     }
     diagnostics.append(summary)
     return fused[:max_results], diagnostics
@@ -2060,13 +2124,7 @@ def _select_crawl_candidates(
     def is_primary(index: int) -> bool:
         candidate = candidates[index]
         source_type = str(candidate.get("source_type") or "")
-        candidate_text = f"{candidate.get('title', '')} {candidate.get('snippet', '')}"
-        relevant = (
-            bool(candidate.get("topic_partial_match"))
-            or float(candidate.get("subject_coverage") or 0.0) >= 0.34
-            or _lexical_score(query, candidate_text) >= 0.35
-        )
-        if not relevant:
+        if not _candidate_is_relevant(query, candidate):
             return False
         if source_type in {
             "documentation_candidate",
@@ -2704,6 +2762,40 @@ def _search_payload(
     }
 
 
+def _empty_research_payload(
+    query: str,
+    diagnostics: dict[str, Any],
+    started: float,
+) -> dict[str, Any]:
+    coverage = dict(evidence_summary([], query))
+    coverage["status"] = "weak"
+    coverage["relevant_result_count"] = 0
+    warnings = list(coverage.get("warnings") or [])
+    warnings.append("Search completed, but no topically relevant candidates were found.")
+    coverage["warnings"] = warnings
+    diagnostics["partial"] = True
+    diagnostics["no_relevant_candidates"] = True
+    diagnostics["evidence_status"] = "weak"
+    return {
+        "query": query,
+        "number_of_results": 0,
+        "results": [],
+        "suggestions": [],
+        "answers": [],
+        "corrections": [],
+        "infoboxes": [],
+        "unresponsive_engines": [
+            item
+            for search in diagnostics.get("searches", [])
+            for item in search.get("unresponsive_engines", [])
+        ],
+        "diagnostics": diagnostics,
+        "evidence_summary": coverage,
+        "duration_seconds": round(time.monotonic() - started, 3),
+        "cache": "miss",
+    }
+
+
 def _attach_search_diagnostics(
     diagnostics: dict[str, Any], searches: list[dict[str, Any]]
 ) -> None:
@@ -3030,7 +3122,20 @@ async def research(
                             )
                         _attach_search_diagnostics(diagnostics, search_diagnostics)
                         if not candidates:
-                            raise RuntimeError("SearXNG returned no usable candidates")
+                            searx_runs = [
+                                item
+                                for item in diagnostics.get("searches", [])
+                                if item.get("provider") == "searxng"
+                            ]
+                            if searx_runs and all(
+                                item.get("status") == "failed" for item in searx_runs
+                            ):
+                                raise RuntimeError("SearXNG discovery failed")
+                            result = _empty_research_payload(
+                                request.query, diagnostics, started
+                            )
+                            await _cache_set(key, result)
+                            return result
                         fallback_candidates = candidates
 
                         candidate_documents = []
@@ -3208,19 +3313,31 @@ async def research(
                 coverage = evidence_summary(
                     results, request.query, time_range=request.time_range
                 )
+                relevant_result_count = sum(
+                    _candidate_is_relevant(request.query, item) for item in results
+                )
+                coverage = dict(coverage)
+                coverage["relevant_result_count"] = relevant_result_count
                 strong_page_count = sum(
                     not bool(page.get("low_confidence")) for page in pages
                 )
-                if strong_page_count == 0:
-                    coverage = dict(coverage)
+                if strong_page_count == 0 or relevant_result_count == 0:
                     coverage["status"] = "weak"
                     warnings = list(coverage.get("warnings") or [])
-                    warning = (
-                        "No high-confidence page content could be extracted; results "
-                        "rely on search-engine snippets or low-confidence API content."
-                    )
-                    if warning not in warnings:
-                        warnings.append(warning)
+                    if strong_page_count == 0:
+                        warning = (
+                            "No high-confidence page content could be extracted; results "
+                            "rely on search-engine snippets or low-confidence API content."
+                        )
+                        if warning not in warnings:
+                            warnings.append(warning)
+                    if relevant_result_count == 0:
+                        warning = (
+                            "No returned evidence passed the gateway's topical relevance "
+                            "check."
+                        )
+                        if warning not in warnings:
+                            warnings.append(warning)
                     coverage["warnings"] = warnings
                 diagnostics["evidence_status"] = coverage["status"]
                 result = {
