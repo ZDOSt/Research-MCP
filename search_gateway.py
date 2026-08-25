@@ -115,11 +115,11 @@ PLANNER_BASE_URL = os.getenv("GATEWAY_PLANNER_BASE_URL", "").strip().rstrip("/")
 PLANNER_API_KEY = os.getenv("GATEWAY_PLANNER_API_KEY", "").strip()
 PLANNER_MODEL = os.getenv("GATEWAY_PLANNER_MODEL", "").strip()
 PLANNER_TIMEOUT_SECONDS = max(
-    1.0, float(os.getenv("GATEWAY_PLANNER_TIMEOUT_SECONDS", "5"))
+    1.0, float(os.getenv("GATEWAY_PLANNER_TIMEOUT_SECONDS", "3"))
 )
 PLANNER_MODES = {
     item.strip().casefold()
-    for item in os.getenv("GATEWAY_PLANNER_MODES", "deep").split(",")
+    for item in os.getenv("GATEWAY_PLANNER_MODES", "balanced,deep").split(",")
     if item.strip()
 }
 
@@ -375,6 +375,18 @@ def _mode_for(query: str, requested: str) -> str:
     if requested != "auto":
         return requested
     if TECHNICAL_RE.search(query) or RECOMMENDATION_RE.search(query):
+        return "balanced"
+    # Short entity queries still need a fallback wave. This remains domain
+    # agnostic: quoted subjects, product identifiers, and proper-name phrases
+    # are useful signals for games, people, products, media, and research.
+    anchor = _topic_anchor(query)
+    if anchor and (
+        len(_tokens(anchor)) >= 2
+        or any(
+            re.search(r"\d", term) or re.search(r"[a-z][A-Z]", term)
+            for term in WORD_RE.findall(anchor)
+        )
+    ):
         return "balanced"
     return "quick" if len(query.split()) <= 9 else "balanced"
 
@@ -636,7 +648,25 @@ def _query_variants(query: str, mode: str) -> list[str]:
         )
         variants.append(f"{instructional} official documentation")
     elif topic_anchor:
-        variants.append(_anchor_query(topic_anchor, compact))
+        anchored = _anchor_query(topic_anchor, compact)
+        if anchored.casefold() != compact.casefold():
+            variants.append(anchored)
+        # Quoting is useful for precision but can hide punctuation, spacing,
+        # or title variants in smaller indexes. Always retain one relaxed form
+        # for an explicitly quoted subject unless the user supplied operators.
+        if any(
+            topic_anchor.casefold() == phrase.casefold()
+            for phrase in QUOTED_PHRASE_RE.findall(normalized)
+        ):
+            relaxed = re.sub(
+                rf'"{re.escape(topic_anchor)}"',
+                topic_anchor,
+                compact,
+                count=1,
+                flags=re.I,
+            )
+            if relaxed.casefold() != compact.casefold():
+                variants.append(relaxed)
     if mode == "deep" and len(variants) < 3:
         if error and all(error.group(1).strip() not in item for item in variants[1:]):
             variants.append(f'{compact} "{error.group(1).strip()}"')
@@ -1156,7 +1186,9 @@ async def _planner_query_variants(
     instruction = (
         "Create at most two concise web-search query alternatives for the user's request. "
         "Preserve named entities, product identifiers, quoted errors, and the actual intent. "
-        "Do not choose a website, domain, or source type unless the user explicitly did. "
+        "If the request has multiple clear questions, cover the distinct questions while "
+        "retaining their shared subject. Do not ask for clarification, invent facts, or "
+        "choose a website, domain, or source type unless the user explicitly did. "
         'Return JSON only: {"queries":["..."]}.'
     )
     started = time.monotonic()
@@ -1706,14 +1738,12 @@ async def _searx_search(
     categories: list[str],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     deterministic = _query_variants(query, mode)
-    planned, planner_diagnostics = await _planner_query_variants(query, mode)
-    variants = [
-        deterministic[0],
-        *[item for item in planned if item.casefold() != deterministic[0].casefold()],
-        *deterministic[1:],
-    ]
-    variant_limit = 3 if mode == "deep" else 2
-    variants = list(dict.fromkeys(variants))[:variant_limit]
+    variants = list(dict.fromkeys(deterministic))
+    planner_diagnostics: dict[str, Any] = {
+        "status": "not-needed",
+        "model": PLANNER_MODEL or None,
+        "trigger": None,
+    }
     diagnostics: list[dict[str, Any]] = []
     occurrences: list[dict[str, Any]] = []
     used_engines: set[str] = set()
@@ -1841,14 +1871,33 @@ async def _searx_search(
     fused = _fuse_candidates(occurrences)
     initial_quality = _candidate_quality(query, fused, max_results, mode)
     fallback_triggered = mode != "quick" and initial_quality["status"] != "sufficient"
+    planned: list[str] = []
     if fallback_triggered:
+        # Deterministic retrieval is always first. Only weak evidence earns a
+        # planner call, keeping the normal path fast and predictable.
+        if _planner_is_enabled(mode):
+            planner_diagnostics = {
+                "status": "pending",
+                "model": PLANNER_MODEL,
+                "trigger": "weak-initial-search",
+            }
+            planned, planner_diagnostics = await _planner_query_variants(query, mode)
+            planner_diagnostics["trigger"] = "weak-initial-search"
         if "images" in _search_categories(query, categories):
             default_fallback = f"{query} high resolution"
         elif CURRENT_RE.search(query):
             default_fallback = f"{query} latest"
         else:
             default_fallback = f"{query} authoritative sources"
-        fallback_variants = variants[1:] or [default_fallback]
+        # Prefer a validated planner variant when available; deterministic
+        # variants remain the guaranteed fallback if the model is unavailable
+        # or returns unusable output.
+        fallback_variants = list(
+            dict.fromkeys([*planned, *variants[1:], default_fallback])
+        )
+        fallback_limit = 2 if mode == "deep" else 1
+        fallback_variants = fallback_variants[:fallback_limit]
+        variants.extend(item for item in fallback_variants if item not in variants)
         supplement_task = asyncio.create_task(
             _supplemental_search(query, time_range, categories)
         )

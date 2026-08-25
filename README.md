@@ -16,12 +16,14 @@ markers, a stable citation ID/URL, and exact character spans for selected
 passages. These are ranking and coverage aids, not claims that the gateway has
 proved source ownership or verified every claim.
 
-It does not require a paid search API or an internal language model. An optional
-OpenAI-compatible query planner can be enabled for selected modes, but it is
-strictly bounded and invalid or slow output falls back to deterministic query
-planning. The frontend's model receives the retrieved evidence and writes the
-answer. This keeps the service usable by any frontend that accepts a custom
-SearXNG or JSON search provider.
+It does not require a paid search API or an internal language model. The gateway
+always performs deterministic query planning first. When the first search wave
+has weak entity coverage, relevance, or source diversity, an optional
+OpenAI-compatible planner can add at most two validated alternatives. The
+planner is never used on a strong first pass; invalid, slow, or unavailable
+output falls back to deterministic planning. The frontend's model receives the
+retrieved evidence and writes the answer. This keeps the service usable by any
+frontend that accepts a custom SearXNG or JSON search provider.
 
 ## What runs
 
@@ -159,8 +161,9 @@ Supported query parameters include:
 - `mode=auto|quick|balanced|deep`
 
 When no category is supplied, the gateway infers useful SearXNG categories from
-the request. `auto` uses quick mode for simple lookups and balanced mode for
-technical questions and recommendations. `quick` performs one search wave;
+the request. `auto` uses quick mode for simple unanchored lookups and balanced
+mode for technical questions, recommendations, and identifiable subjects.
+`quick` performs one search wave;
 `balanced` conditionally adds one fallback query and a small crawl budget;
 `deep` permits two bounded fallback variants and wider evidence. The discovery
 route never crawls.
@@ -174,8 +177,10 @@ sources never replace broad search or exclude ordinary web results.
 
 To enable the optional planner, set `GATEWAY_PLANNER_BASE_URL`,
 `GATEWAY_PLANNER_MODEL`, and, when required, `GATEWAY_PLANNER_API_KEY` in
-`.env`. `GATEWAY_PLANNER_MODES=deep` is the default. Leave the URL and model
-empty for fully deterministic operation.
+`.env`. `GATEWAY_PLANNER_MODES=balanced,deep` is the default. The planner is
+called only after a weak first search wave, has a three-second default timeout,
+and is guarded by entity-preservation checks. Leave the URL and model empty for
+fully deterministic operation.
 
 ### Integrated search and Firecrawl compatibility
 

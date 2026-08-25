@@ -48,6 +48,27 @@ def test_query_variants_are_bounded_and_intent_aware():
     assert len(variants) <= 2
 
 
+def test_quoted_entity_queries_keep_a_relaxed_variant():
+    variants = search_gateway._query_variants(
+        '"DragonSword Awakening" Theresia best gear build', "balanced"
+    )
+
+    assert variants[0].startswith('"DragonSword Awakening"')
+    assert any(
+        item.casefold().startswith("dragonsword awakening")
+        and not item.startswith('"')
+        for item in variants[1:]
+    )
+
+
+def test_auto_mode_gives_identifiable_subjects_a_fallback_wave():
+    assert search_gateway._mode_for('"DragonSword Awakening" game', "auto") == (
+        "balanced"
+    )
+    assert search_gateway._mode_for("Who is Taylor Swift?", "auto") == "balanced"
+    assert search_gateway._mode_for("What is version control?", "auto") == "quick"
+
+
 def test_generic_technical_query_uses_general_documentation_variant():
     variants = search_gateway._query_variants(
         "How do I install PostgreSQL on Ubuntu?", "balanced"
@@ -1220,6 +1241,155 @@ async def test_planner_invalid_output_falls_back_to_deterministic_queries(monkey
     )
     assert variants == []
     assert diagnostics["status"] == "fallback"
+
+
+@pytest.mark.asyncio
+async def test_planner_runs_only_after_weak_deterministic_search(monkeypatch):
+    captured = []
+    planner_calls = []
+
+    class Stream:
+        def __init__(self, params):
+            self.params = params
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        def raise_for_status(self):
+            return None
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        def stream(self, method, url, params):
+            captured.append(params)
+            return Stream(params)
+
+    async def read(response, max_bytes=0):
+        if len(captured) == 1:
+            return {
+                "results": [
+                    {
+                        "title": "Unrelated setup guide",
+                        "url": "https://unrelated.example/guide",
+                        "content": "Generic installation instructions.",
+                        "engine": "bing",
+                    }
+                ]
+            }
+        return {
+            "results": [
+                {
+                    "title": f"Nebula XZ900 setup guide {index}",
+                    "url": f"https://guide{index}.example/xz900",
+                    "content": "Nebula XZ900 installation and configuration details.",
+                    "engine": "bing",
+                }
+                for index in range(1, 4)
+            ]
+        }
+
+    async def planner(query, mode):
+        planner_calls.append((query, mode))
+        return ["Nebula XZ900 official setup guide"], {
+            "status": "ok",
+            "model": "planner-model",
+            "variant_count": 1,
+            "duration_seconds": 0.01,
+        }
+
+    monkeypatch.setattr(search_gateway, "PLANNER_BASE_URL", "http://planner/v1")
+    monkeypatch.setattr(search_gateway, "PLANNER_MODEL", "planner-model")
+    monkeypatch.setattr(search_gateway, "PLANNER_MODES", {"balanced"})
+    monkeypatch.setattr(search_gateway, "_planner_query_variants", planner)
+    monkeypatch.setattr(search_gateway.httpx, "AsyncClient", lambda **kwargs: Client())
+    monkeypatch.setattr(search_gateway, "_read_json_response", read)
+
+    results, diagnostics = await search_gateway._searx_search(
+        "Nebula XZ900 setup guide",
+        mode="balanced",
+        max_results=3,
+        language="auto",
+        time_range=None,
+        categories=[],
+    )
+
+    assert len(results) == 3
+    assert planner_calls == [("Nebula XZ900 setup guide", "balanced")]
+    assert captured[1]["q"] == "Nebula XZ900 official setup guide"
+    assert diagnostics[-1]["planner"]["trigger"] == "weak-initial-search"
+
+
+@pytest.mark.asyncio
+async def test_strong_deterministic_search_skips_optional_planner(monkeypatch):
+    captured = []
+    planner_calls = []
+
+    class Stream:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        def raise_for_status(self):
+            return None
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        def stream(self, method, url, params):
+            captured.append(params)
+            return Stream()
+
+    async def read(response, max_bytes=0):
+        return {
+            "results": [
+                {
+                    "title": f"Nebula XZ900 setup guide {index}",
+                    "url": f"https://source{index}.example/xz900",
+                    "content": "Nebula XZ900 installation and configuration details.",
+                    "engine": "bing",
+                }
+                for index in range(1, 4)
+            ]
+        }
+
+    async def planner(query, mode):
+        planner_calls.append((query, mode))
+        raise AssertionError("planner must not run for strong initial evidence")
+
+    monkeypatch.setattr(search_gateway, "PLANNER_BASE_URL", "http://planner/v1")
+    monkeypatch.setattr(search_gateway, "PLANNER_MODEL", "planner-model")
+    monkeypatch.setattr(search_gateway, "PLANNER_MODES", {"balanced"})
+    monkeypatch.setattr(search_gateway, "_planner_query_variants", planner)
+    monkeypatch.setattr(search_gateway.httpx, "AsyncClient", lambda **kwargs: Client())
+    monkeypatch.setattr(search_gateway, "_read_json_response", read)
+
+    results, diagnostics = await search_gateway._searx_search(
+        "Nebula XZ900 setup guide",
+        mode="balanced",
+        max_results=3,
+        language="auto",
+        time_range=None,
+        categories=[],
+    )
+
+    assert len(results) == 3
+    assert len(captured) == 1
+    assert planner_calls == []
+    assert diagnostics[-1]["planner"]["status"] == "not-needed"
 
 
 def test_planner_rejects_non_string_query_variants():
