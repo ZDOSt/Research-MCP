@@ -213,9 +213,11 @@ by the stack's local BGE reranker. It uses the same Bearer credential as the
 Firecrawl routes. This adapter lets LibreChat include relevant passages from
 scraped pages in the model-visible Web Search result without a hosted reranking
 service. Frontend requests larger than the local model's 32-text client limit
-are split into bounded batches and their scores are merged. If the local model
-is unavailable or exceeds its bounded deadline, the adapter returns lexical
-fallback passages instead of an empty result.
+are split into bounded batches and their scores are merged. The integrated
+route uses CPU-friendly 16-text batches and caps passage reranking at 32
+page-diverse passages. If the local model is unavailable or exceeds its bounded
+deadline, the adapter returns lexical fallback passages instead of an empty
+result.
 
 Crawl4AI runs without direct public DNS or Internet access. Its redundant
 in-container destination precheck is disabled because it cannot resolve public
@@ -314,6 +316,12 @@ docker compose ps
 
 You do not need to run `docker compose down` for a normal update. Existing Redis
 cache and reranker downloads remain in named volumes.
+
+If the existing `.env` file already defines reranker settings, set
+`GATEWAY_RERANKER_TIMEOUT_SECONDS=8`,
+`GATEWAY_RERANKER_MAX_BATCH_SIZE=16`, and
+`GATEWAY_RERANKER_MAX_DOCUMENTS=32`; values in `.env` override the Compose
+defaults.
 
 ## Operations
 

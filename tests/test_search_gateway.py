@@ -1255,6 +1255,23 @@ def test_lexical_reranking_preserves_source_authority():
     assert ranked[0]["authority_score"] == 2.6
 
 
+def test_passage_rerank_limit_preserves_page_diversity(monkeypatch):
+    monkeypatch.setattr(search_gateway, "RERANKER_MAX_DOCUMENTS", 6)
+    documents = [
+        {
+            "page_index": page_index,
+            "passage_index": passage_index,
+        }
+        for page_index in range(3)
+        for passage_index in range(5)
+    ]
+
+    limited = search_gateway._limit_passage_documents(documents)
+
+    assert len(limited) == 6
+    assert {item["page_index"] for item in limited} == {0, 1, 2}
+
+
 def test_url_canonicalization_and_source_matching_are_strict():
     normalized = search_gateway._normalize_search_result(
         {
@@ -1405,6 +1422,7 @@ async def test_reranker_chunks_large_frontend_batches(monkeypatch):
             return Stream(response)
 
     monkeypatch.setattr(search_gateway.httpx, "AsyncClient", lambda **kwargs: Client())
+    monkeypatch.setattr(search_gateway, "RERANKER_MAX_BATCH_SIZE", 32)
     docs = [
         {"text": f"candidate {index}", "candidate_index": index} for index in range(202)
     ]

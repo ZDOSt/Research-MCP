@@ -62,7 +62,7 @@ CACHE_STALE_SECONDS = max(
 )
 CACHE_MAX_ENTRIES = max(16, int(os.getenv("GATEWAY_CACHE_MAX_ENTRIES", "256")))
 RERANKER_TIMEOUT_SECONDS = max(
-    0.5, float(os.getenv("GATEWAY_RERANKER_TIMEOUT_SECONDS", "5"))
+    0.5, float(os.getenv("GATEWAY_RERANKER_TIMEOUT_SECONDS", "8"))
 )
 RERANKER_MAX_RESPONSE_BYTES = max(
     65_536, int(os.getenv("GATEWAY_RERANKER_MAX_RESPONSE_BYTES", "2097152"))
@@ -70,7 +70,10 @@ RERANKER_MAX_RESPONSE_BYTES = max(
 # The pinned CPU TEI image rejects client batches larger than 32. Keep the
 # gateway-side value capped even if an operator accidentally configures more.
 RERANKER_MAX_BATCH_SIZE = min(
-    32, max(1, int(os.getenv("GATEWAY_RERANKER_MAX_BATCH_SIZE", "32")))
+    32, max(1, int(os.getenv("GATEWAY_RERANKER_MAX_BATCH_SIZE", "16")))
+)
+RERANKER_MAX_DOCUMENTS = min(
+    80, max(8, int(os.getenv("GATEWAY_RERANKER_MAX_DOCUMENTS", "32")))
 )
 MAX_CONCURRENT_RERANKS = max(1, int(os.getenv("GATEWAY_MAX_CONCURRENT_RERANKS", "2")))
 RERANKER_ADMISSION_TIMEOUT_SECONDS = max(
@@ -1964,6 +1967,33 @@ def _chunk_text(text: str) -> list[str]:
     return [item["text"] for item in _chunk_text_with_spans(text)]
 
 
+def _limit_passage_documents(documents: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Bound reranker work while retaining evidence from each crawled page."""
+
+    if len(documents) <= RERANKER_MAX_DOCUMENTS:
+        return documents
+
+    by_page: dict[int, list[int]] = {}
+    for index, document in enumerate(documents):
+        try:
+            page_index = int(document.get("page_index", -1))
+        except (TypeError, ValueError):
+            page_index = -1
+        by_page.setdefault(page_index, []).append(index)
+
+    page_quota = max(1, RERANKER_MAX_DOCUMENTS // max(1, len(by_page)))
+    selected: set[int] = set()
+    for indexes in by_page.values():
+        selected.update(indexes[:page_quota])
+
+    for index in range(len(documents)):
+        if len(selected) >= RERANKER_MAX_DOCUMENTS:
+            break
+        selected.add(index)
+
+    return [documents[index] for index in range(len(documents)) if index in selected]
+
+
 async def _rerank(
     query: str, documents: list[dict[str, Any]], top_k: int
 ) -> tuple[list[dict[str, Any]], str]:
@@ -2504,7 +2534,7 @@ def _passage_documents(pages: list[dict[str, Any]], query: str) -> list[dict[str
         key=lambda item: item["lexical_score"] + 0.08 * item["source_score"],
         reverse=True,
     )
-    return documents[:80]
+    return _limit_passage_documents(documents)
 
 
 def _assemble_results(
@@ -3229,6 +3259,7 @@ async def research(
                             diagnostics["follow_failures"] = follow_failures
 
                         documents = _passage_documents(pages, request.query)
+                        diagnostics["passage_document_count"] = len(documents)
                         if documents:
                             ranked, reranker_status = await _rerank_bounded(
                                 request.query,
@@ -3249,6 +3280,7 @@ async def research(
                     diagnostics["partial"] = True
                     diagnostics["deadline_exceeded"] = True
                     documents = _passage_documents(pages, request.query)
+                    diagnostics["passage_document_count"] = len(documents)
                     if documents:
                         ranked = _lexical_rerank(
                             request.query, documents, max(20, request.max_results * 5)
