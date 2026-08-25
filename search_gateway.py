@@ -628,6 +628,56 @@ def _topic_anchor_is_strict(query: str, anchor: str | None) -> bool:
     return any(bool(re.search(r"\d", term)) for term in terms)
 
 
+def _entity_relaxed_variants(query: str) -> list[str]:
+    """Build subject-first fallbacks when a detailed query finds no subject."""
+
+    if SEARCH_OPERATOR_RE.search(query):
+        return []
+    anchor = _topic_anchor(query)
+    if not anchor:
+        return []
+    anchor = re.sub(r"\s+", " ", anchor).strip()
+    if not anchor:
+        return []
+
+    # Keep additional proper names and identifiers that follow the subject,
+    # but drop request/intent language. This is deliberately domain-neutral.
+    anchor_counts: dict[str, int] = {}
+    for term in WORD_RE.findall(anchor):
+        key = term.casefold()
+        anchor_counts[key] = anchor_counts.get(key, 0) + 1
+    anchor_match = re.search(re.escape(anchor), query, re.I)
+    minimum_position = anchor_match.end() if anchor_match else 0
+    extras: list[str] = []
+    for match in WORD_RE.finditer(query):
+        if match.start() < minimum_position:
+            continue
+        raw = match.group(0).strip("-.")
+        key = raw.casefold()
+        if anchor_counts.get(key, 0):
+            anchor_counts[key] -= 1
+            continue
+        if key in ANCHOR_EXCLUDED_TERMS or key in {"first", "second", "third"}:
+            continue
+        letters = re.sub(r"[^a-zA-Z]", "", raw)
+        identifier = bool(
+            re.search(r"\d", raw)
+            or re.search(r"[a-z][A-Z]|[A-Z][a-z].*[A-Z]", raw)
+            or (letters and letters.isupper() and len(letters) >= 2)
+        )
+        proper_name = len(raw) >= 3 and raw[:1].isupper() and raw[1:].islower()
+        if identifier or proper_name:
+            extras.append(raw)
+        if len(extras) >= 3:
+            break
+
+    variants: list[str] = []
+    if extras:
+        variants.append(f"{anchor} {' '.join(extras)}")
+    variants.append(anchor)
+    return list(dict.fromkeys(variants))
+
+
 def _query_variants(query: str, mode: str) -> list[str]:
     """Build bounded, search-engine-friendly variants from the user's intent."""
 
@@ -1872,7 +1922,10 @@ async def _searx_search(
     initial_quality = _candidate_quality(query, fused, max_results, mode)
     fallback_triggered = mode != "quick" and initial_quality["status"] != "sufficient"
     planned: list[str] = []
+    entity_relaxed: list[str] = []
     if fallback_triggered:
+        if "named-entity-not-covered" in initial_quality["reasons"]:
+            entity_relaxed = _entity_relaxed_variants(query)
         # Deterministic retrieval is always first. Only weak evidence earns a
         # planner call, keeping the normal path fast and predictable.
         if _planner_is_enabled(mode):
@@ -1893,7 +1946,9 @@ async def _searx_search(
         # variants remain the guaranteed fallback if the model is unavailable
         # or returns unusable output.
         fallback_variants = list(
-            dict.fromkeys([*planned, *variants[1:], default_fallback])
+            dict.fromkeys(
+                [*planned, *entity_relaxed, *variants[1:], default_fallback]
+            )
         )
         fallback_limit = 2 if mode == "deep" else 1
         fallback_variants = fallback_variants[:fallback_limit]
@@ -1937,6 +1992,10 @@ async def _searx_search(
         "wave": "summary",
         "status": "ok",
         "planner": planner_diagnostics,
+        "entity_relaxation": {
+            "triggered": bool(entity_relaxed),
+            "variants": entity_relaxed,
+        },
         "variants": variants,
         "fallback_triggered": fallback_triggered,
         "fallback_reasons": initial_quality["reasons"] if fallback_triggered else [],
@@ -2891,6 +2950,7 @@ def _attach_search_diagnostics(
     if not summary:
         return
     diagnostics["planner"] = summary.get("planner")
+    diagnostics["entity_relaxation"] = summary.get("entity_relaxation") or {}
     diagnostics["query_variants"] = summary.get("variants") or []
     diagnostics["fallback_triggered"] = bool(summary.get("fallback_triggered"))
     diagnostics["fallback_reasons"] = summary.get("fallback_reasons") or []

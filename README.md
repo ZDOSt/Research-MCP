@@ -164,7 +164,10 @@ When no category is supplied, the gateway infers useful SearXNG categories from
 the request. `auto` uses quick mode for simple unanchored lookups and balanced
 mode for technical questions, recommendations, and identifiable subjects.
 `quick` performs one search wave;
-`balanced` conditionally adds one fallback query and a small crawl budget;
+`balanced` conditionally adds one fallback query and a small crawl budget. When
+an identifiable subject has no matching candidates, that fallback relaxes the
+request to the subject plus preserved proper names or identifiers, then to the
+subject alone when the mode permits another variant;
 `deep` permits two bounded fallback variants and wider evidence. The discovery
 route never crawls.
 

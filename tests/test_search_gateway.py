@@ -69,6 +69,18 @@ def test_auto_mode_gives_identifiable_subjects_a_fallback_wave():
     assert search_gateway._mode_for("What is version control?", "auto") == "quick"
 
 
+def test_entity_relaxation_preserves_subject_and_proper_names():
+    assert search_gateway._entity_relaxed_variants(
+        '"DragonSword Awakening" Theresia best gear build'
+    ) == [
+        "DragonSword Awakening Theresia",
+        "DragonSword Awakening",
+    ]
+    assert search_gateway._entity_relaxed_variants(
+        "Best team composition for DragonSword Awakening"
+    ) == ["DragonSword Awakening"]
+
+
 def test_generic_technical_query_uses_general_documentation_variant():
     variants = search_gateway._query_variants(
         "How do I install PostgreSQL on Ubuntu?", "balanced"
@@ -1325,6 +1337,81 @@ async def test_planner_runs_only_after_weak_deterministic_search(monkeypatch):
     assert planner_calls == [("Nebula XZ900 setup guide", "balanced")]
     assert captured[1]["q"] == "Nebula XZ900 official setup guide"
     assert diagnostics[-1]["planner"]["trigger"] == "weak-initial-search"
+
+
+@pytest.mark.asyncio
+async def test_entity_relaxation_recovers_subject_when_detailed_search_is_empty(
+    monkeypatch,
+):
+    captured = []
+
+    class Stream:
+        def __init__(self, params):
+            self.params = params
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        def raise_for_status(self):
+            return None
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        def stream(self, method, url, params):
+            captured.append(params)
+            return Stream(params)
+
+    async def read(response, max_bytes=0):
+        if len(captured) == 1:
+            return {
+                "results": [
+                    {
+                        "title": "Unrelated game guide",
+                        "url": "https://unrelated.example/game",
+                        "content": "A guide for a different game.",
+                        "engine": "bing",
+                    }
+                ]
+            }
+        return {
+            "results": [
+                {
+                    "title": "DragonSword: Awakening Theresia guide",
+                    "url": "https://guide.example/theresia",
+                    "content": "Theresia character information for DragonSword Awakening.",
+                    "engine": "bing",
+                }
+            ]
+        }
+
+    monkeypatch.setattr(search_gateway, "PLANNER_BASE_URL", "")
+    monkeypatch.setattr(search_gateway, "PLANNER_MODEL", "")
+    monkeypatch.setattr(search_gateway.httpx, "AsyncClient", lambda **kwargs: Client())
+    monkeypatch.setattr(search_gateway, "_read_json_response", read)
+
+    results, diagnostics = await search_gateway._searx_search(
+        '"DragonSword Awakening" Theresia best gear build',
+        mode="balanced",
+        max_results=3,
+        language="auto",
+        time_range=None,
+        categories=[],
+    )
+
+    assert results[0]["domain"] == "guide.example"
+    assert captured[1]["q"] == "DragonSword Awakening Theresia"
+    assert diagnostics[-1]["entity_relaxation"] == {
+        "triggered": True,
+        "variants": ["DragonSword Awakening Theresia", "DragonSword Awakening"],
+    }
 
 
 @pytest.mark.asyncio
